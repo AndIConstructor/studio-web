@@ -500,6 +500,10 @@ label.field input { display: block; width: 100%; margin-top: 6px; font-weight: 4
    Leaving it at 48px is what the first cut did, and the open rail then sat on
    top of 192px of content for as long as it stayed pinned. */
 .shell-body[data-sidebar="open"] { --nav-track: 240px; }
+/* The person turned the rail off (Profile): no track, no panel. */
+.shell-body[data-sidebar="none"] { --nav-track: 0px; }
+.shell-body[data-sidebar="none"] > .drawer { display: none; }
+.pref-toggle { display: flex; align-items: center; gap: 6px; margin-top: 12px; font-size: 13px; }
 .shell-body[data-ai="open"] { --ai-track: 368px; }
 .shell-body[data-ai="none"] { --ai-track: 0; }
 /* grid-column: 2 is NOT redundant, and leaving it to auto-placement is what
@@ -677,7 +681,9 @@ label.field input { display: block; width: 100%; margin-top: 6px; font-weight: 4
    not. Keep it that way unless every label gets wrapped in an element. */
 .drawer:not(:hover):not(:focus-within):not([data-expanded="true"]) nav button,
 .drawer:not(:hover):not(:focus-within):not([data-expanded="true"]) .nav-section-title,
-.drawer:not(:hover):not(:focus-within):not([data-expanded="true"]) .org-select-name {
+.drawer:not(:hover):not(:focus-within):not([data-expanded="true"]) .org-select-name,
+.drawer:not(:hover):not(:focus-within):not([data-expanded="true"]) .nav-level-title .nav-level-name,
+.drawer:not(:hover):not(:focus-within):not([data-expanded="true"]) .nav-pin-empty {
   color: transparent;
 }
 .drawer:not(:hover):not(:focus-within):not([data-expanded="true"]) nav button .ico {
@@ -693,6 +699,13 @@ label.field input { display: block; width: 100%; margin-top: 6px; font-weight: 4
   font-size: 10.5px; letter-spacing: 0.08em; text-transform: uppercase;
   color: var(--muted-foreground); padding: 8px 10px 2px;
 }
+/* The open level's heading: what level, and which one. */
+.nav-level-title { display: flex; flex-direction: column; gap: 2px; padding-bottom: 6px; }
+.nav-level-title .nav-level-name {
+  text-transform: none; letter-spacing: 0; font-size: 13px; font-weight: 600;
+  color: var(--foreground); overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.nav-level-platform .nav-level-name { font-weight: 400; color: var(--muted-foreground); font-size: 12px; }
 /* The pinned section's heading carries its own control, so it is a row rather
    than a label. */
 .nav-section-pinned .nav-section-title {
@@ -816,6 +829,11 @@ label.field input { display: block; width: 100%; margin-top: 6px; font-weight: 4
 .path-bar .org-select-name { flex: 0 1 auto; max-width: 220px; font-weight: 600; }
 .path-bar .org-menu { left: 0; right: auto; min-width: 220px; }
 .path-sep { color: var(--muted-foreground); font-size: 14px; }
+.path-bar .path-platform .org-select-name { font-weight: 500; color: var(--muted-foreground); }
+.path-bar .path-platform.on .org-select-name { font-weight: 600; color: inherit; }
+.path-bar .path-org { display: flex; align-items: center; gap: 2px; }
+.path-bar .path-chev { padding-left: 4px; padding-right: 4px; }
+.path-bar .org-select.on { background: color-mix(in oklab, var(--foreground) 6%, transparent); }
 
 /* The path in the bar takes the product's ContextSwitcher treatment: no box of
    its own, a 36px hit area that tints on hover, and the name at the same

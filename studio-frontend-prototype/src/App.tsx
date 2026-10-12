@@ -107,6 +107,10 @@ import {
 /** The person's theme and language, among their other preferences. */
 const PREF_THEME = "app.theme";
 const PREF_LANGUAGE = "app.language";
+/** Whether the person shows the navigation rail at all: `shown` | `hidden`.
+ *  The rail holds only what they pinned; every level's own sections are the
+ *  band above the work area, so hiding it loses no destination. */
+const PREF_RAIL = "app.rail";
 import { ActivityView } from "./activity-view";
 import { PresenceNotes, WhoIsOnline, usePresence } from "./presence";
 import { followRun } from "./studio-events";
@@ -114,6 +118,8 @@ import { runProvision, type ProvisionStep, type StepState } from "./provision";
 import { gearParentDir, gearSlug } from "./scaffold";
 import { productIdFrom } from "./product";
 import { PortalNavProvider, type PortalNav } from "./portal-nav";
+import { OrgDashboard } from "./org-dashboard";
+import { PublicationRequests } from "./publication-requests";
 import { MyIdentitiesCard, MyPersonCard, PersonPhoto } from "./people-profile";
 import { orgPeople } from "./org-people";
 import { PullRequestsOnMe } from "./pull-requests-on-me";
@@ -245,6 +251,7 @@ const LISTS_WITH_OWN_FILTERS: ReadonlySet<PanelView> = new Set<PanelView>([
   "connectors",
   "tasks",
   "gears",
+  "platform",
   "chats",
   "files",
 ]);
@@ -497,6 +504,9 @@ type View =
   | "files"
   | "connectors"
   | "gears"
+  | "platform"
+  | "publications"
+  | "org"
   | "reports"
   | "objects"
   | "views"
@@ -512,6 +522,12 @@ function NavIcon({ name }: { name: string }) {
       <>
         <path d="m3 11 9-8 9 8" />
         <path d="M5 10v11h14V10" />
+      </>
+    ),
+    layers: (
+      <>
+        <path d="m12 3 9 5-9 5-9-5z" />
+        <path d="m3 13 9 5 9-5" />
       </>
     ),
     shield: (
@@ -606,71 +622,49 @@ function NavIcon({ name }: { name: string }) {
   );
 }
 
-// Sectioned nav (concept v2). Two nouns carry the whole product — Projects and
-// People — and everything that used to need a level above them (organizations,
-// the workspace/project split, "pick a workspace first" dead ends) is gone from
-// the sidebar. Sources, secrets and nested projects are not top-level surfaces:
-// they belong TO a project and live on its page, which is what makes the
-// project the unit rather than a folder you have to select first.
-const NAV_SECTIONS: {
-  title: string | null;
-  /** Drawn only inside the "+" picker: pinnable, but not a group of its own. */
-  hidden?: boolean;
-  items: { id: View; icon: string; label: string }[];
-}[] = [
-  {
-    // Was a group called WORK, holding these three. That was not a category so
-    // much as what concept v2 left over after everything else moved onto a
-    // project, and three unrelated destinations under a heading claiming they
-    // belong together is a heading that has stopped meaning anything.
-    //
-    // The slot is the rail's most valuable one, so it holds what this person
-    // always needs instead (see pins.ts). These three stay the defaults, so
-    // nothing moves on first use, and they remain here as the list the "+"
-    // picker offers — unpinning one must not put it out of reach.
-    title: "Organization",
-    hidden: true,
-    items: [
-      { id: "projects", icon: "grid", label: "Workspaces" },
-      { id: "people", icon: "users", label: "People" },
-      // Shared connector catalogue. It is owned by the hidden organization —
-      // which is exactly why it sits here and not inside one project: every
-      // project of the org inherits it. Labelled "Connections" to match the
-      // sidebar in the product mockups.
-      { id: "connectors", icon: "plug", label: "Connections" },
-      // Chats and Files are hidden: neither is a surface of the organization.
-      // A chat is had inside a project and a file is an artifact of one, so an
-      // org-wide list of either is a flat, contextless feed sitting one click
-      // from the top of the product. The views and their routes are kept
-      // (`view === "chats"`, `view === "files"`), so putting an entry back here
-      // is the whole of un-hiding them.
-    ],
-  },
-  // Spec Quality is no longer a top-level surface — it moved onto the project
-  // page (the "Analyze" project tab), where it runs over that project's
-  // ingested artifacts.
-  {
-    title: "Platform",
-    items: [
-      // Our published gears (crates.io → graph), and the system observability
-      // surface.
-      { id: "gears", icon: "package", label: "Components" },
-      // Every report the Studio draws, configured once for the organization
-      // (studio-reports): the roadmap workbook is the first.
-      { id: "reports", icon: "activity", label: "Reports" },
-      // The type catalogue the line above is a view of. Which types are
-      // components is a judgement this organization makes here, not a constant
-      // in a gear — so the two surfaces sit next to each other.
-      { id: "objects", icon: "grid", label: "Objects" },
-      // Lists of the domain model's objects that people define and save as
-      // data (views.tsx): a new one is not a release.
-      { id: "views", icon: "grid", label: "Views" },
-      // What the deployment is doing in the background, and what fires on its
-      // own: studio-tasks runs plus studio-scheduler schedules.
-      { id: "tasks", icon: "scan", label: "Background work" },
-      { id: "system", icon: "cog", label: "System" },
-    ],
-  },
+// The rail follows the path (Platform › organization › workspace › project):
+// it lists the sections of the level the path has open, and nothing else.
+// The platform has its shared components and the deployment; an
+// organization its overview, workspaces, people, connections and own
+// components; a workspace and a project their own sections
+// (WORKSPACE_TABS, PROJECT_TABS). Moving up or down is the path's job.
+type Level = "platform" | "organization" | "workspace" | "project";
+
+const LEVEL_NAV: Record<"platform" | "organization", { id: View; icon: string; label: string }[]> = {
+  platform: [
+    // The common set every organization builds on (ADR-0042).
+    { id: "platform", icon: "layers", label: "Components" },
+    // What organizations ask the platform to take, answered by a curator.
+    { id: "publications", icon: "package", label: "Publication requests" },
+    // How the deployment itself is doing.
+    { id: "system", icon: "cog", label: "System" },
+  ],
+  organization: [
+    { id: "org", icon: "home", label: "Overview" },
+    { id: "projects", icon: "grid", label: "Workspaces" },
+    { id: "people", icon: "users", label: "People" },
+    // Owned by the organization and inherited by every project in it.
+    { id: "connectors", icon: "plug", label: "Connections" },
+    // What its projects build: the registry, candidates, its gear repository.
+    { id: "gears", icon: "package", label: "Our components" },
+    // Every report the Studio draws, configured once for the organization.
+    { id: "reports", icon: "activity", label: "Reports" },
+    // The type catalogue, and the lists of its objects people save.
+    { id: "objects", icon: "grid", label: "Objects" },
+    { id: "views", icon: "grid", label: "Views" },
+    // Its studio-tasks runs and studio-scheduler schedules.
+    { id: "tasks", icon: "scan", label: "Background work" },
+  ],
+};
+
+/** The views whose level is the platform; every other portal view is the
+ *  organization's. */
+const PLATFORM_VIEWS: ReadonlySet<View> = new Set(LEVEL_NAV.platform.map((n) => n.id));
+
+/** Every destination the "+" picker can pin, by level. */
+const NAV_SECTIONS: { title: string; items: { id: View; icon: string; label: string }[] }[] = [
+  { title: "Platform", items: LEVEL_NAV.platform },
+  { title: "Organization", items: LEVEL_NAV.organization },
 ];
 
 type AdminView =
@@ -899,6 +893,7 @@ function Shell({ token, me, onLogout }: { token: string; me: Me; onLogout: () =>
     savePins(next);
   };
   const [menuOpen, setMenuOpen] = useState(false);
+  const [railPref] = usePreference(PREF_RAIL, "shown");
   /** Whether the Studio AI dock is open (368px) rather than railed (48px).
    *  Owned here because the shell grid sizes the track — see .shell-body. */
   const [aiOpen, setAiOpen] = useState(false);
@@ -1564,6 +1559,14 @@ function Shell({ token, me, onLogout }: { token: string; me: Me; onLogout: () =>
    *  two are mutually exclusive, so exactly one band ever shows. */
   const workspaceOpen =
     !adminOpen && !activeSpace && view === "projects" && !!crumb.projectId && !crumb.nestedId;
+  /** The level the path has open, which decides what the rail lists. */
+  const level: Level = projectOpen
+    ? "project"
+    : workspaceOpen
+      ? "workspace"
+      : PLATFORM_VIEWS.has(view)
+        ? "platform"
+        : "organization";
 
   const panelView: PanelView = dash ? "dashboard" : view;
 
@@ -1703,6 +1706,7 @@ function Shell({ token, me, onLogout }: { token: string; me: Me; onLogout: () =>
         {/* Pins the rail open. It is not an open/close control any more — the
             rail is always there and opens on hover — so it reports pressed
             state rather than naming a destination. */}
+        {(railPref !== "hidden" || adminOpen) && (
         <button
           className="bar-burger"
           aria-label={menuOpen ? "Unpin global navigation" : "Pin global navigation open"}
@@ -1712,6 +1716,7 @@ function Shell({ token, me, onLogout }: { token: string; me: Me; onLogout: () =>
         >
           <MenuIcon size={20} />
         </button>
+        )}
         {/* The product family hangs off the wordmark again.
             It was moved to the foot of the drawer on the reasoning that the
             portal is one door and the API docs and the IdP admin are others,
@@ -1785,6 +1790,18 @@ function Shell({ token, me, onLogout }: { token: string; me: Me; onLogout: () =>
             <PathBar
               orgs={orgOptions}
               activeOrg={activeOrg}
+              platformOpen={PLATFORM_VIEWS.has(view) && !activeSpace}
+              onOpenPlatform={() => {
+                setCrumb({});
+                setView("platform");
+                setActiveSpace(null);
+              }}
+              orgOpen={view === "org" && !activeSpace}
+              onOpenOrg={() => {
+                setCrumb({});
+                setView("org");
+                setActiveSpace(null);
+              }}
               onPickOrg={(id) => {
                 setActiveOrgId(id);
                 setCrumb({});
@@ -1952,7 +1969,9 @@ function Shell({ token, me, onLogout }: { token: string; me: Me; onLogout: () =>
         /* The admin area is a settings sidebar, not transient navigation: it keeps
            its full 240px track, or its open panel would lie over the page it
            manages (and stay open over it while a nav button holds the focus). */
-        data-sidebar={menuOpen || adminOpen ? "open" : "rail"}
+        data-sidebar={
+          railPref === "hidden" && !adminOpen ? "none" : menuOpen || adminOpen ? "open" : "rail"
+        }
         /* "none" while a space is showing: the IDE is a whole application, and
            the product does not dock its own assistant beside somebody else's
            editor — that column belongs to Theia. */
@@ -2067,14 +2086,9 @@ function Shell({ token, me, onLogout }: { token: string; me: Me; onLogout: () =>
                 </>
               ) : (
                 <>
-                {/* Organization / workspace switchers used to live here; the
-                    horizontal path picker (org › workspace › project) above the
-                    content is now the single place to switch context, so the
-                    sidebar keeps only the nav surfaces below. */}
-                {/* The open project's sections are NOT here any more — they are
-                    the band across the top of the work area (.project-sections).
-                    Listing them in both places was the same navigation twice,
-                    and the rail is for context, not for the open thing's parts. */}
+                {/* Only what this person pinned. The open level's sections are
+                    the band above the work area, so the rail is theirs to
+                    fill -- or to hide, in the profile. */}
                 <PinnedSection
                   pins={pins}
                   setPins={setPinned}
@@ -2097,33 +2111,6 @@ function Shell({ token, me, onLogout }: { token: string; me: Me; onLogout: () =>
                     setView("projects");
                   }}
                 />
-                {
-                  // ── Organization context: work surfaces of the whole org ──
-                  NAV_SECTIONS.filter((sec) => !sec.hidden).map((sec) => {
-                    const items = sec.items;
-                    return (
-                      <div
-                        key={sec.title ?? "_top"}
-                        className={`nav-section${sec.title ? ` nav-section-${sec.title.toLowerCase()}` : ""}`}
-                      >
-                        {sec.title && <div className="nav-section-title">{sec.title}</div>}
-                        {items.map((n) => (
-                          <button
-                            key={n.id}
-                            className={view === n.id && !activeSpace ? "active" : ""}
-                            title={n.label}
-                            onClick={() => {
-                              setView(n.id);
-                              setActiveSpace(null); // portal navigation leaves the space
-                            }}
-                          >
-                            <span className="ico"><NavIcon name={n.icon} /></span> {n.label}
-                          </button>
-                        ))}
-                      </div>
-                    );
-                  })
-                }
                 </>
               )}
             </nav>
@@ -2218,6 +2205,47 @@ function Shell({ token, me, onLogout }: { token: string; me: Me; onLogout: () =>
               })()}
             </span>
           )}
+        </nav>
+      )}
+      {/* Every level of the path has its sections as a band above the work
+          area -- the platform's and the organization's here, a workspace's and
+          a project's below. The rail is only what the person pinned. */}
+      {!adminOpen && !activeSpace && (level === "platform" || level === "organization") && (
+        <nav className="project-sections" aria-label={level === "platform" ? "Platform sections" : "Organization sections"}>
+          {LEVEL_NAV[level].map((n) => (
+            <button
+              key={n.id}
+              className={`psection${view === n.id ? " on" : ""}`}
+              aria-current={view === n.id ? "page" : undefined}
+              onClick={() => {
+                setCrumb({});
+                setView(n.id);
+              }}
+            >
+              <span className="ico" aria-hidden>
+                <NavIcon name={n.icon} />
+              </span>
+              {n.label}
+            </button>
+          ))}
+          {railPref !== "hidden" &&
+            (() => {
+              const pin: Pin = { kind: "view", id: view };
+              const already = isPinned(pins, pin);
+              return (
+                <button
+                  className={`psection psection-pin${already ? " on" : ""}`}
+                  aria-pressed={already}
+                  title={already ? "Unpin this section from the rail" : "Pin this section to the rail"}
+                  onClick={() => setPinned(togglePin(pins, pin))}
+                >
+                  <span className="ico" aria-hidden>
+                    {already ? "★" : "☆"}
+                  </span>
+                  {already ? "Pinned" : "Pin"}
+                </button>
+              );
+            })()}
         </nav>
       )}
       {/* The project's sections, as the product draws them: a 44px band across
@@ -2536,6 +2564,25 @@ function Shell({ token, me, onLogout }: { token: string; me: Me; onLogout: () =>
             }}
           />
         )}
+        {view === "publications" && <PublicationRequests token={token} orgId={orgAsSpace?.id} />}
+        {view === "org" && orgAsSpace && (
+          <OrgDashboard
+            key={orgAsSpace.id}
+            token={token}
+            org={{ id: orgAsSpace.id, name: orgAsSpace.name }}
+            workspaceIds={workspaces.filter((w) => w.orgId === orgAsSpace.id).map((w) => w.id)}
+            onOpen={(target) => {
+              setCrumb({});
+              setView(target);
+            }}
+            onOpenProject={(workspaceId, projectId, name) => {
+              setProjectLabel(name);
+              setCrumb({ projectId: workspaceId, nestedId: projectId });
+              setProjectTab("overview");
+              setView("projects");
+            }}
+          />
+        )}
         {view === "home" && (
           <HomeView
             token={token}
@@ -2571,10 +2618,17 @@ function Shell({ token, me, onLogout }: { token: string; me: Me; onLogout: () =>
             projects={workspaces.filter((w) => w.orgId === orgAsSpace?.id).map((w) => ({ id: w.id, name: w.name }))}
           />
         )}
-        {view === "gears" && (
+        {(view === "gears" || view === "platform") && (
           <ComponentsCatalog
+            // Remounted when the organization resolves: the registry and the
+            // catalogue read it once, and a page opened straight from its
+            // address mounts before the organization is known.
+            key={`${view}:${orgAsSpace?.id ?? ""}`}
+            tier={view === "platform" ? "platform" : "organization"}
+            orgName={orgAsSpace?.name}
             token={token}
             tenantId={orgAsSpace?.id}
+            isPlatformAdmin={showPlatform}
             query={filters.query}
             kindFilter={filters.gearKind}
             sortMode={filters.gearSort}
@@ -2582,6 +2636,7 @@ function Shell({ token, me, onLogout }: { token: string; me: Me; onLogout: () =>
             categoryFilter={filters.gearCategory}
             onCategories={setComponentCategories}
             focus={componentFocus}
+            projects={workspaces.filter((w) => w.orgId === orgAsSpace?.id).map((w) => ({ id: w.id, name: w.name }))}
           />
         )}
         {view === "objects" && <ObjectTypes token={token} query={filters.query} />}
@@ -3101,6 +3156,10 @@ interface Crumb {
 function PathBar({
   orgs,
   activeOrg,
+  platformOpen,
+  onOpenPlatform,
+  orgOpen,
+  onOpenOrg,
   onPickOrg,
   workspaces,
   currentWorkspaceId,
@@ -3112,6 +3171,14 @@ function PathBar({
 }: {
   orgs: { id: string; name: string }[];
   activeOrg: { id: string; name: string } | null;
+  /** Whether the platform level itself is open (its common components). */
+  platformOpen: boolean;
+  /** Open the platform level: the top of the path, above every organization. */
+  onOpenPlatform: () => void;
+  /** Whether the organization's own dashboard is open. */
+  orgOpen: boolean;
+  /** Open the organization's dashboard: clicking its name in the path. */
+  onOpenOrg: () => void;
   onPickOrg: (id: string) => void;
   workspaces: { id: string; name: string }[];
   currentWorkspaceId?: string;
@@ -3127,19 +3194,49 @@ function PathBar({
 
   return (
     <div className="path-bar" onMouseLeave={() => setOpen(null)}>
-      {/* Organization */}
-      <div className="path-seg org-select-wrap">
+      {/* The platform: the level above every organization, holding the
+          components they all share (ADR-0042). Not a picker -- there is one. */}
+      <div className="path-seg">
         <button
           type="button"
-          className="org-select"
-          disabled={orgs.length <= 1}
-          title={activeOrg?.name ?? "Organization"}
-          onClick={() => setOpen((o) => (o === "org" ? null : "org"))}
+          className={`org-select path-platform${platformOpen ? " on" : ""}`}
+          aria-current={platformOpen ? "page" : undefined}
+          title="The platform: the components every organization shares"
+          onClick={onOpenPlatform}
+        >
+          <span className="account-avatar small">P</span>
+          <span className="org-select-name">Platform</span>
+        </button>
+      </div>
+
+      <span className="path-sep">›</span>
+
+      {/* Organization */}
+      <div className="path-seg org-select-wrap path-org">
+        {/* The name opens the organization's dashboard; the chevron, when
+            there is more than one organization, switches to another. */}
+        <button
+          type="button"
+          className={`org-select${orgOpen ? " on" : ""}`}
+          aria-current={orgOpen ? "page" : undefined}
+          disabled={!activeOrg}
+          title={activeOrg ? `${activeOrg.name}: the organization's dashboard` : "Organization"}
+          onClick={onOpenOrg}
         >
           <span className="account-avatar small">{initial(activeOrg?.name ?? "?")}</span>
           <span className="org-select-name">{activeOrg?.name ?? "Organization"}</span>
-          {orgs.length > 1 && <span className="chev">▾</span>}
         </button>
+        {orgs.length > 1 && (
+          <button
+            type="button"
+            className="org-select path-chev"
+            aria-label="Switch organization"
+            title="Switch organization"
+            onClick={() => setOpen((o) => (o === "org" ? null : "org"))}
+          >
+            <span className="chev">▾</span>
+          </button>
+        )}
         {open === "org" && orgs.length > 1 && (
           <div className="org-menu">
             {orgs.map((o) => (
@@ -9653,6 +9750,7 @@ function ProfileView({
   // edits a draft and Save commits it.
   const [savedTheme, saveTheme] = usePreference(PREF_THEME, "light");
   const [savedLanguage, saveLanguage] = usePreference(PREF_LANGUAGE, "en");
+  const [rail, saveRail] = usePreference(PREF_RAIL, "shown");
   const [theme, setTheme] = useState(savedTheme);
   const [language, setLanguage] = useState(savedLanguage);
   const [saved, setSaved] = useState(false);
@@ -9756,6 +9854,18 @@ function ProfileView({
           <button className="primary">Save</button>
           {saved && <span className="hint">saved ✓</span>}
         </form>
+        <label className="pref-toggle">
+          <input
+            type="checkbox"
+            checked={rail !== "hidden"}
+            onChange={(e) => saveRail(e.target.checked ? "shown" : "hidden")}
+          />{" "}
+          Show the navigation rail on the left
+        </label>
+        <p className="hint">
+          The rail holds only what you pin (☆ Pin on a section, or + in the rail). Every level&apos;s
+          sections are always in the band above the page, so hiding the rail loses nothing.
+        </p>
         {error && <div className="error">{error}</div>}
       </div>
     </>
