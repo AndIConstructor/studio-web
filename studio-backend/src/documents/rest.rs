@@ -1646,6 +1646,21 @@ impl Quality {
             })
     }
 
+    /// The model client, for reading documents into the spec model on the
+    /// caller's key.
+    fn models(&self) -> ApiResult<Arc<dyn crate::llm_proxy::port::ModelProviders>> {
+        self.hub
+            .get::<dyn crate::llm_proxy::port::ModelProviders>()
+            .map_err(|_| {
+                CanonicalError::service_unavailable()
+                    .with_detail(
+                        "the domain model cannot be built in this deployment: \
+                         studio-llm-proxy is not part of it",
+                    )
+                    .create()
+            })
+    }
+
     /// The ingested files, for the Specs list.
     ///
     /// Absent is not fatal here and must not be: a project with no ingest gear
@@ -2050,6 +2065,619 @@ async fn delete_binding(
 }
 
 // ── registration ─────────────────────────────────────────────────────────────
+
+// ── the domain model read from a project's documents ─────────────────────────
+
+/// One passage a finding rests on.
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+pub struct SpecModelSideDto {
+    pub path: String,
+    /// First line, from 1; absent when the side is a whole document.
+    pub line_start: Option<u32>,
+    pub line_end: Option<u32>,
+    /// The passage verbatim, or the document's title for a whole document.
+    pub quote: Option<String>,
+}
+
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+pub struct SpecModelFindingDto {
+    /// Stable across re-runs and line shifts.
+    pub fingerprint: String,
+    pub rule: String,
+    /// `high`, `medium` or `low`.
+    pub severity: String,
+    pub message: String,
+    pub sides: Vec<SpecModelSideDto>,
+    /// The decision a person has to take when the documents cannot tell
+    /// which side is right: one choice per entry.
+    pub decide: Vec<String>,
+    /// The smallest edit that fixes it, when the documents show which side
+    /// is right; `replace` is checked to be in `path`.
+    pub edit: Option<SpecModelEditDto>,
+    /// A member's word on it: `confirmed` (a real problem) or `dismissed`.
+    pub decision: Option<String>,
+}
+
+/// Replace `replace` with `with` in `path`.
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+pub struct SpecModelEditDto {
+    pub path: String,
+    pub replace: String,
+    pub with: String,
+}
+
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+pub struct SpecModelFindingListDto {
+    pub items: Vec<SpecModelFindingDto>,
+    pub total: u32,
+}
+
+impl From<super::spec_model::finding::Finding> for SpecModelFindingDto {
+    fn from(f: super::spec_model::finding::Finding) -> Self {
+        Self {
+            fingerprint: f.fingerprint,
+            rule: f.rule,
+            severity: f.severity,
+            message: f.message,
+            sides: f
+                .sides
+                .into_iter()
+                .map(|s| SpecModelSideDto {
+                    path: s.path,
+                    line_start: s.line_start.and_then(|n| u32::try_from(n).ok()),
+                    line_end: s.line_end.and_then(|n| u32::try_from(n).ok()),
+                    quote: s.quote,
+                })
+                .collect(),
+            decide: f.decide,
+            edit: f.edit.map(|e| SpecModelEditDto {
+                path: e.path,
+                replace: e.replace,
+                with: e.with,
+            }),
+            decision: None,
+        }
+    }
+}
+
+/// A member's ✓ or ✗ on one finding.
+#[derive(Debug)]
+#[toolkit_macros::api_dto(request)]
+pub struct SpecModelDecisionRequest {
+    pub project_id: String,
+    /// `confirmed` (a real problem) or `dismissed` (not one).
+    pub decision: String,
+}
+
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+pub struct SpecModelDecisionDto {
+    pub fingerprint: String,
+    pub decision: String,
+    pub decided_by: String,
+    pub decided_at: String,
+}
+
+/// Which project to build the model of.
+#[derive(Debug)]
+#[toolkit_macros::api_dto(request)]
+pub struct SpecModelBuildRequest {
+    pub project_id: String,
+}
+
+/// A project's build, as the process serving it knows it.
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+pub struct SpecModelBuildDto {
+    pub running: bool,
+    /// Documents this build reads.
+    pub documents: u32,
+    pub done: u32,
+    /// Candidates sent to the judge, and how many it has answered.
+    pub candidates: u32,
+    pub judged: u32,
+    pub current: Option<String>,
+    /// Why it stopped, when it did not finish (no model key, most often).
+    pub error: Option<String>,
+    pub started_at: Option<String>,
+    pub finished_at: Option<String>,
+}
+
+impl From<super::spec_model::build::BuildState> for SpecModelBuildDto {
+    fn from(s: super::spec_model::build::BuildState) -> Self {
+        let at = |t: Option<time::OffsetDateTime>| {
+            t.and_then(|t| {
+                t.format(&time::format_description::well_known::Rfc3339)
+                    .ok()
+            })
+        };
+        Self {
+            running: s.running,
+            documents: u32::try_from(s.documents).unwrap_or(u32::MAX),
+            done: u32::try_from(s.done).unwrap_or(u32::MAX),
+            candidates: u32::try_from(s.candidates).unwrap_or(u32::MAX),
+            judged: u32::try_from(s.judged).unwrap_or(u32::MAX),
+            current: s.current,
+            error: s.error,
+            started_at: at(s.started_at),
+            finished_at: at(s.finished_at),
+        }
+    }
+}
+
+/// Where one document stands in the model.
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+pub struct SpecModelDocumentDto {
+    pub path: String,
+    pub revision: String,
+    /// `extracted`, `failed` (part-way; read again on the next build),
+    /// `stale` (only an older revision was read) or `pending`.
+    pub state: String,
+    pub facts: u32,
+    /// Facts the model gave that the text did not bear out.
+    pub dropped: u32,
+    pub error: Option<String>,
+}
+
+/// One fact, with the passage it rests on.
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+pub struct SpecModelFactDto {
+    /// `entity`, `attribute`, `relation`, `requirement`, `constraint`,
+    /// `lifecycle` or `decision`.
+    pub kind: String,
+    pub subject: String,
+    pub aspect: String,
+    pub value: String,
+    pub text: String,
+    /// `active`, `proposed`, `deferred`, `superseded`, `resolved` or
+    /// `evidence`.
+    pub status: String,
+    pub status_because: String,
+    pub source: SpecModelSideDto,
+}
+
+/// A project's domain model as read so far.
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+pub struct SpecModelDto {
+    pub build: SpecModelBuildDto,
+    pub documents: Vec<SpecModelDocumentDto>,
+    pub facts: Vec<SpecModelFactDto>,
+}
+
+/// The project's sources, the facts of their current revisions, and where
+/// each document stands.
+async fn spec_model_state(
+    service: &Arc<DocumentsService>,
+    ctx: &SecurityContext,
+    workspace_id: Uuid,
+    project_id: Uuid,
+    reader: &dyn crate::artifact_ingest::port::RepoFileReader,
+) -> ApiResult<(
+    super::spec_model::Sources,
+    Vec<super::spec_model::extract::Fact>,
+    Vec<super::spec_model::Coverage>,
+)> {
+    let sources = service
+        .spec_model_sources(ctx, workspace_id, project_id, reader)
+        .await
+        .map_err(internal)?;
+    let rows = service
+        .spec_extractions(workspace_id, project_id)
+        .await
+        .map_err(internal)?;
+    let kept: Vec<super::spec_model::Kept<'_>> = rows
+        .iter()
+        .map(|r| super::spec_model::Kept {
+            path: &r.path,
+            revision: &r.revision,
+            extractor_version: &r.extractor_version,
+            facts: &r.facts,
+            dropped: r.dropped,
+            error: r.error.as_deref(),
+        })
+        .collect();
+    let (facts, coverage) = super::spec_model::current(&sources.documents, &kept);
+    Ok((sources, facts, coverage))
+}
+
+/// A project's domain model as read so far.
+async fn get_spec_model(
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(service): Extension<Arc<DocumentsService>>,
+    Extension(quality): Extension<Quality>,
+    Query(query): Query<SpecScopeQuery>,
+) -> ApiResult<JsonBody<SpecModelDto>> {
+    let project_id = parse_project_id(&query.project_id)?;
+    let workspace_id = parent_workspace(&service, &ctx, project_id).await?;
+    let reader = quality.reader()?;
+    let (_, facts, coverage) =
+        spec_model_state(&service, &ctx, workspace_id, project_id, reader.as_ref()).await?;
+    let count = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
+    Ok(Json(SpecModelDto {
+        build: super::spec_model::build::state(project_id).into(),
+        documents: coverage
+            .into_iter()
+            .map(|c| SpecModelDocumentDto {
+                path: c.path,
+                revision: c.revision,
+                state: c.state.to_string(),
+                facts: count(c.facts),
+                dropped: count(c.dropped),
+                error: c.error,
+            })
+            .collect(),
+        facts: facts
+            .into_iter()
+            .map(|f| SpecModelFactDto {
+                kind: f.kind,
+                subject: f.subject,
+                aspect: f.aspect,
+                value: f.value,
+                text: f.text,
+                status: f.status,
+                status_because: f.status_because,
+                source: SpecModelSideDto {
+                    path: f.path,
+                    line_start: u32::try_from(f.line_start).ok(),
+                    line_end: u32::try_from(f.line_end).ok(),
+                    quote: Some(f.quote),
+                },
+            })
+            .collect(),
+    }))
+}
+
+/// Read every document of the project not yet read at its revision, on the
+/// caller's model key, in the background. A build already running for the
+/// project is answered with its state rather than started twice.
+async fn start_spec_model_build(
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(service): Extension<Arc<DocumentsService>>,
+    Extension(quality): Extension<Quality>,
+    Json(body): Json<SpecModelBuildRequest>,
+) -> ApiResult<(StatusCode, JsonBody<SpecModelBuildDto>)> {
+    use super::spec_model::build;
+    let project_id = parse_project_id(&body.project_id)?;
+    let workspace_id = parent_workspace(&service, &ctx, project_id).await?;
+    let reader = quality.reader()?;
+    let models = quality.models()?;
+    let (sources, _, coverage) =
+        spec_model_state(&service, &ctx, workspace_id, project_id, reader.as_ref()).await?;
+    let wanted: std::collections::BTreeSet<&str> =
+        super::spec_model::to_read(&coverage).into_iter().collect();
+    let pending: Vec<super::spec_model::SourceText> = sources
+        .documents
+        .iter()
+        .filter(|d| wanted.contains(d.path.as_str()))
+        .cloned()
+        .collect();
+    if !build::begin(project_id, pending.len()) {
+        return Ok((StatusCode::ACCEPTED, Json(build::state(project_id).into())));
+    }
+    let findings_writer = quality.findings();
+    let sources_for_record = super::spec_model::Sources {
+        documents: sources.documents.clone(),
+        tree: sources.tree,
+    };
+    let documents = sources.documents;
+    tokio::spawn(async move {
+        for doc in pending {
+            build::update(project_id, |s| s.current = Some(doc.path.clone()));
+            let read = match build::read_document(
+                models.as_ref(),
+                &ctx,
+                &doc.path,
+                doc.doc_type.as_deref(),
+                &doc.text,
+            )
+            .await
+            {
+                Ok(read) => read,
+                Err(build::Stop(reason)) => {
+                    build::finish(project_id, Some(reason));
+                    return;
+                }
+            };
+            let revision = super::spec_model::extract::revision(&doc.text);
+            if let Err(error) = service
+                .put_spec_extraction(workspace_id, project_id, &doc.path, &revision, &read)
+                .await
+            {
+                tracing::warn!(%error, path = %doc.path, "spec-model: an extraction could not be kept");
+            }
+            build::update(project_id, |s| s.done += 1);
+        }
+        let reason = judge_new_candidates(
+            &service,
+            &models,
+            &ctx,
+            workspace_id,
+            project_id,
+            &documents,
+        )
+        .await
+        .err();
+        if let Some(writer) = findings_writer {
+            record_spec_model_findings(
+                &service,
+                writer.as_ref(),
+                &ctx,
+                workspace_id,
+                project_id,
+                &sources_for_record,
+            )
+            .await;
+        }
+        build::finish(project_id, reason);
+    });
+    Ok((StatusCode::ACCEPTED, Json(build::state(project_id).into())))
+}
+
+/// Today's candidates of the project's model and the judgements kept for
+/// them: the confirmed findings, and which candidates are not judged yet.
+async fn judged_candidates(
+    service: &DocumentsService,
+    workspace_id: Uuid,
+    project_id: Uuid,
+    documents: &[super::spec_model::SourceText],
+) -> anyhow::Result<(
+    Vec<super::spec_model::rules::Candidate>,
+    Vec<super::spec_model::finding::Finding>,
+    Vec<usize>,
+)> {
+    use super::spec_model as sm;
+    let rows = service.spec_extractions(workspace_id, project_id).await?;
+    let kept: Vec<sm::Kept<'_>> = rows
+        .iter()
+        .map(|r| sm::Kept {
+            path: &r.path,
+            revision: &r.revision,
+            extractor_version: &r.extractor_version,
+            facts: &r.facts,
+            dropped: r.dropped,
+            error: r.error.as_deref(),
+        })
+        .collect();
+    let (facts, _) = sm::current(documents, &kept);
+    let candidates = sm::candidates(documents, &facts);
+    let judgements = service.spec_judgements(workspace_id, project_id).await?;
+    let judged: Vec<sm::Judged<'_>> = judgements
+        .iter()
+        .map(|j| sm::Judged {
+            fingerprint: &j.fingerprint,
+            revisions: &j.revisions,
+            judge_version: &j.judge_version,
+            finding: j.finding.as_deref(),
+        })
+        .collect();
+    let (findings, unjudged) = sm::judged(&candidates, &sm::revisions(documents), &judged);
+    Ok((candidates, findings, unjudged))
+}
+
+/// The judge's stage of a build: every candidate not judged at its sides'
+/// revisions is asked about once. `Err` is why the build stopped.
+async fn judge_new_candidates(
+    service: &DocumentsService,
+    models: &Arc<dyn crate::llm_proxy::port::ModelProviders>,
+    ctx: &SecurityContext,
+    workspace_id: Uuid,
+    project_id: Uuid,
+    documents: &[super::spec_model::SourceText],
+) -> Result<(), String> {
+    use super::spec_model::build;
+    let (candidates, _, unjudged) = judged_candidates(service, workspace_id, project_id, documents)
+        .await
+        .map_err(|e| format!("the model could not be read back: {e:#}"))?;
+    build::update(project_id, |s| {
+        s.candidates = unjudged.len();
+        s.current = None;
+    });
+    let texts: std::collections::BTreeMap<String, String> = documents
+        .iter()
+        .map(|d| (d.path.clone(), d.text.clone()))
+        .collect();
+    let revision_of = super::spec_model::revisions(documents);
+    for i in unjudged {
+        let candidate = &candidates[i];
+        match build::judge_candidate(models.as_ref(), ctx, candidate, &texts).await {
+            Err(build::Stop(reason)) => return Err(reason),
+            Ok(Err(error)) => {
+                tracing::warn!(%error, "spec-model: a candidate could not be judged");
+            }
+            Ok(Ok(found)) => {
+                let (fingerprint, revisions) =
+                    super::spec_model::judgement_key(candidate, &revision_of);
+                if let Err(error) = service
+                    .put_spec_judgement(
+                        workspace_id,
+                        project_id,
+                        &fingerprint,
+                        &revisions,
+                        found.as_ref(),
+                    )
+                    .await
+                {
+                    tracing::warn!(%error, "spec-model: a judgement could not be kept");
+                }
+            }
+        }
+        build::update(project_id, |s| s.judged += 1);
+    }
+    Ok(())
+}
+
+/// Every finding of the project, references and judged alike, each with a
+/// member's decision on it when there is one.
+async fn spec_model_findings(
+    service: &DocumentsService,
+    workspace_id: Uuid,
+    project_id: Uuid,
+    sources: &super::spec_model::Sources,
+) -> anyhow::Result<(
+    Vec<super::spec_model::finding::Finding>,
+    std::collections::BTreeMap<String, String>,
+)> {
+    let mut findings = sources.reference_findings();
+    let (_, judged, _) =
+        judged_candidates(service, workspace_id, project_id, &sources.documents).await?;
+    findings.extend(judged);
+    let decisions = service
+        .spec_decisions(workspace_id, project_id)
+        .await?
+        .into_iter()
+        .map(|d| (d.fingerprint, d.decision))
+        .collect();
+    Ok((findings, decisions))
+}
+
+/// The last stage of a build: every document's findings as its
+/// `spec_finding` verdict, so the Specs list counts them and the IDE places
+/// them in the text. Nothing to stop a build over: a failure is logged and
+/// the next build writes again.
+async fn record_spec_model_findings(
+    service: &DocumentsService,
+    writer: &dyn crate::artifact_ingest::port::SpecFindingWriter,
+    ctx: &SecurityContext,
+    workspace_id: Uuid,
+    project_id: Uuid,
+    sources: &super::spec_model::Sources,
+) {
+    use super::spec_model::record;
+    let (findings, decisions) =
+        match spec_model_findings(service, workspace_id, project_id, sources).await {
+            Ok(read) => read,
+            Err(error) => {
+                tracing::warn!(%error, "spec-model: the findings could not be read to record");
+                return;
+            }
+        };
+    let dismissed: std::collections::BTreeSet<String> = decisions
+        .into_iter()
+        .filter(|(_, d)| d == "dismissed")
+        .map(|(f, _)| f)
+        .collect();
+    let paths: Vec<&str> = sources.documents.iter().map(|d| d.path.as_str()).collect();
+    let node_of: std::collections::BTreeMap<&str, &str> = sources
+        .documents
+        .iter()
+        .map(|d| (d.path.as_str(), d.node.as_str()))
+        .collect();
+    let verdicts: Vec<crate::artifact_ingest::port::QualityFinding> =
+        record::verdicts(&paths, &findings, &dismissed)
+            .into_iter()
+            .filter_map(|v| {
+                let node = node_of.get(v.path.as_str()).filter(|n| !n.is_empty())?;
+                Some(crate::artifact_ingest::port::QualityFinding {
+                    detector: record::DETECTOR.to_string(),
+                    subject: (*node).to_string(),
+                    path: Some(v.path),
+                    severity: Some(v.severity.to_string()),
+                    summary: Some(v.summary),
+                    score: None,
+                    details: v.details,
+                })
+            })
+            .collect();
+    if let Err(error) = writer
+        .write_spec_findings(
+            ctx,
+            &verdicts,
+            &[],
+            Some(&workspace_id.to_string()),
+            Some(&project_id.to_string()),
+        )
+        .await
+    {
+        tracing::warn!(%error, "spec-model: the findings could not be recorded");
+    }
+}
+
+/// Where a project's documents disagree, or refer to what is not there.
+async fn list_spec_model_findings(
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(service): Extension<Arc<DocumentsService>>,
+    Extension(quality): Extension<Quality>,
+    Query(query): Query<SpecScopeQuery>,
+) -> ApiResult<JsonBody<SpecModelFindingListDto>> {
+    let project_id = parse_project_id(&query.project_id)?;
+    let workspace_id = parent_workspace(&service, &ctx, project_id).await?;
+    let reader = quality.reader()?;
+    let sources = service
+        .spec_model_sources(&ctx, workspace_id, project_id, reader.as_ref())
+        .await
+        .map_err(internal)?;
+    let (findings, decisions) = spec_model_findings(&service, workspace_id, project_id, &sources)
+        .await
+        .map_err(internal)?;
+    let items: Vec<SpecModelFindingDto> = findings
+        .into_iter()
+        .map(|f| {
+            let decision = decisions.get(&f.fingerprint).cloned();
+            SpecModelFindingDto {
+                decision,
+                ..f.into()
+            }
+        })
+        .collect();
+    let total = u32::try_from(items.len()).unwrap_or(u32::MAX);
+    Ok(Json(SpecModelFindingListDto { items, total }))
+}
+
+/// Record a member's ✓ or ✗ on one finding. It holds for as long as the
+/// finding keeps its fingerprint, which a change to either passage ends.
+async fn decide_spec_model_finding(
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(service): Extension<Arc<DocumentsService>>,
+    Path(fingerprint): Path<String>,
+    Json(body): Json<SpecModelDecisionRequest>,
+) -> ApiResult<(StatusCode, JsonBody<SpecModelDecisionDto>)> {
+    let project_id = parse_project_id(&body.project_id)?;
+    let workspace_id = parent_workspace(&service, &ctx, project_id).await?;
+    if !matches!(body.decision.as_str(), "confirmed" | "dismissed") {
+        return Err(DocumentsError::invalid_argument()
+            .with_field_violation(
+                "decision",
+                "must be confirmed or dismissed".to_owned(),
+                "INVALID",
+            )
+            .create());
+    }
+    if fingerprint.is_empty()
+        || fingerprint.len() > 64
+        || !fingerprint.chars().all(|c| c.is_ascii_hexdigit())
+    {
+        return Err(DocumentsError::invalid_argument()
+            .with_field_violation(
+                "fingerprint",
+                "must be a finding's fingerprint".to_owned(),
+                "INVALID",
+            )
+            .create());
+    }
+    let saved = service
+        .put_spec_decision(&ctx, workspace_id, project_id, &fingerprint, &body.decision)
+        .await
+        .map_err(internal)?;
+    Ok((
+        StatusCode::CREATED,
+        Json(SpecModelDecisionDto {
+            fingerprint: saved.fingerprint,
+            decision: saved.decision,
+            decided_by: saved.decided_by.to_string(),
+            decided_at: saved
+                .decided_at
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap_or_default(),
+        }),
+    ))
+}
 
 // ── the Specs list, folded here rather than in a page ────────────────────────
 
@@ -2782,6 +3410,99 @@ pub fn register_routes(
         .error_401(openapi)
         .error_404(openapi)
         .error_500(openapi)
+        .register(router, openapi);
+
+    router = OperationBuilder::get("/studio-documents/v1/spec-model")
+        .operation_id("studio_documents.get_spec_model")
+        .summary("A project's domain model, as read from its documents so far")
+        .description(
+            "The facts every document gave at its current revision — entities, attributes, \
+             relations, requirements, constraints, lifecycles and decisions — each with the \
+             passage it rests on and whether that passage is in force \
+             (docs/spec-domain-model.md). `documents` says where each document stands: \
+             extracted, failed part-way, stale (only an older revision was read) or pending. \
+             `build` is the project's build as the process answering knows it.",
+        )
+        .tag("StudioDocuments")
+        .authenticated()
+        .require_license_features::<License>([])
+        .query_param("project_id", true, "The project whose model to read")
+        .handler(get_spec_model)
+        .json_response_with_schema::<SpecModelDto>(openapi, StatusCode::OK, "The model")
+        .error_400(openapi)
+        .error_401(openapi)
+        .error_404(openapi)
+        .error_500(openapi)
+        .error_503(openapi)
+        .register(router, openapi);
+
+    router = OperationBuilder::post("/studio-documents/v1/spec-model/builds")
+        .operation_id("studio_documents.start_spec_model_build")
+        .summary("Read a project's documents into its domain model, on your model key")
+        .description(
+            "Every document not yet read at its current revision is read by a model on the \
+             caller's own key (ADR-0039: Studio holds none), in the background; follow it on \
+             `GET /spec-model`. Not a studio-tasks run, because the queue worker cannot act as \
+             the caller. A build already running for the project is answered with its state. \
+             A document already read at its revision is never read again, so a build stopped \
+             part-way resumes where it stopped.",
+        )
+        .tag("StudioDocuments")
+        .authenticated()
+        .require_license_features::<License>([])
+        .json_request::<SpecModelBuildRequest>(openapi, "The project")
+        .handler(start_spec_model_build)
+        .json_response_with_schema::<SpecModelBuildDto>(openapi, StatusCode::ACCEPTED, "The build")
+        .error_400(openapi)
+        .error_401(openapi)
+        .error_404(openapi)
+        .error_500(openapi)
+        .error_503(openapi)
+        .register(router, openapi);
+
+    router =
+        OperationBuilder::post("/studio-documents/v1/spec-model/findings/{fingerprint}/decision")
+            .operation_id("studio_documents.decide_spec_model_finding")
+            .summary("Mark a finding a real problem, or not one")
+            .description(
+                "`confirmed` says the finding is a real problem, `dismissed` that it is not. The \
+             latest decision on a finding wins, and it holds while the finding keeps its \
+             fingerprint: a change to either passage is a new finding, decided afresh.",
+            )
+            .tag("StudioDocuments")
+            .authenticated()
+            .require_license_features::<License>([])
+            .path_param("fingerprint", "The finding's fingerprint")
+            .json_request::<SpecModelDecisionRequest>(openapi, "The project and the decision")
+            .handler(decide_spec_model_finding)
+            .json_response_with_schema::<SpecModelDecisionDto>(
+                openapi,
+                StatusCode::CREATED,
+                "The decision",
+            )
+            .error_400(openapi)
+            .error_401(openapi)
+            .error_404(openapi)
+            .error_500(openapi)
+            .register(router, openapi);
+
+    router = OperationBuilder::get("/studio-documents/v1/spec-model/findings")
+        .operation_id("studio_documents.list_spec_model_findings")
+        .summary("Where a project's documents disagree, or refer to what is not there")
+        .description(
+            "Read from the documents as they are written (docs/spec-domain-model.md). Today the              rules that need no model: a reference to an identifier, ADR, file or section the              project does not have (`reference.dangling`), and an ADR number two of the              project's ADR sets share, cited without a link from outside both              (`reference.ambiguous`). Every finding quotes each side, and its `fingerprint`              survives the lines moving. The list is read whole.",
+        )
+        .tag("StudioDocuments")
+        .authenticated()
+        .require_license_features::<License>([])
+        .query_param("project_id", true, "The project whose documents to check")
+        .handler(list_spec_model_findings)
+        .json_response_with_schema::<SpecModelFindingListDto>(openapi, StatusCode::OK, "The findings")
+        .error_400(openapi)
+        .error_401(openapi)
+        .error_404(openapi)
+        .error_500(openapi)
+        .error_503(openapi)
         .register(router, openapi);
 
     router = OperationBuilder::get("/studio-documents/v1/spec-pipeline")

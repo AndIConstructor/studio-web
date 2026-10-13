@@ -33,6 +33,8 @@ impl MigratorTrait for Migrator {
             Box::new(m0012::Migration),
             Box::new(m0013::Migration),
             Box::new(m0014::Migration),
+            Box::new(m0015::Migration),
+            Box::new(m0016::Migration),
         ]
     }
 }
@@ -918,6 +920,141 @@ ALTER TABLE studio_document_bindings
 ALTER TABLE studio_document_bindings DROP COLUMN IF EXISTS inferred_capabilities;",
                 )
                 .await?;
+            Ok(())
+        }
+    }
+}
+
+/// What a model read out of each document revision of a project
+/// (`docs/spec-domain-model.md`). One row per (project, path, revision,
+/// extractor version): an unchanged document is never asked about twice, and
+/// a new prompt asks again.
+mod m0015 {
+    use toolkit_db::sea_orm_migration::prelude::*;
+    use toolkit_db::sea_orm_migration::sea_orm::ConnectionTrait;
+
+    use super::{UNSUPPORTED, is_postgres};
+
+    pub struct Migration;
+
+    impl MigrationName for Migration {
+        fn name(&self) -> &str {
+            "m0015_spec_model_extractions"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl MigrationTrait for Migration {
+        async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+            if !is_postgres(manager) {
+                return Err(DbErr::Custom(UNSUPPORTED.to_owned()));
+            }
+            for sql in [
+                r"
+CREATE TABLE IF NOT EXISTS studio_spec_model_extractions (
+    id UUID PRIMARY KEY,
+    tenant_id UUID NOT NULL,
+    project_id UUID NOT NULL,
+    path TEXT NOT NULL,
+    revision TEXT NOT NULL,
+    extractor_version TEXT NOT NULL,
+    facts TEXT NOT NULL DEFAULT '[]',
+    dropped INTEGER NOT NULL DEFAULT 0,
+    error TEXT,
+    provider TEXT NOT NULL DEFAULT '',
+    model TEXT NOT NULL DEFAULT '',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (project_id, path, revision, extractor_version)
+);",
+                r"CREATE INDEX IF NOT EXISTS idx_studio_spec_model_extractions_project
+    ON studio_spec_model_extractions (tenant_id, project_id);",
+            ] {
+                manager.get_connection().execute_unprepared(sql).await?;
+            }
+            Ok(())
+        }
+
+        async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+            if !is_postgres(manager) {
+                return Err(DbErr::Custom(UNSUPPORTED.to_owned()));
+            }
+            manager
+                .get_connection()
+                .execute_unprepared("DROP TABLE IF EXISTS studio_spec_model_extractions;")
+                .await?;
+            Ok(())
+        }
+    }
+}
+
+/// What the judge said about each candidate of a project's spec model, per
+/// revision of the documents on its sides, and what members decided about
+/// the findings (`docs/spec-domain-model.md`).
+mod m0016 {
+    use toolkit_db::sea_orm_migration::prelude::*;
+    use toolkit_db::sea_orm_migration::sea_orm::ConnectionTrait;
+
+    use super::{UNSUPPORTED, is_postgres};
+
+    pub struct Migration;
+
+    impl MigrationName for Migration {
+        fn name(&self) -> &str {
+            "m0016_spec_model_judgements_and_decisions"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl MigrationTrait for Migration {
+        async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+            if !is_postgres(manager) {
+                return Err(DbErr::Custom(UNSUPPORTED.to_owned()));
+            }
+            for sql in [
+                r"
+CREATE TABLE IF NOT EXISTS studio_spec_model_judgements (
+    id UUID PRIMARY KEY,
+    tenant_id UUID NOT NULL,
+    project_id UUID NOT NULL,
+    fingerprint TEXT NOT NULL,
+    revisions TEXT NOT NULL,
+    judge_version TEXT NOT NULL,
+    conflict BOOLEAN NOT NULL,
+    finding TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (project_id, fingerprint, revisions, judge_version)
+);",
+                r"CREATE INDEX IF NOT EXISTS idx_studio_spec_model_judgements_project
+    ON studio_spec_model_judgements (tenant_id, project_id);",
+                r"
+CREATE TABLE IF NOT EXISTS studio_spec_model_decisions (
+    id UUID PRIMARY KEY,
+    tenant_id UUID NOT NULL,
+    project_id UUID NOT NULL,
+    fingerprint TEXT NOT NULL,
+    decision TEXT NOT NULL CHECK (decision IN ('confirmed', 'dismissed')),
+    decided_by UUID NOT NULL,
+    decided_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (project_id, fingerprint)
+);",
+                r"CREATE INDEX IF NOT EXISTS idx_studio_spec_model_decisions_project
+    ON studio_spec_model_decisions (tenant_id, project_id);",
+            ] {
+                manager.get_connection().execute_unprepared(sql).await?;
+            }
+            Ok(())
+        }
+
+        async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+            if !is_postgres(manager) {
+                return Err(DbErr::Custom(UNSUPPORTED.to_owned()));
+            }
+            for sql in [
+                "DROP TABLE IF EXISTS studio_spec_model_decisions;",
+                "DROP TABLE IF EXISTS studio_spec_model_judgements;",
+            ] {
+                manager.get_connection().execute_unprepared(sql).await?;
+            }
             Ok(())
         }
     }

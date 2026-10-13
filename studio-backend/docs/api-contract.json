@@ -895,6 +895,40 @@
     },
     {
       "method": "GET",
+      "path": "/studio-documents/v1/spec-model",
+      "operation_id": "studio_documents.get_spec_model",
+      "tag": "StudioDocuments",
+      "summary": "A project's domain model, as read from its documents so far",
+      "authenticated": true,
+      "responses": [
+        "SpecModelDto"
+      ],
+      "errors": [
+        "400",
+        "401",
+        "404",
+        "500"
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/studio-documents/v1/spec-model/findings",
+      "operation_id": "studio_documents.list_spec_model_findings",
+      "tag": "StudioDocuments",
+      "summary": "Where a project's documents disagree, or refer to what is not there",
+      "authenticated": true,
+      "responses": [
+        "SpecModelFindingListDto"
+      ],
+      "errors": [
+        "400",
+        "401",
+        "404",
+        "500"
+      ]
+    },
+    {
+      "method": "GET",
       "path": "/studio-documents/v1/spec-pipeline",
       "operation_id": "studio_documents.list_spec_pipeline",
       "tag": "StudioDocuments",
@@ -2754,6 +2788,42 @@
         "400",
         "401",
         "403",
+        "500"
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/studio-documents/v1/spec-model/builds",
+      "operation_id": "studio_documents.start_spec_model_build",
+      "tag": "StudioDocuments",
+      "summary": "Read a project's documents into its domain model, on your model key",
+      "authenticated": true,
+      "request": "SpecModelBuildRequest",
+      "responses": [
+        "SpecModelBuildDto"
+      ],
+      "errors": [
+        "400",
+        "401",
+        "404",
+        "500"
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/studio-documents/v1/spec-model/findings/{fingerprint}/decision",
+      "operation_id": "studio_documents.decide_spec_model_finding",
+      "tag": "StudioDocuments",
+      "summary": "Mark a finding a real problem, or not one",
+      "authenticated": true,
+      "request": "SpecModelDecisionRequest",
+      "responses": [
+        "SpecModelDecisionDto"
+      ],
+      "errors": [
+        "400",
+        "401",
+        "404",
         "500"
       ]
     },

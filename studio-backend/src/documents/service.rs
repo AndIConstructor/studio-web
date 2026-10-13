@@ -1526,6 +1526,157 @@ impl DocumentsService {
         Ok(quality::docs_for(&wanted, &by_path))
     }
 
+    /// The project's documents as the spec model reads them, and every path
+    /// of its checkouts to resolve references against.
+    ///
+    /// The documents are the project's bindings that are documents at all,
+    /// guessed or confirmed, read as written (`docs/spec-domain-model.md`).
+    pub async fn spec_model_sources(
+        &self,
+        ctx: &SecurityContext,
+        workspace_id: Uuid,
+        project_id: Uuid,
+        reader: &dyn crate::artifact_ingest::port::RepoFileReader,
+    ) -> Result<super::spec_model::Sources> {
+        let rows: Vec<DocumentBinding> = self
+            .all_bindings(workspace_id, Some(project_id))
+            .await?
+            .into_iter()
+            .filter(|row| row.state != BindingState::NotADocument)
+            .collect();
+        if rows.is_empty() {
+            return Ok(super::spec_model::Sources::default());
+        }
+        let tenants = checkout_tenants(
+            rows.iter().map(|r| r.project_id),
+            Some(project_id),
+            workspace_id,
+        );
+        // The whole listing, not the text files alone: a link that leads to a
+        // template or an image resolves as surely as one to a document.
+        let mut by_path = self.checkout_listing(ctx, &tenants, reader).await;
+        let tree = by_path.keys().cloned().collect();
+        let documents = rows
+            .into_iter()
+            .filter_map(|row| {
+                by_path
+                    .remove(&row.path)
+                    .flatten()
+                    .map(|text| super::spec_model::SourceText {
+                        path: row.path,
+                        text,
+                        doc_type: row.type_key,
+                        node: row.node_id,
+                    })
+            })
+            .collect();
+        Ok(super::spec_model::Sources { documents, tree })
+    }
+
+    /// Every extraction kept for the project, of any revision.
+    pub async fn spec_extractions(
+        &self,
+        workspace_id: Uuid,
+        project_id: Uuid,
+    ) -> Result<Vec<super::entity::spec_extraction::Model>> {
+        self.repo.list_extractions(workspace_id, project_id).await
+    }
+
+    /// Keep what reading one document revision gave.
+    pub async fn put_spec_extraction(
+        &self,
+        workspace_id: Uuid,
+        project_id: Uuid,
+        path: &str,
+        revision: &str,
+        read: &super::spec_model::build::Read,
+    ) -> Result<()> {
+        let version = super::spec_model::extract::EXTRACTOR_VERSION;
+        self.repo
+            .put_extraction(super::entity::spec_extraction::Model {
+                id: super::repo::extraction_id(project_id, path, revision, version),
+                tenant_id: workspace_id,
+                project_id,
+                path: path.to_string(),
+                revision: revision.to_string(),
+                extractor_version: version.to_string(),
+                facts: serde_json::to_string(&read.extraction.facts)?,
+                dropped: i32::try_from(read.extraction.dropped).unwrap_or(i32::MAX),
+                error: read.error.clone(),
+                provider: read.provider.clone(),
+                model: read.model.clone(),
+                created_at: OffsetDateTime::now_utc(),
+            })
+            .await
+    }
+
+    /// Every judgement kept for the project.
+    pub async fn spec_judgements(
+        &self,
+        workspace_id: Uuid,
+        project_id: Uuid,
+    ) -> Result<Vec<super::entity::spec_judgement::Model>> {
+        self.repo.list_judgements(workspace_id, project_id).await
+    }
+
+    /// Keep what the judge said about one candidate at its sides' revisions.
+    pub async fn put_spec_judgement(
+        &self,
+        workspace_id: Uuid,
+        project_id: Uuid,
+        fingerprint: &str,
+        revisions: &str,
+        finding: Option<&super::spec_model::finding::Finding>,
+    ) -> Result<()> {
+        let version = super::spec_model::judge::JUDGE_VERSION;
+        self.repo
+            .put_judgement(super::entity::spec_judgement::Model {
+                id: super::repo::judgement_id(project_id, fingerprint, revisions, version),
+                tenant_id: workspace_id,
+                project_id,
+                fingerprint: fingerprint.to_string(),
+                revisions: revisions.to_string(),
+                judge_version: version.to_string(),
+                conflict: finding.is_some(),
+                finding: finding.map(serde_json::to_string).transpose()?,
+                created_at: OffsetDateTime::now_utc(),
+            })
+            .await
+    }
+
+    /// Every member decision on the project's spec-model findings.
+    pub async fn spec_decisions(
+        &self,
+        workspace_id: Uuid,
+        project_id: Uuid,
+    ) -> Result<Vec<super::entity::spec_decision::Model>> {
+        self.repo
+            .list_spec_decisions(workspace_id, project_id)
+            .await
+    }
+
+    /// Record a member's ✓ (`confirmed`) or ✗ (`dismissed`) on a finding.
+    pub async fn put_spec_decision(
+        &self,
+        ctx: &SecurityContext,
+        workspace_id: Uuid,
+        project_id: Uuid,
+        fingerprint: &str,
+        decision: &str,
+    ) -> Result<super::entity::spec_decision::Model> {
+        let model = super::entity::spec_decision::Model {
+            id: super::repo::spec_decision_id(project_id, fingerprint),
+            tenant_id: workspace_id,
+            project_id,
+            fingerprint: fingerprint.to_string(),
+            decision: decision.to_string(),
+            decided_by: ctx.subject_id(),
+            decided_at: OffsetDateTime::now_utc(),
+        };
+        self.repo.put_spec_decision(model.clone()).await?;
+        Ok(model)
+    }
+
     /// What each analysed document's result is recorded against, by the path
     /// the run names it with.
     ///
@@ -1723,7 +1874,22 @@ impl DocumentsService {
         tenants: &[Uuid],
         reader: &dyn crate::artifact_ingest::port::RepoFileReader,
     ) -> std::collections::BTreeMap<String, String> {
-        let mut by_path: std::collections::BTreeMap<String, String> =
+        self.checkout_listing(ctx, tenants, reader)
+            .await
+            .into_iter()
+            .filter_map(|(path, text)| text.map(|t| (path, t)))
+            .collect()
+    }
+
+    /// Every file of those checkouts, text or not, with the text of the ones
+    /// [`Self::checkout_files`] gives — tried tenant by tenant the same way.
+    async fn checkout_listing(
+        &self,
+        ctx: &SecurityContext,
+        tenants: &[Uuid],
+        reader: &dyn crate::artifact_ingest::port::RepoFileReader,
+    ) -> std::collections::BTreeMap<String, Option<String>> {
+        let mut by_path: std::collections::BTreeMap<String, Option<String>> =
             std::collections::BTreeMap::new();
         for tenant in tenants {
             // A tenant that has recorded no sources has no checkout to read,
@@ -1741,7 +1907,7 @@ impl DocumentsService {
                     .secret_ref
                     .as_ref()
                     .map(|secret_ref| (secret_ref, &resolved.source.full_path));
-                let mut files = match reader.read_repo_files(&tenant.to_string(), dir).await {
+                let mut files = match reader.read_repo_listing(&tenant.to_string(), dir).await {
                     Ok(files) => files,
                     Err(error) => {
                         tracing::warn!(%error, dir, "studio-documents: a checkout could not be read");
@@ -1755,7 +1921,7 @@ impl DocumentsService {
                     && let Some((secret_ref, full_path)) = clone
                 {
                     files = reader
-                        .read_synced_clone(secret_ref, full_path)
+                        .read_synced_clone_listing(secret_ref, full_path)
                         .await
                         .unwrap_or_else(|error| {
                             tracing::warn!(%error, dir, "studio-documents: the synced clone could not be read");
