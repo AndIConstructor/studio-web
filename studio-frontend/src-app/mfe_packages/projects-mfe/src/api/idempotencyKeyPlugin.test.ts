@@ -13,6 +13,11 @@ import {
   startsSync,
 } from './ArtifactIngestApiService';
 import type { SyncBody } from './artifactTypes';
+import {
+  DOCUMENTS_API_BASE_URL,
+  DocumentsApiService,
+  startsQualityRun,
+} from './DocumentsApiService';
 
 const request = (
   method: RestRequestContext['method'],
@@ -40,6 +45,13 @@ describe('IdempotencyKeyPlugin', () => {
     expect(again.headers[IDEMPOTENCY_KEY_HEADER]).toBe(first.headers[IDEMPOTENCY_KEY_HEADER]);
   });
 
+  it('gives one body sent to two URLs two keys: the server remembers a key per tenant, not per route', () => {
+    const body = { repo: 'a' };
+    const first = plugin.onRequest(request('POST', SYNC_URL, body));
+    const other = plugin.onRequest(request('POST', `${SYNC_URL}?again=1`, body));
+    expect(other.headers[IDEMPOTENCY_KEY_HEADER]).not.toBe(first.headers[IDEMPOTENCY_KEY_HEADER]);
+  });
+
   it('keeps a key the caller already chose', () => {
     const out = plugin.onRequest(request('POST', SYNC_URL, {}, { [IDEMPOTENCY_KEY_HEADER]: 'k-1' }));
     expect(out.headers[IDEMPOTENCY_KEY_HEADER]).toBe('k-1');
@@ -63,6 +75,25 @@ describe('startsSync', () => {
   });
 });
 
+describe('startsQualityRun', () => {
+  const QUALITY = `${DOCUMENTS_API_BASE_URL}/workspaces/w-1/projects/p-1/quality`;
+
+  it('names a quality run of any detector, with or without a query', () => {
+    expect(startsQualityRun(`${QUALITY}/purpose`)).toBe(true);
+    expect(startsQualityRun(`${QUALITY}/leak?x=1`)).toBe(true);
+  });
+
+  it('leaves the other routes alone', () => {
+    // Built from the base, not written out: scripts/check-api-usage.mjs reads
+    // every literal path as a call.
+    expect(startsQualityRun(`${DOCUMENTS_API_BASE_URL}/workspaces/w-1/projects/p-1/documents`)).toBe(false);
+    expect(startsQualityRun(`${QUALITY}/purpose/x`)).toBe(false);
+    expect(startsQualityRun(`${ARTIFACT_INGEST_API_BASE_URL}/workspaces/w-1/projects/p-1/quality/leak`)).toBe(
+      false
+    );
+  });
+});
+
 /** Records every request it is handed; the first `fail` of them are lost. */
 function recordingAdapter(fail = 0) {
   const seen: { method?: string; headers: Record<string, unknown> }[] = [];
@@ -76,7 +107,10 @@ function recordingAdapter(fail = 0) {
 }
 
 /** The service's REST protocol, its axios client answered by `adapter`. */
-function wired(service: ArtifactIngestApiService, adapter: AxiosAdapter): RestProtocol {
+function wired(
+  service: ArtifactIngestApiService | DocumentsApiService,
+  adapter: AxiosAdapter
+): RestProtocol {
   const rest = (service as unknown as { protocol: (c: typeof RestProtocol) => RestProtocol }).protocol(
     RestProtocol
   );
@@ -114,5 +148,25 @@ describe('ArtifactIngestApiService and the key', () => {
 
     expect(seen).toHaveLength(2);
     expect(seen[1].headers[IDEMPOTENCY_KEY_HEADER]).toBe(seen[0].headers[IDEMPOTENCY_KEY_HEADER]);
+  });
+});
+
+describe('DocumentsApiService and the key', () => {
+  it('sends purpose and leak of one body each its own key, and none on a write that starts no run', async () => {
+    const service = new DocumentsApiService();
+    const { seen, adapter } = recordingAdapter();
+    wired(service, adapter);
+    const project = { workspaceId: 'w-1', projectId: 'p-1' };
+    const body = { binding_ids: ['b-1'], document_ids: [] };
+
+    await service.analyze({ ...project, detector: 'purpose' }).fetch(body);
+    await service.analyze({ ...project, detector: 'leak' }).fetch(body);
+    await service.createDocument(project).fetch({ type_key: 'prd', title: 'PRD' });
+
+    const keys = seen.map((r) => r.headers[IDEMPOTENCY_KEY_HEADER]);
+    expect(keys[0]).toMatch(/^[0-9a-f-]{36}$/);
+    expect(keys[1]).toMatch(/^[0-9a-f-]{36}$/);
+    expect(keys[1]).not.toBe(keys[0]);
+    expect(keys[2]).toBeUndefined();
   });
 });
