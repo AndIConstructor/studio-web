@@ -1,6 +1,11 @@
 /** The MFE -> shell channel */
 
-import type { ChildMfeBridge } from '@gears-frontx/react';
+import {
+  FRONTX_ACTION_MOUNT_EXT,
+  FRONTX_ACTION_UNMOUNT_EXT,
+  FRONTX_OVERLAY_DOMAIN,
+  type ChildMfeBridge,
+} from '@gears-frontx/react';
 
 /** Screen domain: `kind: opened | closed | section`. */
 export const STUDIO_ACTION_CONTEXT_PUBLISH =
@@ -49,6 +54,10 @@ export type StudioArtifactRequest = StudioArtifact & { projectId: string };
 export const STUDIO_EXTENSION_WORKSPACE_CREATE =
   'gts.frontx.mfes.ext.extension.v1~frontx.screensets.layout.overlay.v1~constructor_studio.overlays.workspace_create.main.v1';
 
+/** connections-mfe's connection form, opened from projects-mfe as well. */
+export const STUDIO_EXTENSION_CONNECTION_CREATE =
+  'gts.frontx.mfes.ext.extension.v1~frontx.screensets.layout.overlay.v1~constructor_studio.overlays.connect_source.main.v1';
+
 export interface HostAction {
   type: string;
   target: string;
@@ -65,4 +74,25 @@ export function sendAndForget(bridge: ChildMfeBridge | null, action: HostAction,
   void sendToHost(bridge, action).catch((error: unknown) => {
     console.error(`[${tag}] host action failed`, action.type, error);
   });
+}
+
+function overlayAction(type: string, extensionId: string): HostAction {
+  return { type, target: FRONTX_OVERLAY_DOMAIN, payload: { subject: extensionId } };
+}
+
+export function openOverlay(bridge: ChildMfeBridge | null, extensionId: string, tag: string): void {
+  sendAndForget(bridge, overlayAction(FRONTX_ACTION_MOUNT_EXT, extensionId), tag);
+}
+
+export function closeOverlay(
+  bridge: ChildMfeBridge | null,
+  extensionId: string,
+  tag: string
+): Promise<void> {
+  if (!bridge) return Promise.resolve();
+  return sendToHost(bridge, overlayAction(FRONTX_ACTION_UNMOUNT_EXT, extensionId)).catch(
+    (error: unknown) => {
+      console.error(`[${tag}] closing the overlay failed`, extensionId, error);
+    }
+  );
 }

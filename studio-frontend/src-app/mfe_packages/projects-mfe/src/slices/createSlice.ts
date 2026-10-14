@@ -9,17 +9,18 @@ import type { Refusal } from '@constructor-studio/mfe-shared';
 import {
   EMPTY_DRAFT,
   MAX_SOURCES,
-  sourceKey,
   type ProjectDraft,
   type RepositoryPick,
 } from '../model/projectDraft';
 import { FIRST_STEP_KEY, type WizardStepKey } from '../model/wizardSteps';
+import { pickerReducers, toggled } from './pickerReducers';
 
 export interface CreateState {
   stepKey: WizardStepKey;
   draft: ProjectDraft;
+  providerId: string | null;
   connectionId: string | null;
-  repoSearch: string;
+  search: string;
   submitting: boolean;
   error: Refusal | null;
 }
@@ -29,8 +30,9 @@ const SLICE_KEY = 'projects/create' as const;
 const initialState: CreateState = {
   stepKey: FIRST_STEP_KEY,
   draft: EMPTY_DRAFT,
+  providerId: null,
   connectionId: null,
-  repoSearch: '',
+  search: '',
   submitting: false,
   error: null,
 };
@@ -41,8 +43,10 @@ const {
   goToStep,
   editDraft,
   pickSource,
-  selectConnection,
-  searchRepositories,
+  chooseProvider,
+  clearProvider,
+  chooseConnection,
+  searchRepos,
   submitStarted,
   submitFailed,
 } = createSlice({
@@ -53,8 +57,9 @@ const {
     resetWizard: (state: CreateState) => {
       state.stepKey = FIRST_STEP_KEY;
       state.draft = EMPTY_DRAFT;
+      state.providerId = null;
       state.connectionId = null;
-      state.repoSearch = '';
+      state.search = '';
       state.submitting = false;
       state.error = null;
     },
@@ -68,26 +73,13 @@ const {
     },
     // @cpt-begin:cpt-studiofrontend-dod-project-create-many-sources:p1:inst-1
     pickSource: (state: CreateState, action: ReducerPayload<RepositoryPick>) => {
-      const key = sourceKey(action.payload);
-      const kept = state.draft.sources.filter((pick) => sourceKey(pick) !== key);
-      const wasPicked = kept.length !== state.draft.sources.length;
-      if (wasPicked) {
-        state.draft = { ...state.draft, sources: kept };
-      } else {
-        if (kept.length >= MAX_SOURCES) return;
-        state.draft = { ...state.draft, sources: [...kept, action.payload] };
-      }
+      const sources = toggled(state.draft.sources, action.payload, MAX_SOURCES);
+      if (!sources) return;
+      state.draft = { ...state.draft, sources };
       state.error = null;
     },
     // @cpt-end:cpt-studiofrontend-dod-project-create-many-sources:p1:inst-1
-    selectConnection: (state: CreateState, action: ReducerPayload<string>) => {
-      if (state.connectionId === action.payload) return;
-      state.connectionId = action.payload;
-      state.repoSearch = '';
-    },
-    searchRepositories: (state: CreateState, action: ReducerPayload<string>) => {
-      state.repoSearch = action.payload;
-    },
+    ...pickerReducers<CreateState>(),
     submitStarted: (state: CreateState) => {
       state.submitting = true;
       state.error = null;
@@ -105,8 +97,10 @@ export {
   goToStep,
   editDraft,
   pickSource,
-  selectConnection,
-  searchRepositories,
+  chooseProvider,
+  clearProvider,
+  chooseConnection,
+  searchRepos,
   submitStarted,
   submitFailed,
 };
