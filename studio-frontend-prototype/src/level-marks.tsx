@@ -26,9 +26,20 @@ export function LevelBadge({ level }: { level: Level }) {
  *  organization's logo. */
 export function LevelMark({ level, name, logo }: { level: Level; name: string; logo?: string | null }) {
   if (logo) return <img className={`level-mark level-${level} has-logo`} src={logo} alt="" />;
+  // The platform is one shared layer, not a thing with a name: layers, not an initial.
+  if (level === "platform")
+    return (
+      <span className="level-mark level-platform" aria-hidden="true">
+        <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinejoin="round">
+          <path d="M8 2 14 5 8 8 2 5Z" />
+          <path d="M2 8l6 3 6-3" />
+          <path d="M2 11l6 3 6-3" />
+        </svg>
+      </span>
+    );
   return (
     <span className={`level-mark level-${level}`} aria-hidden="true">
-      {level === "platform" ? "P" : (name || "?").slice(0, 1).toUpperCase()}
+      {(name || "?").slice(0, 1).toUpperCase()}
     </span>
   );
 }
@@ -39,7 +50,8 @@ export function OrgMark({ token, orgId, name }: { token: string; orgId: string |
   return <LevelMark level="organization" name={name} logo={logo} />;
 }
 
-/** Set or remove an organization's logo, on its overview. The backend says
+/** Set or remove an organization's logo, in the admin area's organization
+ *  card. The backend says
  *  who may; anybody else is told so. */
 export function LogoControl({ token, orgId }: { token: string; orgId: string }) {
   const logo = useOrgLogo(token, orgId);
