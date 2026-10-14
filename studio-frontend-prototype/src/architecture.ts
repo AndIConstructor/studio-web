@@ -619,6 +619,14 @@ export const SURFACES: Surface[] = [
     ],
   },
   {
+    id: "project-builds",
+    area: "project",
+    title: "Builds",
+    does: "See what the product was built into, where and how it went: the CI runs of the project's repositories.",
+    components: ["ProjectBuilds"],
+    gears: ["studio-artifact-ingest"],
+  },
+  {
     id: "project-artifacts",
     area: "project",
     title: "Artifacts",
@@ -693,7 +701,7 @@ export const SURFACES: Surface[] = [
     area: "organization",
     title: "Components catalogue",
     does: "Browse every gear a product can be built from, with its profile and documentation.",
-    components: ["ComponentsCatalog", "ComponentRegistry", "RegistryDecisions", "DeclareCandidate", "SuggestDescription", "GearDetail", "ProfileEditor", "PlatformSourcesPanel", "OrgGearRepositoryCard"],
+    components: ["ComponentsCatalog", "ComponentRegistry", "RegistryDecisions", "DeclareCandidate", "SuggestDescription", "ExtractReadiness", "GearDetail", "ProfileEditor", "PlatformSourcesPanel", "OrgGearRepositoryCard"],
     gears: ["studio-components-catalog", "studio-connector", "studio-kits", "studio-user"],
   },
   {

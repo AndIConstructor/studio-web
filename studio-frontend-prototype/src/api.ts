@@ -1,5 +1,6 @@
 import type { DomainExpert, DomainQuestions, TermDrift } from "./domain-questions";
 import type { GearBrings } from "./gear-brings";
+import type { GearCatalogue } from "./product-configurator";
 import type { ProjectComponent, PullRequestChecks } from "./project-checks";
 import type { Decision, RemarkComment, Remarks, ReviewBrief } from "./remarks";
 import type { InboxMark } from "./waiting-on-me";
@@ -609,6 +610,47 @@ export interface RegistrySuggestion {
   model: string;
 }
 
+/** One place a readiness check fails at. */
+export interface ReadinessSpot {
+  path: string;
+  /** 1-based. */
+  line?: number | null;
+  text?: string | null;
+}
+
+/** One readiness check (ADR-0044 §1). */
+export interface ReadinessCheck {
+  /** `size`, `boundary`, `persistence`, `reaches_out`, `gears`, `reached_into` or `dependencies`. */
+  key: string;
+  ok: boolean;
+  /** A failure that stops Extract; a failed check that does not block is advice. */
+  blocks: boolean;
+  summary: string;
+  spots: ReadinessSpot[];
+  more: number;
+}
+
+/** What `GET /registry/{name}/readiness` answered: whether the component
+ *  could leave its project as a crate of its own. */
+export interface RegistryReadiness {
+  name: string;
+  ready: boolean;
+  /** `module` or `crate`. */
+  kind: string;
+  repo: string;
+  git_ref?: string | null;
+  project_name?: string | null;
+  path: string;
+  module_path?: string | null;
+  files: number;
+  checks: ReadinessCheck[];
+  dependencies: { name: string; spec?: string | null }[];
+  /** Other gears it uses, which must be crates first. */
+  gears: string[];
+  outside_read: number;
+  outside_total: number;
+}
+
 /** One signal a candidate detector found (ADR-0041 P3). */
 export interface RegistryEvidence {
   /** `rest`, `persistence`, `types`, `boundary`, `docs`, `consumers` or `copied`. */
@@ -823,9 +865,12 @@ export interface Candidate {
   /** The engine's reason, when `blocked`. */
   composable_why?: string | null;
   /** `project` when the project's own repository declares this gear (whether
-   *  or not the catalogue lists it too); `catalogue` otherwise. */
-  origin?: "catalogue" | "project";
-  /** For a `project` gear, where it lives in the repository. */
+   *  or not the catalogue lists it too); `organization` for a gear the
+   *  organization's registry holds from another project or its gear
+   *  repository; `catalogue` otherwise. */
+  origin?: "catalogue" | "project" | "organization";
+  /** For a `project` gear, where it lives in the repository; for an
+   *  `organization` one, which project and where (`Insight: src/analytics`). */
   path?: string | null;
   /** For a gear the organization's registry backs, its state there. */
   registry_state?: string | null;
@@ -4534,6 +4579,11 @@ export const api = {
     request<RegistrySuggestion>(`/studio-components-catalog/v1/registry/${encodeURIComponent(name)}/suggest`, token, {
       method: "POST",
     }),
+  /** Whether an entry could leave its project as a crate of its own, and
+   *  what stops it (ADR-0044 §1). Reads its code; nothing is written. An
+   *  organization administrator only: anyone else gets a 403 problem. */
+  registryReadiness: (token: string, name: string) =>
+    request<RegistryReadiness>(`/studio-components-catalog/v1/registry/${encodeURIComponent(name)}/readiness`, token),
   /** What the last registry walk saw of each project: read, unchanged, or
    *  not readable and why. */
   registryProjects: (token: string) =>
@@ -4873,6 +4923,13 @@ export const api = {
       `/studio-product/v1/gearbox/config-schema`,
       token,
       { method: "POST", body: JSON.stringify({ gears }) },
+    ),
+  /** The gear corpus's catalogue as the Gearbox engine reads it: every gear
+   *  with its name, category, extension points and config schema. */
+  gearboxCatalogue: (token: string) =>
+    request<{ catalogue: GearCatalogue; corpus_ref: string; corpus_commit?: string | null }>(
+      `/studio-product/v1/gearbox/catalogue`,
+      token,
     ),
   /** Whether product previews can run, and against which gear corpus. */
   gearboxStatus: (token: string) =>

@@ -58,6 +58,7 @@ import {
 import { ProjectOverview, type ProjTab } from "./project-overview";
 import { makeZip } from "./zip";
 import { SpecModelTab } from "./spec-model-tab";
+import { ProjectBuilds } from "./builds-tab";
 import { GearsTable, PermissionsTable } from "./system-tables";
 import {
   StudioBridgeProvider,
@@ -651,7 +652,7 @@ const LEVEL_NAV: Record<"platform" | "organization", { id: View; icon: string; l
     // Where its products run: clusters, registries, approvals (ADR-0043).
     { id: "environments", icon: "layers", label: "Environments" },
     // What its projects build: the registry, candidates, its gear repository.
-    { id: "gears", icon: "package", label: "Our components" },
+    { id: "gears", icon: "package", label: "Components" },
     // Every report the Studio draws, configured once for the organization.
     { id: "reports", icon: "activity", label: "Reports" },
     // The type catalogue, and the lists of its objects people save.
@@ -4705,7 +4706,7 @@ function WorkspaceProjects({
                 No components are offered for a shared gear store. A kit installs with
                 <code> copy</code> across every repository the project has, and this one
                 already belongs to the gears in it — it has its own conventions to keep.
-                The project can still take a kit later, from its Components tab.
+                The project can still take a kit later, from its Kits tab.
               </p>
             )}
 
@@ -5084,13 +5085,20 @@ const PROJECT_TABS: { id: ProjTab; icon: string; label: string }[] = [
   { id: "specs", icon: "scan", label: "Specs" },
   // What the specs say the application is, read out of them, and where they
   // disagree about it (docs/spec-domain-model.md). Next to Specs because it is
-  // made of them, and before Components because what a product is composed
+  // made of them, and before Product because what a product is composed
   // from should answer this model.
   { id: "model", icon: "layers", label: "Domain model" },
-  { id: "components", icon: "package", label: "Components" },
+  // Called Product, not Components: a project gathers repositories, and what
+  // this tab makes of them is the product. The organization and the platform
+  // keep "Components" for what they hold. The id stays, so links still open it.
+  { id: "components", icon: "package", label: "Product" },
   // Kits are how the project works (workflows, conventions pinned to a Git
   // version), not what it is made of, so they stopped sharing a page with the
   // specs-to-product journey.
+  // What the product was built into, where, and how it went (ADR-0045): after
+  // the tab that says what it is made of, before where it runs. The portal
+  // does not build; CI and the IDE do.
+  { id: "builds", icon: "activity", label: "Builds" },
   { id: "kits", icon: "grid", label: "Kits" },
   { id: "artifacts", icon: "file", label: "Artifacts" },
   // Sources sits after them because it is where they come from: a sync run
@@ -5435,6 +5443,7 @@ function ProjectScreen({
             workspaceId={workspace.id}
           />
         )}
+        {tab === "builds" && <ProjectBuilds token={token} projectId={proj.id} />}
         {tab === "kits" && (
           <ProjectKits
             token={token}
