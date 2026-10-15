@@ -40,10 +40,18 @@ impl GitHubDriver {
         rb: reqwest::RequestBuilder,
         auth: &ConnectionAuth,
     ) -> reqwest::RequestBuilder {
-        rb.header("Authorization", format!("Bearer {}", auth.token))
+        let rb = rb
             .header("Accept", "application/vnd.github+json")
             .header("X-GitHub-Api-Version", "2022-11-28")
-            .header("User-Agent", "constructor-studio")
+            .header("User-Agent", "constructor-studio");
+        // A public gear repository (ADR-0046) is read with no token: GitHub
+        // answers an empty bearer with 401, and an anonymous request with the
+        // repository.
+        if auth.token.trim().is_empty() {
+            rb
+        } else {
+            rb.header("Authorization", format!("Bearer {}", auth.token))
+        }
     }
 }
 
@@ -1157,6 +1165,39 @@ impl ConnectorDriver for GitHubDriver {
         .await
     }
 
+    async fn commit_changes(
+        &self,
+        auth: &ConnectionAuth,
+        repo_full_path: &str,
+        base_branch: &str,
+        branch: &str,
+        files: &[FileToWrite],
+        deleted: &[String],
+        message: &str,
+    ) -> anyhow::Result<String> {
+        super::github_write::commit_changes(
+            self,
+            auth,
+            repo_full_path,
+            base_branch,
+            branch,
+            files,
+            deleted,
+            message,
+        )
+        .await
+    }
+
+    async fn create_tag(
+        &self,
+        auth: &ConnectionAuth,
+        repo_full_path: &str,
+        tag: &str,
+        sha: &str,
+    ) -> anyhow::Result<()> {
+        super::github_write::create_tag(self, auth, repo_full_path, tag, sha).await
+    }
+
     async fn create_repository(
         &self,
         auth: &ConnectionAuth,
@@ -1375,6 +1416,33 @@ impl ConnectorDriver for GitHubDriver {
             url: file.html_url,
             updated: prior_sha.is_some(),
         })
+    }
+
+    async fn dispatch_workflow(
+        &self,
+        auth: &ConnectionAuth,
+        repo_full_path: &str,
+        workflow: &str,
+        git_ref: &str,
+    ) -> anyhow::Result<()> {
+        let url = format!(
+            "{}/repos/{repo_full_path}/actions/workflows/{workflow}/dispatches",
+            auth.root()
+        );
+        let res = self
+            .headers(self.http.post(&url), auth)
+            .json(&serde_json::json!({ "ref": git_ref }))
+            .send()
+            .await?;
+        let status = res.status();
+        if !status.is_success() {
+            let body = res.text().await.unwrap_or_default();
+            anyhow::bail!(
+                "GitHub {status} starting {workflow} on {repo_full_path}@{git_ref}: {}",
+                body.chars().take(200).collect::<String>()
+            );
+        }
+        Ok(())
     }
 
     async fn default_branch(

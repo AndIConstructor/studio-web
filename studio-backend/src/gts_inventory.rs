@@ -295,6 +295,7 @@ pub fn config_declared_types() -> Vec<(&'static str, &'static str)> {
             "studio-kits",
             crate::kit_registry::service::INSTALLATIONS_METADATA_TYPE,
         ),
+        ("studio-product", crate::product::EXPLANATIONS_METADATA_TYPE),
         // Declared by the profile and consumed by account-management and the
         // portal rather than by a constant in this crate: the three tenant types
         // below the platform root that shape the org / workspace / project
@@ -494,7 +495,7 @@ mod tests {
     /// is how the fourth entry left: `studio-user` was recorded here as an open
     /// question, the question was answered, and the test demanded the entry go
     /// with it.
-    const DATABASE_OMISSIONS: [(&str, &str, &str); 7] = [
+    const DATABASE_OMISSIONS: [(&str, &str, &str); 8] = [
         (
             "dev.yaml",
             "studio-credstore-pg",
@@ -541,6 +542,14 @@ mod tests {
             "the artifact index is PostgreSQL only (its ordering is `COLLATE \"C\"`), \
              and it is an optimisation rather than a store: without it every \
              listing walks the graph as it did before, and nothing is lost",
+        ),
+        (
+            "dev.yaml",
+            "postgres-usage-collector-plugin",
+            "its schema is PostgreSQL only and it keeps its own sqlx pool; \
+             without a database the plugin stands down and usage is simply \
+             not recorded, which loses nothing a developer poking at the API \
+             needs",
         ),
     ];
 

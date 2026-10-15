@@ -61,6 +61,7 @@ import { ProjectOverview, type ProjTab } from "./project-overview";
 import { makeZip } from "./zip";
 import { SpecModelTab } from "./spec-model-tab";
 import { ProjectBuilds } from "./builds-tab";
+import { ProjectTabHowto } from "./project-path-view";
 import { GearsTable, PermissionsTable } from "./system-tables";
 import {
   StudioBridgeProvider,
@@ -120,11 +121,12 @@ import { PresenceNotes, WhoIsOnline, usePresence } from "./presence";
 import { followRun } from "./studio-events";
 import { runProvision, type ProvisionStep, type StepState } from "./provision";
 import { gearParentDir, gearSlug } from "./scaffold";
+import type { GearDraft } from "./gear-from-entity";
 import { productIdFrom } from "./product";
 import { PortalNavProvider, type PortalNav } from "./portal-nav";
 import { OrgDashboard } from "./org-dashboard";
 import { OrgEnvironments } from "./environments-screen";
-import { PlatformSources } from "./platform-sources";
+import { OrgSources, PlatformSources } from "./platform-sources";
 import { PublicationRequests } from "./publication-requests";
 import { MyIdentitiesCard, MyPersonCard, PersonPhoto } from "./people-profile";
 import { orgPeople } from "./org-people";
@@ -601,6 +603,7 @@ type View =
   | "platform"
   | "publications"
   | "platform-sources"
+  | "org-sources"
   | "org"
   | "reports"
   | "tasks"
@@ -744,6 +747,8 @@ const LEVEL_NAV: Record<"platform" | "organization", { id: View; icon: string; l
     { id: "environments", icon: "layers", label: "Environments" },
     // What its projects build: the registry, candidates, its gear repository.
     { id: "gears", icon: "package", label: "Components" },
+    // Its own gear repositories, read after the platform's (ADR-0046).
+    { id: "org-sources", icon: "plug", label: "Sources" },
     // Every report the Studio draws, configured once for the organization.
     { id: "reports", icon: "activity", label: "Reports" },
     // Its studio-tasks runs and studio-scheduler schedules.
@@ -2688,6 +2693,7 @@ function Shell({ token, me, onLogout }: { token: string; me: Me; onLogout: () =>
         )}
         {view === "publications" && <PublicationRequests token={token} orgId={orgAsSpace?.id} />}
         {view === "platform-sources" && <PlatformSources token={token} isPlatformAdmin={showPlatform} />}
+        {view === "org-sources" && <OrgSources token={token} orgId={orgAsSpace?.id} />}
         {view === "environments" && orgAsSpace && (
           <OrgEnvironments
             key={orgAsSpace.id}
@@ -5507,6 +5513,9 @@ function ProjectScreen({
   const [tenant, setTenant] = useState<Tenant | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const studio = useStudioBridge();
+  /** A gear the Domain model asked for, carried to the Product tab, whose
+   *  scaffold dialog takes it (and clears it) when it opens. */
+  const [pendingGear, setPendingGear] = useState<GearDraft | null>(null);
 
   // Someone who opens a project is likely to open one of its documents next:
   // start its IDE now, so that click is not also the wait for a session.
@@ -5558,6 +5567,7 @@ function ProjectScreen({
   return (
     <>
       <div className="proj-content">
+        <ProjectTabHowto tab={tab} />
         {tab === "overview" && (
           <ProjectOverview
             token={token}
@@ -5576,9 +5586,13 @@ function ProjectScreen({
             projectId={proj.id}
             projectName={proj.name}
             workspaceId={workspace.id}
+            pendingGear={pendingGear}
+            onPendingGearTaken={() => setPendingGear(null)}
           />
         )}
-        {tab === "builds" && <ProjectBuilds token={token} projectId={proj.id} />}
+        {tab === "builds" && (
+          <ProjectBuilds token={token} projectId={proj.id} onOpenStudio={() => onOpenStudio(proj)} />
+        )}
         {tab === "kits" && (
           <ProjectKits
             token={token}
@@ -5609,6 +5623,10 @@ function ProjectScreen({
             token={token}
             projectId={proj.id}
             onOpenFile={(path) => void studio?.openFile(proj, path)}
+            onCreateGear={(draft) => {
+              setPendingGear(draft);
+              setTab("components");
+            }}
           />
         )}
         {tab === "specs" && (
@@ -7813,7 +7831,7 @@ function ProjectSources({
         }
         empty={{
           title: "No repositories attached yet.",
-          body: "Pick one from a connector below.",
+          body: "Pick one from a connector below. It is the project's first step: its sync brings in the documents to type.",
         }}
         columns={[
           {

@@ -220,6 +220,7 @@ fn check_adr_citations(
                     format!("{token} is cited, but the project has no ADR numbered {number}."),
                     vec![Side::at(doc.path, line.number, line.text)],
                 )
+                .with_target(token.clone())
                 .with_fix_decide(&[
                     &format!("link the record {token} means"),
                     &format!("remove the citation of {token}"),
@@ -438,6 +439,7 @@ fn misattribution(path: &str, line: &Line<'_>, adr: &Adr, record: &str) -> Candi
         line_start: line.number,
         line_end: line.number,
         quote: line.text.trim().to_string(),
+        layer: None,
     };
     let cited = Fact {
         kind: "decision".into(),
@@ -451,6 +453,7 @@ fn misattribution(path: &str, line: &Line<'_>, adr: &Adr, record: &str) -> Candi
         line_start: title_line,
         line_end: title_line,
         quote: title_text,
+        layer: None,
     };
     Candidate {
         rule: "reference.misattributed",
@@ -498,6 +501,7 @@ fn check_links(
                     ),
                     vec![Side::at(doc.path, line.number, line.text)],
                 )
+                .with_target(resolved.clone())
                 .with_fix_decide(&["point the link at the file it means", "remove the link"]),
             );
             continue;
@@ -515,6 +519,7 @@ fn check_links(
                     format!("`{resolved}` has no section `#{anchor}`."),
                     vec![Side::at(doc.path, line.number, line.text)],
                 )
+                .with_target(format!("{resolved}#{anchor}"))
                 .with_fix_decide(&["point the link at the section it means", "drop the anchor"]),
             );
         }
@@ -774,6 +779,7 @@ fn check_ids(
                 format!("`{id}` is referenced, but no document of the project defines it."),
                 vec![Side::at(doc.path, line.number, line.text)],
             )
+            .with_target(id.to_string())
             .with_fix_decide(&[
                 &format!("define `{id}` where it belongs"),
                 "reference the identifier that is defined",

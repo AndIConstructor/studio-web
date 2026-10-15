@@ -326,6 +326,8 @@ before that are swept by each repository sync of the project.
 | `GET` `POST` | `/remarks`, `/remarks/replies` | Review threads on a document from its pull requests; a reply to one | unstable |
 | `GET` `POST` | `/decisions` | Decisions recorded on requirements | unstable |
 | `POST` | `/pull-request-checks` | Check the documents open pull requests change; set a commit status | unstable |
+| `GET` `POST` `PATCH` `DELETE` | `/delivery-scopes`, `/delivery-scopes/{scope_id}`, `/delivery-scopes/{scope_id}/history`, `/delivery-scopes/{scope_id}/limits[/{limit_id}]` | Delivery scopes of a project, their limits and history (#784) | unstable |
+| `GET` `PUT` | `/application-parts` | Configuration, storage and deployment parts found in the repositories, with what people recorded about each (#786) | unstable |
 
 A quality request may carry at most 20 inline documents of 256 KiB each and
 1 MiB in total (`quality.rs`).
@@ -369,6 +371,54 @@ longer open are `left_open`: what a merge left behind. A reply
 connection. A decision (`POST /decisions`, table `studio_decisions`) records
 what was decided, the requirement identifiers it closes, where it was taken
 and by whom; insert only.
+
+**For the review card and document comparisons** (`m0023`). A review request
+keeps the text it was asked about (`reviewed_text`, at most 256 KiB); a request
+without a `version` is about the document as it is now. Every request carries
+`current_version` (a binding's content digest, a Studio document's content digest),
+`stale` when the document changed since, and `recorded_checks` (the detectors
+that pass on it now); the list adds `open`, `overdue` and `stale` counts.
+`GET /review-requests/{id}/diff` answers the reviewed text, the text now and
+`base`, the newest earlier approved request on the same document, for a
+Before / Proposed diff. A domain-model finding's sides carry `binding_id`, and a
+reference to something missing names it as `target`. A decision takes an
+optional `note` and keeps the finding as it stood; `/spec-model/decisions`
+answers `present: false` for a decided finding the documents no longer show
+(resolved), with its rule, message and sides.
+
+**Stage checks beyond documents** (issue #782). A stage may declare `checks`,
+each `code`, `tests` or `review`, next to the document types it `requires`.
+`stage-status` answers each per stage as `{kind, passed, detail}`: `code` passes
+when a synced commit or merged pull request names one of the requirements the
+project's documents label (any commit when they label none); `tests` when the
+latest completed CI run on the mainline concluded `success`
+(`artifact_ingest::port::DeliveryEvidence`); `review` when no open pull request
+waits on a reviewer and no review request awaits a required approval.
+`passed` is `null` when the deployment cannot read the evidence (no sync), and
+a stage with a null or failed check is not complete. The built-in catalogue is
+the journey plus the delivery stages the portal shows: `prd` requires a `prd`,
+`architecture` a `design`, and `code`, `testing` and `review` carry the three
+checks. Table `studio_process_stages` gains `checks` (`m0020`).
+
+**Delivery scopes** (`delivery.rs`, issue #784). A scope is one outcome a
+project promises: title, outcome, owner, target date, the requirement
+identifiers it delivers (as decisions name them), the gears it pins, its
+acceptance and state (`planned`, `in_progress`, `delivered`, `dropped`). A
+limit is a limitation, an open question or a dependency (on another scope's id,
+or a decision record); a blocking limit that is unresolved — and, for a
+dependency on a scope, while that scope is not delivered — blocks the scope.
+Every change keeps the version it replaced (`/history`). Tables
+`studio_delivery_scopes`, `studio_delivery_limits`,
+`studio_delivery_scope_history` (`m0021`).
+
+**Application parts** (`parts.rs`, issue #786). Found in the project's
+repositories by what the files are: Helm charts and values, Dockerfiles,
+compose files, Kubernetes and Terraform directories, deployment workflows,
+configuration files and directories, migrations and schemas. The owner,
+describing document, boundary and related parts are recorded beside each,
+keyed by repository, kind and reference (table `studio_application_parts`,
+`m0022`); a recorded part the repositories no longer show is listed as not
+present. `product.gdl` stays the Gearbox composition language.
 
 **Checks on pull requests** (`pr_checks.rs`, `POST /pull-request-checks`,
 issue #734). Every open pull request of the project's repositories that changes

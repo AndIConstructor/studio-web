@@ -744,6 +744,24 @@ pub trait ConnectorDriver: Send + Sync + 'static {
 
     /// The repository's default branch — what a caller means when it names no
     /// branch at all. Defaulted to an error for a driver with no write path.
+    /// Start a run of `workflow` (its file name, `build.yml`, or its id) on
+    /// `git_ref` (ADR-0045 phase 3). The provider queues it; the run arrives
+    /// in the next sync like any other. Defaulted to an error: only a CI host
+    /// has workflows, and a token may lack the right to start them.
+    async fn dispatch_workflow(
+        &self,
+        auth: &ConnectionAuth,
+        repo_full_path: &str,
+        workflow: &str,
+        git_ref: &str,
+    ) -> anyhow::Result<()> {
+        let _ = (auth, repo_full_path, workflow, git_ref);
+        Err(anyhow::anyhow!(
+            "{} cannot start CI workflows through this connection",
+            self.display_name()
+        ))
+    }
+
     async fn default_branch(
         &self,
         auth: &ConnectionAuth,
@@ -943,6 +961,48 @@ pub trait ConnectorDriver: Send + Sync + 'static {
         let _ = (auth, repo_full_path, base_branch, branch, files, message);
         Err(anyhow::anyhow!(
             "{} cannot commit files through this connection",
+            self.display_name()
+        ))
+    }
+
+    /// [`Self::commit_files`], and in the same commit `deleted` removed: what
+    /// moving code out of a repository writes (ADR-0044 Extract). Without
+    /// deletions it is `commit_files`; a driver that cannot delete refuses
+    /// the rest.
+    #[allow(clippy::too_many_arguments)]
+    async fn commit_changes(
+        &self,
+        auth: &ConnectionAuth,
+        repo_full_path: &str,
+        base_branch: &str,
+        branch: &str,
+        files: &[FileToWrite],
+        deleted: &[String],
+        message: &str,
+    ) -> anyhow::Result<String> {
+        if deleted.is_empty() {
+            return self
+                .commit_files(auth, repo_full_path, base_branch, branch, files, message)
+                .await;
+        }
+        Err(anyhow::anyhow!(
+            "{} cannot delete files through this connection",
+            self.display_name()
+        ))
+    }
+
+    /// Tag `sha` as `tag` (a lightweight tag). A tag already at `sha` is not
+    /// an error; one at another commit is.
+    async fn create_tag(
+        &self,
+        auth: &ConnectionAuth,
+        repo_full_path: &str,
+        tag: &str,
+        sha: &str,
+    ) -> anyhow::Result<()> {
+        let _ = (auth, repo_full_path, tag, sha);
+        Err(anyhow::anyhow!(
+            "{} cannot create tags through this connection",
             self.display_name()
         ))
     }

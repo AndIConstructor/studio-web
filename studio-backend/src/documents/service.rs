@@ -419,6 +419,7 @@ impl DocumentsService {
             ordinal: st.position,
             requires: serde_json::to_string(&st.requires)?,
             gates: serde_json::to_string(&st.gates)?,
+            checks: serde_json::to_string(&st.checks)?,
             hidden: st.hidden,
             created_at: now,
             updated_at: now,
@@ -635,6 +636,7 @@ impl DocumentsService {
         ctx: &SecurityContext,
         workspace_id: Uuid,
         project_id: Uuid,
+        evidence: &super::model::StageEvidence,
     ) -> Result<Vec<StageStatus>> {
         let stages = self.list_stages(ctx, workspace_id).await?;
         let docs = self.all_documents(workspace_id, Some(project_id)).await?;
@@ -663,8 +665,12 @@ impl DocumentsService {
 
         Ok(stages
             .into_iter()
-            .map(|stage| evaluate_stage(stage, &docs, &bindings, &analyses, &binding_analyses))
-            .map(|status| gate_on_approvals(status, &docs, &bindings, &reviews))
+            .map(|stage| {
+                let checks = stage.checks.clone();
+                let status = evaluate_stage(stage, &docs, &bindings, &analyses, &binding_analyses);
+                let status = gate_on_approvals(status, &docs, &bindings, &reviews);
+                gate_on_checks(status, &checks, evidence)
+            })
             .collect())
     }
 
@@ -722,6 +728,7 @@ impl DocumentsService {
         project_id: Uuid,
         ask: ReviewAsk,
         requester: (String, Option<String>),
+        reviewed_text: Option<String>,
     ) -> Result<Review> {
         if !matches!(ask.subject_kind.as_str(), "document" | "binding") {
             bail!("subject_kind must be `document` or `binding`");
@@ -731,6 +738,31 @@ impl DocumentsService {
         }
         if ask.version.trim().is_empty() {
             bail!("name the version being reviewed");
+        }
+        // The subject is read, not taken on the caller's word: it must be this
+        // project's (or the workspace's, which every project inherits), and
+        // its type is the one stored. Otherwise a request could name another
+        // project's document and supersede that project's current request.
+        let (subject_project, type_key) = match ask.subject_kind.as_str() {
+            "document" => {
+                let doc = self
+                    .repo
+                    .get_doc(workspace_id, ask.subject_id)
+                    .await?
+                    .context("no such document in this workspace")?;
+                (doc.project_id, Some(doc.type_key))
+            }
+            _ => {
+                let binding = self
+                    .repo
+                    .get_binding(workspace_id, ask.subject_id)
+                    .await?
+                    .context("no such document in this workspace")?;
+                (binding.project_id, binding.type_key)
+            }
+        };
+        if !subject_in_project(subject_project, project_id) {
+            bail!("the document is not this project's");
         }
         let mut seen = std::collections::BTreeSet::new();
         let reviewers: Vec<super::approvals::Reviewer> = ask
@@ -744,7 +776,7 @@ impl DocumentsService {
             project_id,
             subject_kind: ask.subject_kind,
             subject_id: ask.subject_id,
-            type_key: ask.type_key,
+            type_key,
             title: ask.title,
             version: ask.version.trim().to_string(),
             requested_by: requester.0,
@@ -753,6 +785,7 @@ impl DocumentsService {
             due_at: ask.due_at,
             state: "open".to_string(),
             created_at: OffsetDateTime::now_utc(),
+            reviewed_text: reviewed_text.map(|t| clip_text(&t, REVIEWED_TEXT_MAX)),
         };
         self.repo.put_review_request(model.clone()).await?;
         Ok(Review {
@@ -763,10 +796,12 @@ impl DocumentsService {
 
     /// Record one reviewer's verdict. The caller must be one of the request's
     /// reviewers, and the request still open. Every required approval in
-    /// closes the request as `approved`.
+    /// closes the request as `approved`. `None` when the request is not
+    /// `project_id`'s: a project's caller never decides another's.
     pub async fn give_verdict(
         &self,
         workspace_id: Uuid,
+        project_id: Uuid,
         request_id: Uuid,
         approver: (String, Option<String>),
         verdict: &str,
@@ -776,6 +811,7 @@ impl DocumentsService {
             .repo
             .get_review_request(workspace_id, request_id)
             .await?
+            .filter(|r| r.project_id == project_id)
         else {
             return Ok(None);
         };
@@ -822,10 +858,78 @@ impl DocumentsService {
         Ok(Some((review, model)))
     }
 
+    /// The version a document is at now and its text: a binding's content
+    /// digest and its file from the checkout, or a Studio document's content
+    /// and the digest of it. `(None, None)` for a subject not found.
+    pub async fn subject_state(
+        &self,
+        ctx: &SecurityContext,
+        workspace_id: Uuid,
+        project_id: Uuid,
+        subject_kind: &str,
+        subject_id: Uuid,
+        reader: Option<&dyn crate::artifact_ingest::port::RepoFileReader>,
+    ) -> Result<(Option<String>, Option<String>)> {
+        if subject_kind == "document" {
+            return Ok(match self.repo.get_doc(workspace_id, subject_id).await? {
+                Some(doc) => (Some(content_digest(&doc.content)), Some(doc.content)),
+                None => (None, None),
+            });
+        }
+        let Some(row) = self.repo.get_binding(workspace_id, subject_id).await? else {
+            return Ok((None, None));
+        };
+        let text = match reader {
+            Some(r) => self
+                .project_binding_text(ctx, workspace_id, project_id, subject_id, r)
+                .await
+                .unwrap_or(None),
+            None => None,
+        };
+        Ok((Some(row.content_sha), text))
+    }
+
+    /// Every document's current version and the detectors that pass on it,
+    /// by subject id: what a review list compares its requests against.
+    pub async fn subject_versions(
+        &self,
+        workspace_id: Uuid,
+        project_id: Uuid,
+    ) -> Result<std::collections::HashMap<Uuid, (String, Vec<String>)>> {
+        let mut out = std::collections::HashMap::new();
+        let docs = self.all_documents(workspace_id, Some(project_id)).await?;
+        let doc_ids: Vec<Uuid> = docs.iter().map(|d| d.id).collect();
+        let analyses = self.repo.list_analyses(workspace_id, &doc_ids).await?;
+        for d in &docs {
+            let passed = analyses
+                .iter()
+                .filter(|a| {
+                    a.document_id == Some(d.id) && a.state == AnalysisState::Passed.as_str()
+                })
+                .map(|a| a.detector.clone())
+                .collect();
+            out.insert(d.id, (content_digest(&d.content), passed));
+        }
+        let rows = self.all_bindings(workspace_id, Some(project_id)).await?;
+        let ids: Vec<Uuid> = rows.iter().map(|b| b.id).collect();
+        let banalyses = self.repo.list_binding_analyses(workspace_id, &ids).await?;
+        for b in rows {
+            let passed = banalyses
+                .iter()
+                .filter(|a| a.binding_id == Some(b.id) && a.state == AnalysisState::Passed.as_str())
+                .map(|a| a.detector.clone())
+                .collect();
+            out.insert(b.id, (b.content_sha, passed));
+        }
+        Ok(out)
+    }
+
     /// Withdraw an open request. Only the person who asked for it can.
+    /// `None` when the request is not `project_id`'s.
     pub async fn withdraw_review(
         &self,
         workspace_id: Uuid,
+        project_id: Uuid,
         request_id: Uuid,
         caller: &str,
     ) -> Result<Option<Review>> {
@@ -833,6 +937,7 @@ impl DocumentsService {
             .repo
             .get_review_request(workspace_id, request_id)
             .await?
+            .filter(|r| r.project_id == project_id)
         else {
             return Ok(None);
         };
@@ -1313,6 +1418,8 @@ fn stage_from_row(row: stage::Model, workspace_id: Option<Uuid>) -> Result<Stage
         position: row.ordinal,
         requires,
         gates: serde_json::from_str(&row.gates).context("stage `gates` is malformed")?,
+        // A row from before checks, or one written by hand, reads as none.
+        checks: serde_json::from_str(&row.checks).unwrap_or_default(),
         owner: owner_of(row.tenant_id, workspace_id),
         hidden: row.hidden,
     })
@@ -1411,6 +1518,7 @@ fn evaluate_stage(
         label: stage.label,
         required: stage.required,
         requirements,
+        checks: Vec::new(),
     }
 }
 
@@ -1797,11 +1905,18 @@ impl DocumentsService {
         project_id: Uuid,
         reader: &dyn crate::artifact_ingest::port::RepoFileReader,
     ) -> Result<super::spec_model::Sources> {
-        let rows: Vec<DocumentBinding> = self
-            .all_bindings(workspace_id, Some(project_id))
-            .await?
+        use super::spec_model::domain_doc::{DOMAIN_DOC_PATH, DOMAIN_DOC_TYPE, read_as};
+        let all = self.all_bindings(workspace_id, Some(project_id)).await?;
+        let domain_doc_bound = all.iter().any(|row| row.path == DOMAIN_DOC_PATH);
+        // The documentation: every typed binding, and Studio's own domain
+        // model document whatever its binding says.
+        let rows: Vec<DocumentBinding> = all
             .into_iter()
-            .filter(|row| row.state.is_typed())
+            .filter_map(|mut row| {
+                let doc_type = read_as(&row.path, row.state.is_typed(), row.type_key.as_deref())?;
+                row.type_key = doc_type;
+                Some(row)
+            })
             .collect();
         if rows.is_empty() {
             return Ok(super::spec_model::Sources::default());
@@ -1815,6 +1930,18 @@ impl DocumentsService {
         // template or an image resolves as surely as one to a document.
         let mut by_path = self.checkout_listing(ctx, &tenants, reader).await;
         let tree = by_path.keys().cloned().collect();
+        // Written by Studio but not synced yet: no binding, so no graph node
+        // to record a verdict on, but read all the same.
+        let unbound_domain_doc = (!domain_doc_bound)
+            .then(|| by_path.remove(DOMAIN_DOC_PATH).flatten())
+            .flatten()
+            .map(|text| super::spec_model::SourceText {
+                path: DOMAIN_DOC_PATH.to_owned(),
+                text,
+                doc_type: Some(DOMAIN_DOC_TYPE.to_owned()),
+                node: String::new(),
+                binding: None,
+            });
         let documents = rows
             .into_iter()
             .filter_map(|row| {
@@ -1822,12 +1949,14 @@ impl DocumentsService {
                     .remove(&row.path)
                     .flatten()
                     .map(|text| super::spec_model::SourceText {
+                        binding: Some(row.id),
                         path: row.path,
                         text,
                         doc_type: row.type_key,
                         node: row.node_id,
                     })
             })
+            .chain(unbound_domain_doc)
             .collect();
         let files = by_path
             .into_iter()
@@ -1838,6 +1967,310 @@ impl DocumentsService {
             tree,
             files,
         })
+    }
+
+    // ── application parts (#786) ─────────────────────────────────────────────
+
+    pub async fn part_records(
+        &self,
+        workspace_id: Uuid,
+        project_id: Uuid,
+    ) -> Result<Vec<super::entity::application_part::Model>> {
+        self.repo.list_parts(workspace_id, project_id).await
+    }
+
+    /// Record (or replace) what is known about one part.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn record_part(
+        &self,
+        workspace_id: Uuid,
+        project_id: Uuid,
+        repo: &str,
+        kind: &str,
+        reference: &str,
+        about: PartRecord,
+        by: &str,
+    ) -> Result<super::entity::application_part::Model> {
+        if !super::parts::KINDS.contains(&kind) {
+            bail!("kind is configuration, storage or deployment");
+        }
+        if repo.trim().is_empty() || reference.len() > 500 {
+            bail!("name the repository, and a reference of at most 500 characters");
+        }
+        let clean = |v: Option<String>| v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+        let mut related: Vec<String> = about
+            .related
+            .into_iter()
+            .map(|r| r.trim().to_string())
+            .filter(|r| !r.is_empty())
+            .collect();
+        related.sort();
+        related.dedup();
+        let model = super::entity::application_part::Model {
+            id: super::repo::part_id(project_id, repo, kind, reference),
+            tenant_id: workspace_id,
+            project_id,
+            repo: repo.to_string(),
+            kind: kind.to_string(),
+            reference: reference.to_string(),
+            owner: clean(about.owner),
+            owner_name: clean(about.owner_name),
+            description_path: clean(about.description_path),
+            boundary: clean(about.boundary),
+            related: serde_json::to_value(&related)?,
+            updated_by: by.to_string(),
+            updated_at: OffsetDateTime::now_utc(),
+        };
+        self.repo.put_part(model.clone()).await?;
+        Ok(model)
+    }
+
+    // ── delivery scopes (#784) ───────────────────────────────────────────────
+
+    /// The project's scopes with their limits and whether each is blocked.
+    pub async fn delivery_scopes(
+        &self,
+        workspace_id: Uuid,
+        project_id: Uuid,
+    ) -> Result<Vec<ScopeView>> {
+        let scopes = self.repo.list_scopes(workspace_id, project_id).await?;
+        let limits = self.repo.list_limits(workspace_id, project_id).await?;
+        let state_of: std::collections::BTreeMap<String, String> = scopes
+            .iter()
+            .map(|s| (s.id.to_string(), s.state.clone()))
+            .collect();
+        Ok(scopes
+            .into_iter()
+            .map(|scope| {
+                let mine: Vec<super::entity::delivery_limit::Model> = limits
+                    .iter()
+                    .filter(|l| l.scope_id == scope.id)
+                    .cloned()
+                    .collect();
+                let states: Vec<super::delivery::LimitState<'_>> = mine
+                    .iter()
+                    .map(|l| super::delivery::LimitState {
+                        blocking: l.blocking,
+                        resolution: l.resolution.as_deref(),
+                        depends_on_state: l
+                            .depends_on
+                            .as_deref()
+                            .and_then(|d| state_of.get(d))
+                            .map(String::as_str),
+                    })
+                    .collect();
+                let blocked = super::delivery::blocked(&states);
+                ScopeView {
+                    scope,
+                    limits: mine,
+                    blocked,
+                }
+            })
+            .collect())
+    }
+
+    async fn scope_of(
+        &self,
+        workspace_id: Uuid,
+        project_id: Uuid,
+        id: Uuid,
+    ) -> Result<Option<super::entity::delivery_scope::Model>> {
+        Ok(self
+            .repo
+            .list_scopes(workspace_id, project_id)
+            .await?
+            .into_iter()
+            .find(|s| s.id == id))
+    }
+
+    pub async fn create_scope(
+        &self,
+        workspace_id: Uuid,
+        project_id: Uuid,
+        fields: super::delivery::ScopeFields,
+        by: &str,
+    ) -> Result<super::entity::delivery_scope::Model> {
+        let f = super::delivery::check_scope(fields).map_err(|e| anyhow::anyhow!(e))?;
+        let now = OffsetDateTime::now_utc();
+        let model = super::entity::delivery_scope::Model {
+            id: Uuid::new_v4(),
+            tenant_id: workspace_id,
+            project_id,
+            title: f.title,
+            outcome: f.outcome,
+            owner: f.owner,
+            owner_name: f.owner_name,
+            target_date: f.target_date,
+            requirements: serde_json::to_value(&f.requirements)?,
+            gears: serde_json::to_value(&f.gears)?,
+            acceptance: f.acceptance,
+            state: f.state,
+            created_by: by.to_string(),
+            created_at: now,
+            updated_by: by.to_string(),
+            updated_at: now,
+        };
+        self.repo.put_scope(model.clone()).await?;
+        Ok(model)
+    }
+
+    /// Change a scope; the version it replaces is kept in its history.
+    pub async fn update_scope(
+        &self,
+        workspace_id: Uuid,
+        project_id: Uuid,
+        id: Uuid,
+        patch: ScopePatch,
+        by: &str,
+    ) -> Result<Option<super::entity::delivery_scope::Model>> {
+        let Some(old) = self.scope_of(workspace_id, project_id, id).await? else {
+            return Ok(None);
+        };
+        let list = |v: &serde_json::Value| -> Vec<String> {
+            serde_json::from_value(v.clone()).unwrap_or_default()
+        };
+        let f = super::delivery::check_scope(super::delivery::ScopeFields {
+            title: patch.title.unwrap_or_else(|| old.title.clone()),
+            outcome: patch.outcome.unwrap_or_else(|| old.outcome.clone()),
+            owner: patch.owner.unwrap_or_else(|| old.owner.clone()),
+            owner_name: patch.owner_name.unwrap_or_else(|| old.owner_name.clone()),
+            target_date: patch.target_date.unwrap_or_else(|| old.target_date.clone()),
+            requirements: patch
+                .requirements
+                .unwrap_or_else(|| list(&old.requirements)),
+            gears: patch.gears.unwrap_or_else(|| list(&old.gears)),
+            acceptance: patch.acceptance.unwrap_or_else(|| old.acceptance.clone()),
+            state: patch.state.unwrap_or_else(|| old.state.clone()),
+        })
+        .map_err(|e| anyhow::anyhow!(e))?;
+        let now = OffsetDateTime::now_utc();
+        self.repo
+            .insert_scope_history(super::entity::delivery_history::Model {
+                id: Uuid::new_v4(),
+                tenant_id: workspace_id,
+                scope_id: id,
+                snapshot: scope_snapshot(&old),
+                changed_by: by.to_string(),
+                changed_at: now,
+            })
+            .await?;
+        let model = super::entity::delivery_scope::Model {
+            title: f.title,
+            outcome: f.outcome,
+            owner: f.owner,
+            owner_name: f.owner_name,
+            target_date: f.target_date,
+            requirements: serde_json::to_value(&f.requirements)?,
+            gears: serde_json::to_value(&f.gears)?,
+            acceptance: f.acceptance,
+            state: f.state,
+            updated_by: by.to_string(),
+            updated_at: now,
+            ..old
+        };
+        self.repo.put_scope(model.clone()).await?;
+        Ok(Some(model))
+    }
+
+    pub async fn delete_scope(
+        &self,
+        workspace_id: Uuid,
+        project_id: Uuid,
+        id: Uuid,
+    ) -> Result<bool> {
+        if self.scope_of(workspace_id, project_id, id).await?.is_none() {
+            return Ok(false);
+        }
+        self.repo.delete_scope(workspace_id, id).await?;
+        Ok(true)
+    }
+
+    pub async fn scope_history(
+        &self,
+        workspace_id: Uuid,
+        project_id: Uuid,
+        id: Uuid,
+    ) -> Result<Option<Vec<super::entity::delivery_history::Model>>> {
+        if self.scope_of(workspace_id, project_id, id).await?.is_none() {
+            return Ok(None);
+        }
+        Ok(Some(self.repo.list_scope_history(workspace_id, id).await?))
+    }
+
+    pub async fn add_limit(
+        &self,
+        workspace_id: Uuid,
+        project_id: Uuid,
+        scope_id: Uuid,
+        fields: super::delivery::LimitFields,
+        by: &str,
+    ) -> Result<Option<super::entity::delivery_limit::Model>> {
+        if self
+            .scope_of(workspace_id, project_id, scope_id)
+            .await?
+            .is_none()
+        {
+            return Ok(None);
+        }
+        let f = super::delivery::check_limit(fields).map_err(|e| anyhow::anyhow!(e))?;
+        let model = super::entity::delivery_limit::Model {
+            id: Uuid::new_v4(),
+            tenant_id: workspace_id,
+            project_id,
+            scope_id,
+            kind: f.kind,
+            text: f.text,
+            blocking: f.blocking,
+            depends_on: f.depends_on,
+            resolution: None,
+            resolved_by: None,
+            resolved_at: None,
+            created_by: by.to_string(),
+            created_at: OffsetDateTime::now_utc(),
+        };
+        self.repo.put_limit(model.clone()).await?;
+        Ok(Some(model))
+    }
+
+    /// Resolve a limit (or reopen it with an empty resolution), or change
+    /// whether it blocks.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn update_limit(
+        &self,
+        workspace_id: Uuid,
+        project_id: Uuid,
+        scope_id: Uuid,
+        limit_id: Uuid,
+        resolution: Option<String>,
+        blocking: Option<bool>,
+        by: &str,
+    ) -> Result<Option<super::entity::delivery_limit::Model>> {
+        let Some(mut limit) = self
+            .repo
+            .list_limits(workspace_id, project_id)
+            .await?
+            .into_iter()
+            .find(|l| l.id == limit_id && l.scope_id == scope_id)
+        else {
+            return Ok(None);
+        };
+        if let Some(r) = resolution {
+            let r = r.trim().to_string();
+            if r.is_empty() {
+                limit.resolution = None;
+                limit.resolved_by = None;
+                limit.resolved_at = None;
+            } else {
+                limit.resolution = Some(r);
+                limit.resolved_by = Some(by.to_string());
+                limit.resolved_at = Some(OffsetDateTime::now_utc());
+            }
+        }
+        if let Some(b) = blocking {
+            limit.blocking = b;
+        }
+        self.repo.put_limit(limit.clone()).await?;
+        Ok(Some(limit))
     }
 
     /// Record a decision on the project's requirements.
@@ -1873,7 +2306,7 @@ impl DocumentsService {
             project_id,
             statement: statement.to_string(),
             requirements: serde_json::to_value(&requirements)?,
-            source_url: source_url.filter(|u| !u.trim().is_empty()),
+            source_url: safe_source_url(source_url),
             source_kind: source_kind.to_string(),
             path: path.filter(|p| !p.trim().is_empty()),
             decided_by: decided_by.0,
@@ -2054,6 +2487,7 @@ impl DocumentsService {
     }
 
     /// Record a member's ✓ (`confirmed`) or ✗ (`dismissed`) on a finding.
+    #[allow(clippy::too_many_arguments)]
     pub async fn put_spec_decision(
         &self,
         ctx: &SecurityContext,
@@ -2061,7 +2495,13 @@ impl DocumentsService {
         project_id: Uuid,
         fingerprint: &str,
         decision: &str,
+        note: Option<String>,
+        snapshot: Option<serde_json::Value>,
     ) -> Result<super::entity::spec_decision::Model> {
+        let note = note.map(|n| n.trim().to_string()).filter(|n| !n.is_empty());
+        if note.as_ref().is_some_and(|n| n.chars().count() > 2_000) {
+            bail!("a note is at most 2000 characters");
+        }
         let model = super::entity::spec_decision::Model {
             id: super::repo::spec_decision_id(project_id, fingerprint),
             tenant_id: workspace_id,
@@ -2070,6 +2510,8 @@ impl DocumentsService {
             decision: decision.to_string(),
             decided_by: ctx.subject_id(),
             decided_at: OffsetDateTime::now_utc(),
+            note,
+            snapshot,
         };
         self.repo.put_spec_decision(model.clone()).await?;
         Ok(model)
@@ -2451,6 +2893,84 @@ pub struct DeclaredCapability {
     pub sources: Vec<CapabilitySource>,
 }
 
+/// A stage's checks beyond documents folded into its status: each declared
+/// check is answered from the evidence, and the stage is complete only when
+/// its documents are and every check passed.
+fn gate_on_checks(
+    mut status: StageStatus,
+    checks: &[String],
+    evidence: &super::model::StageEvidence,
+) -> StageStatus {
+    status.checks = checks.iter().map(|k| evidence.check(k)).collect();
+    // A check nobody can read is not passed: the stage is not complete.
+    status.complete = status.complete && status.checks.iter().all(|c| c.passed == Some(true));
+    status
+}
+
+/// What a person records about a part.
+#[derive(Clone, Debug, Default)]
+pub struct PartRecord {
+    pub owner: Option<String>,
+    pub owner_name: Option<String>,
+    pub description_path: Option<String>,
+    pub boundary: Option<String>,
+    pub related: Vec<String>,
+}
+
+/// A scope with its limits, and whether a blocking one still holds.
+#[derive(Clone, Debug)]
+pub struct ScopeView {
+    pub scope: super::entity::delivery_scope::Model,
+    pub limits: Vec<super::entity::delivery_limit::Model>,
+    pub blocked: bool,
+}
+
+/// What a change to a scope sets; an absent field is left as it is, and
+/// `Some(None)` clears an optional one.
+#[derive(Clone, Debug, Default)]
+pub struct ScopePatch {
+    pub title: Option<String>,
+    pub outcome: Option<String>,
+    pub owner: Option<Option<String>>,
+    pub owner_name: Option<Option<String>>,
+    pub target_date: Option<Option<String>>,
+    pub requirements: Option<Vec<String>>,
+    pub gears: Option<Vec<String>>,
+    pub acceptance: Option<String>,
+    pub state: Option<String>,
+}
+
+/// A scope as its history keeps it.
+fn scope_snapshot(s: &super::entity::delivery_scope::Model) -> serde_json::Value {
+    serde_json::json!({
+        "title": s.title,
+        "outcome": s.outcome,
+        "owner": s.owner,
+        "owner_name": s.owner_name,
+        "target_date": s.target_date,
+        "requirements": s.requirements,
+        "gears": s.gears,
+        "acceptance": s.acceptance,
+        "state": s.state,
+        "updated_by": s.updated_by,
+        "updated_at": s.updated_at.format(&Rfc3339).unwrap_or_default(),
+    })
+}
+
+/// The longest reviewed text a request keeps.
+const REVIEWED_TEXT_MAX: usize = 256 * 1024;
+
+fn clip_text(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_string();
+    }
+    let mut end = max_bytes;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_string()
+}
+
 /// How many reviewers a suggestion offers.
 const SUGGESTED_REVIEWERS: usize = 8;
 
@@ -2459,7 +2979,6 @@ const SUGGESTED_REVIEWERS: usize = 8;
 pub struct ReviewAsk {
     pub subject_kind: String,
     pub subject_id: Uuid,
-    pub type_key: Option<String>,
     pub title: String,
     pub version: String,
     pub reviewers: Vec<super::approvals::Reviewer>,
@@ -2490,6 +3009,28 @@ impl Review {
     }
 }
 
+/// The longest link a remark keeps to where it came from.
+const SOURCE_URL_MAX: usize = 2048;
+
+/// A remark's link to where it came from, as the portal will render it: an
+/// `http(s)` URL of a sane length, or nothing. The portal makes it an anchor,
+/// and a `javascript:` or `data:` one would run in another member's browser.
+fn safe_source_url(url: Option<String>) -> Option<String> {
+    let url = url?.trim().to_string();
+    let lower = url.to_ascii_lowercase();
+    ((lower.starts_with("https://") || lower.starts_with("http://"))
+        && url.len() <= SOURCE_URL_MAX
+        && !url.chars().any(char::is_control))
+    .then_some(url)
+}
+
+/// Whether a document whose row says `subject_project` may be reviewed in
+/// `project_id`: it is that project's, or the workspace's (`None`), which
+/// every project in it inherits.
+fn subject_in_project(subject_project: Option<Uuid>, project_id: Uuid) -> bool {
+    subject_project.is_none_or(|p| p == project_id)
+}
+
 /// The reviewers a request stored. A row this code did not write reads as
 /// nobody rather than failing the list.
 fn reviewers_of(request: &super::entity::review_request::Model) -> Vec<super::approvals::Reviewer> {
@@ -2498,8 +3039,10 @@ fn reviewers_of(request: &super::entity::review_request::Model) -> Vec<super::ap
 
 /// A stage's status with its documents' reviews folded in: a document whose
 /// current request (the newest that is open or approved) still waits on a
-/// required reviewer holds the stage. Nothing is outstanding for a document
-/// nobody asked to review.
+/// required reviewer holds the stage, and so does one whose request is about
+/// an earlier version -- a Studio document's `updated_at`, a file's
+/// `content_sha` -- than the one there now: every required reviewer is then
+/// outstanding. Nothing is outstanding for a document nobody asked to review.
 fn gate_on_approvals(
     mut status: StageStatus,
     docs: &[Document],
@@ -2512,7 +3055,10 @@ fn gate_on_approvals(
             b.type_key.as_deref() == Some(req.type_key.as_str())
                 && matches!(b.state, BindingState::Confirmed | BindingState::Manual)
         });
-        let Some(subject) = doc.map(|d| d.id).or(bound.map(|b| b.id)) else {
+        let Some((subject, version)) = doc
+            .map(|d| (d.id, d.updated_at.as_str()))
+            .or(bound.map(|b| (b.id, b.content_sha.as_str())))
+        else {
             continue;
         };
         // Newest first, as the repository lists them.
@@ -2523,11 +3069,15 @@ fn gate_on_approvals(
             continue;
         };
         let reviewers = current.reviewers();
-        req.approvals_outstanding =
+        let waiting: Vec<&super::approvals::Reviewer> = if current.request.version == version {
             super::approvals::outstanding(&reviewers, &current.verdict_facts())
-                .into_iter()
-                .map(|r| r.name.clone().unwrap_or_else(|| r.person.clone()))
-                .collect();
+        } else {
+            reviewers.iter().filter(|r| r.required).collect()
+        };
+        req.approvals_outstanding = waiting
+            .into_iter()
+            .map(|r| r.name.clone().unwrap_or_else(|| r.person.clone()))
+            .collect();
     }
     status.complete = status.requirements.iter().all(|r| {
         r.present
@@ -3247,6 +3797,7 @@ mod tests {
             ordinal,
             requires: "[]".to_string(),
             gates: "[]".to_string(),
+            checks: "[]".to_string(),
             hidden,
             created_at: now,
             updated_at: now,
@@ -3293,7 +3844,9 @@ mod tests {
                 "architecture",
                 "ui_design",
                 "user_stories",
-                "testing"
+                "code",
+                "testing",
+                "review"
             ]
         );
     }
@@ -3456,6 +4009,7 @@ mod tests {
             position: 30,
             requires: requires.iter().map(|k| (*k).to_string()).collect(),
             gates: gates.iter().map(|k| (*k).to_string()).collect(),
+            checks: Vec::new(),
             owner: Owner::Builtin,
             hidden: false,
         }
@@ -3639,6 +4193,101 @@ mod tests {
         for guess in [Detected, Unknown, NotADocument] {
             assert!(!guess.is_typed(), "{guess:?}");
         }
+    }
+
+    fn review_of(version: &str, state: &str, approved_by: &[&str]) -> Review {
+        let request = crate::documents::entity::review_request::Model {
+            id: Uuid::from_u128(0xfeed),
+            tenant_id: WS,
+            project_id: WS,
+            subject_kind: "binding".to_string(),
+            subject_id: BINDING,
+            type_key: Some("prd".to_string()),
+            title: "prd.md".to_string(),
+            version: version.to_string(),
+            requested_by: "req".to_string(),
+            requested_by_name: None,
+            reviewers: serde_json::json!([{ "person": "ann", "name": "Ann", "required": true }]),
+            due_at: None,
+            state: state.to_string(),
+            created_at: OffsetDateTime::UNIX_EPOCH,
+            reviewed_text: None,
+        };
+        let verdicts = approved_by
+            .iter()
+            .map(|who| crate::documents::entity::approval::Model {
+                id: Uuid::new_v4(),
+                tenant_id: WS,
+                project_id: WS,
+                request_id: request.id,
+                subject_id: BINDING,
+                version: version.to_string(),
+                approver: (*who).to_string(),
+                approver_name: None,
+                verdict: "approved".to_string(),
+                note: None,
+                checks: serde_json::json!([]),
+                decided_at: OffsetDateTime::UNIX_EPOCH,
+            })
+            .collect();
+        Review { request, verdicts }
+    }
+
+    /// #731: an approval of `sha-1` does not hold once the file is `sha-2`.
+    #[test]
+    fn an_approval_of_an_earlier_version_does_not_open_the_stage() {
+        let mut file = bound("prd", BindingState::Confirmed, Some(true));
+        file.content_sha = "sha-1".to_string();
+        let stage = |file: &_| {
+            evaluate_stage(
+                stage_with(&["prd"], &[]),
+                &[],
+                std::slice::from_ref(file),
+                &[],
+                &[],
+            )
+        };
+        let approved = [review_of("sha-1", "approved", &["ann"])];
+        let now = gate_on_approvals(stage(&file), &[], std::slice::from_ref(&file), &approved);
+        assert!(now.complete, "{now:?}");
+
+        file.content_sha = "sha-2".to_string();
+        let later = gate_on_approvals(stage(&file), &[], std::slice::from_ref(&file), &approved);
+        assert_eq!(later.requirements[0].approvals_outstanding, ["Ann"]);
+        assert!(!later.complete);
+    }
+
+    #[test]
+    fn a_remark_keeps_only_a_web_link_to_where_it_came_from() {
+        let keep = |u: &str| safe_source_url(Some(u.to_string()));
+        assert_eq!(
+            keep(" https://github.com/o/r/pull/1#x "),
+            Some("https://github.com/o/r/pull/1#x".to_string())
+        );
+        assert!(keep("http://example.com/a").is_some());
+        for bad in [
+            "javascript:alert(1)",
+            "JavaScript:alert(1)",
+            "data:text/html,x",
+            "//evil.example",
+            "",
+            "https://x/\nset-cookie",
+        ] {
+            assert_eq!(keep(bad), None, "{bad:?}");
+        }
+        assert_eq!(
+            keep(&format!("https://x/{}", "a".repeat(SOURCE_URL_MAX))),
+            None
+        );
+        assert_eq!(safe_source_url(None), None);
+    }
+
+    #[test]
+    fn a_review_is_asked_only_about_the_projects_own_document_or_the_workspaces() {
+        let project = Uuid::from_u128(0xa);
+        assert!(subject_in_project(Some(project), project));
+        assert!(subject_in_project(None, project));
+        assert!(!subject_in_project(Some(Uuid::from_u128(0xb)), project));
     }
 
     fn bound(type_key: &str, state: BindingState, conforms: Option<bool>) -> DocumentBinding {

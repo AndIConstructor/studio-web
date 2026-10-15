@@ -15,11 +15,12 @@ other files spend against, and an implicit ceiling is one nobody can check:
 | studio-backend, 13 gear pools | 52 | `pool.max_conns: 4` on `pg_main`, `studio-backend/config/k8s.yaml` |
 | studio-backend, graph-storage | 8 | that gear's own `pool` override |
 | studio-backend, studio-events | 2 | that gear's own `pool` override |
+| studio-backend, postgres-usage-collector-plugin | 3 | 1 on its toolkit `pool`, 2 on its own sqlx pool (`pool_size_max`) |
 | Keycloak | 10 | `keycloak.dbPoolMaxSize`, `deploy/helm/studio-web/values.yaml` |
 | backend-bootstrap Job | ~2 | transient, one pass per upgrade |
 | CloudNativePG + exporter | ~5 | the operator |
 | `superuser_reserved_connections` | 3 | PostgreSQL default |
-| **Total** | **~82** | |
+| **Total** | **~85** | |
 
 The thing to know before changing any of it: toolkit-db caches one pool **per
 gear**, not per server, so the `max_conns` on `pg_main` is multiplied by the
@@ -33,24 +34,28 @@ The other blocker, a push channel whose sequence lived in process memory, is
 gone: `studio-events` keeps its sequence and its replay window in the database
 listed above, so two replicas agree on what a cursor means.
 
-So `max_connections` is **150**, not PostgreSQL's default of 100. The
+So `max_connections` is **160**, not PostgreSQL's default of 100. The
 arithmetic, which is the whole reason for the number:
 
 | shared `max_conns` | per replica | two replicas | with everyone else | under 100? |
 |---|---|---|---|---|
-| 4 (today) | 64 | 128 | 148 | no |
-| 3 | 51 | 102 | 122 | no |
-| 2 | 38 | 76 | 96 | yes |
+| 4 (today) | 67 | 134 | 154 | no |
+| 3 | 54 | 108 | 128 | no |
+| 2 | 41 | 82 | 102 | no |
 
 (Per replica: thirteen gears on the shared pool, plus graph-storage's own 8,
-studio-events' 2 and studio-artifact-ingest's 2.)
+studio-events' 2, studio-artifact-ingest's 2 and the usage plugin's 3.)
 
-Lowering the per-gear pool is therefore not the way to make room: three
-connections per gear still does not fit, and two — the only value that does —
-is a queue rather than a budget for any gear serving a burst.
+It was 150 until the usage plugin (issue #781) added three connections per
+replica and two replicas came to 154; 160 keeps them fitting with a little
+room. Dev's 3 Gi and test's 4 Gi memory limits cover the ten more processes.
+
+Lowering the per-gear pool is therefore not the way to make room: neither
+three nor two connections per gear fits in 100 any more, and two would be a
+queue rather than a budget for any gear serving a burst.
 
 Raising the ceiling is not free either. A PostgreSQL backend is a process, so
-150 of them is roughly another 400 MB of resident memory at saturation, and
+160 of them is roughly another 450 MB of resident memory at saturation, and
 `resources.limits.memory` moves from 2 Gi to 3 Gi with it. That is the trade
 being made: memory on one server against a second replica of the backend.
 

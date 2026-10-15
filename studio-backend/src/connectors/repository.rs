@@ -71,6 +71,11 @@ impl Repository {
         self.connection_id
     }
 
+    /// The repository's default branch.
+    pub async fn default_branch(&self) -> Result<String> {
+        self.driver.default_branch(&self.auth, &self.repo).await
+    }
+
     /// Every file and directory at the ref, and whether the provider cut the
     /// listing short.
     pub async fn tree(&self) -> Result<RemoteFileList> {
@@ -93,6 +98,22 @@ impl Repository {
             .await
     }
 
+    /// Start a run of `workflow` on `git_ref`, or on the repository's default
+    /// branch when none is given; returns the ref it was started on.
+    pub async fn dispatch_workflow(&self, workflow: &str, git_ref: Option<&str>) -> Result<String> {
+        let git_ref = match git_ref.map(str::trim).filter(|r| !r.is_empty()) {
+            Some(r) => r.to_string(),
+            None => match self.git_ref() {
+                Some(r) => r.to_string(),
+                None => self.driver.default_branch(&self.auth, &self.repo).await?,
+            },
+        };
+        self.driver
+            .dispatch_workflow(&self.auth, &self.repo, workflow, &git_ref)
+            .await?;
+        Ok(git_ref)
+    }
+
     /// One page of tag names.
     pub async fn tags(&self, page: u32, per_page: u32) -> Result<Vec<String>> {
         self.driver
@@ -100,18 +121,40 @@ impl Repository {
             .await
     }
 
-    /// Commit `files` in one commit on top of `base_branch`, onto `branch`
-    /// ([`ConnectorDriver::commit_files`]). Returns the commit `branch` points
-    /// at.
-    pub async fn commit_files(
+    /// Commit `files` in one commit on top of `base_branch`, onto `branch`,
+    /// deleting `deleted` in the same commit ([`ConnectorDriver::commit_changes`]).
+    pub async fn commit_changes(
         &self,
         base_branch: &str,
         branch: &str,
         files: &[FileToWrite],
+        deleted: &[String],
         message: &str,
     ) -> Result<String> {
         self.driver
-            .commit_files(&self.auth, &self.repo, base_branch, branch, files, message)
+            .commit_changes(
+                &self.auth,
+                &self.repo,
+                base_branch,
+                branch,
+                files,
+                deleted,
+                message,
+            )
+            .await
+    }
+
+    /// The commit `branch` points at; `None` when there is no such branch.
+    pub async fn head_of(&self, branch: &str) -> Result<Option<String>> {
+        self.driver
+            .branch_head(&self.auth, &self.repo, branch)
+            .await
+    }
+
+    /// Tag `sha` as `tag` ([`ConnectorDriver::create_tag`]).
+    pub async fn create_tag(&self, tag: &str, sha: &str) -> Result<()> {
+        self.driver
+            .create_tag(&self.auth, &self.repo, tag, sha)
             .await
     }
 

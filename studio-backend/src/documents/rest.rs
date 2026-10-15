@@ -204,6 +204,20 @@ pub struct StageStatusDto {
     pub required: bool,
     pub complete: bool,
     pub requirements: Vec<RequirementDto>,
+    /// The stage's checks beyond documents, each answered (#782).
+    pub checks: Vec<StageCheckDto>,
+}
+
+/// One check beyond documents, and where the project stands on it.
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+pub struct StageCheckDto {
+    /// `code`, `tests` or `review`.
+    pub kind: String,
+    /// `null` when this deployment cannot read the evidence: no verdict.
+    pub passed: Option<bool>,
+    /// What passed it, or what is still missing.
+    pub detail: String,
 }
 
 #[derive(Debug)]
@@ -228,6 +242,8 @@ pub struct StageDto {
     pub requires: Vec<String>,
     /// Detectors every required document must pass before the stage completes.
     pub gates: Vec<String>,
+    /// Checks beyond documents: `code`, `tests`, `review`.
+    pub checks: Vec<String>,
     /// "builtin", "organization" or "workspace".
     pub owner: String,
     pub owner_tenant_id: Option<Uuid>,
@@ -250,6 +266,8 @@ pub struct UpsertStageDto {
     pub position: Option<i32>,
     pub requires: Option<Vec<String>>,
     pub gates: Option<Vec<String>>,
+    /// Checks beyond documents, each of `code`, `tests`, `review`.
+    pub checks: Option<Vec<String>>,
     /// Hide the key this entry overrides instead of replacing it.
     pub hidden: Option<bool>,
 }
@@ -620,6 +638,15 @@ impl From<StageStatus> for StageStatusDto {
                     approvals_outstanding: r.approvals_outstanding,
                 })
                 .collect(),
+            checks: st
+                .checks
+                .into_iter()
+                .map(|c| StageCheckDto {
+                    kind: c.kind,
+                    passed: c.passed,
+                    detail: c.detail,
+                })
+                .collect(),
         }
     }
 }
@@ -638,6 +665,7 @@ impl From<Stage> for StageDto {
             position: st.position,
             requires: st.requires,
             gates: st.gates,
+            checks: st.checks,
             owner,
             owner_tenant_id,
             hidden: st.hidden,
@@ -962,6 +990,15 @@ async fn upsert_stage_at(
         .authorize(&ctx, tenant_id)
         .await
         .map_err(no_tenant)?;
+    let checks = body.checks.unwrap_or_default();
+    if let Some(bad) = checks
+        .iter()
+        .find(|c| !super::model::STAGE_CHECKS.contains(&c.as_str()))
+    {
+        return Err(invalid(anyhow::anyhow!(
+            "`{bad}` is not a stage check: use code, tests or review"
+        )));
+    }
     let st = Stage {
         key: body.key,
         label: body.label,
@@ -969,6 +1006,7 @@ async fn upsert_stage_at(
         position: body.position.unwrap_or(0),
         requires: body.requires.unwrap_or_default(),
         gates: body.gates.unwrap_or_default(),
+        checks,
         owner: owner.clone(),
         hidden: body.hidden.unwrap_or(false),
     };
@@ -1058,18 +1096,163 @@ async fn list_project_analyses(
     Ok(Json(AnalysisListDto { items, total }))
 }
 
+/// The evidence the stages' checks read, gathered only for the kinds some
+/// stage declares.
+async fn stage_evidence(
+    service: &DocumentsService,
+    quality: &Quality,
+    ctx: &SecurityContext,
+    workspace_id: Uuid,
+    project_id: Uuid,
+    kinds: &std::collections::BTreeSet<String>,
+) -> super::model::StageEvidence {
+    let mut ev = super::model::StageEvidence::default();
+    let scope = project_id.to_string();
+    let delivery = quality
+        .hub
+        .get::<dyn crate::artifact_ingest::port::DeliveryEvidence>()
+        .ok();
+    if kinds.contains("code") {
+        ev.code = match (quality.work(), quality.reader().ok()) {
+            (Some(source), Some(reader)) => {
+                match (
+                    source.project_work(ctx, &scope).await,
+                    service
+                        .spec_model_sources(ctx, workspace_id, project_id, reader.as_ref())
+                        .await,
+                ) {
+                    (Ok(work), Ok(sources)) => Some(code_evidence(&sources.labelled_ids(), &work)),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+    }
+    if kinds.contains("tests") {
+        ev.tests = match &delivery {
+            Some(d) => d.ci_runs(ctx, &scope).await.ok().map(|runs| {
+                match crate::artifact_ingest::port::latest_completed_run(&runs) {
+                    None => Err("no completed CI run has been synced".to_string()),
+                    Some(r) => {
+                        let what = format!(
+                            "{} on {} at {}",
+                            r.workflow,
+                            r.branch.as_deref().unwrap_or("?"),
+                            r.sha.chars().take(7).collect::<String>()
+                        );
+                        if r.conclusion.as_deref() == Some("success") {
+                            Ok(format!("{what} passed"))
+                        } else {
+                            Err(format!(
+                                "{what} ended {}",
+                                r.conclusion.as_deref().unwrap_or("without a conclusion")
+                            ))
+                        }
+                    }
+                }
+            }),
+            None => None,
+        };
+    }
+    if kinds.contains("review") {
+        let pulls = match &delivery {
+            Some(d) => d.pulls_waiting_on_review(ctx, &scope).await.ok(),
+            None => None,
+        };
+        let awaited: Vec<String> = service
+            .reviews_with_verdicts(workspace_id, project_id, None)
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter(|r| r.request.state == "open")
+            .filter(|r| {
+                !super::approvals::outstanding(&r.reviewers(), &r.verdict_facts()).is_empty()
+            })
+            .map(|r| r.request.title.clone())
+            .collect();
+        ev.review = pulls.map(|waiting| {
+            let mut missing = Vec::new();
+            if waiting > 0 {
+                missing.push(format!(
+                    "{waiting} pull request{} wait on review",
+                    if waiting == 1 { "" } else { "s" }
+                ));
+            }
+            if !awaited.is_empty() {
+                missing.push(format!(
+                    "review requested and not approved: {}",
+                    awaited.join(", ")
+                ));
+            }
+            if missing.is_empty() {
+                Ok("nothing waits on a reviewer".to_string())
+            } else {
+                Err(missing.join("; "))
+            }
+        });
+    }
+    ev
+}
+
+/// `code` passes when a commit or a merged pull request names one of the
+/// requirements the project's documents define; with no labelled
+/// requirements, when any commit was synced.
+fn code_evidence(
+    ids: &std::collections::BTreeMap<String, Vec<super::spec_model::finding::Side>>,
+    work: &[crate::artifact_ingest::port::WorkItem],
+) -> Result<String, String> {
+    let landed: Vec<crate::artifact_ingest::port::WorkItem> = work
+        .iter()
+        .filter(|w| w.kind == "commit" || (w.kind == "pull_request" && w.merged))
+        .cloned()
+        .collect();
+    if ids.is_empty() {
+        return if landed.iter().any(|w| w.kind == "commit") {
+            Ok("commits are synced (the documents label no requirements to match)".to_string())
+        } else {
+            Err("no commit has been synced".to_string())
+        };
+    }
+    let (linked, _) = super::spec_model::work::link(ids, &landed);
+    if linked.is_empty() {
+        Err(format!(
+            "no commit or merged pull request names one of the {} requirements",
+            ids.len()
+        ))
+    } else {
+        Ok(format!(
+            "{} of {} requirements are named by commits or merged pull requests",
+            linked.len(),
+            ids.len()
+        ))
+    }
+}
+
 /// Where a project stands against its workspace's stages.
 async fn project_stage_status(
     Extension(ctx): Extension<SecurityContext>,
     Extension(service): Extension<Arc<DocumentsService>>,
+    Extension(quality): Extension<Quality>,
     Path((workspace_id, project_id)): Path<(Uuid, Uuid)>,
 ) -> ApiResult<JsonBody<StageStatusListDto>> {
     service
         .authorize(&ctx, project_id)
         .await
         .map_err(no_tenant)?;
+    let kinds: std::collections::BTreeSet<String> = service
+        .list_stages(&ctx, workspace_id)
+        .await
+        .map_err(internal)?
+        .into_iter()
+        .flat_map(|s| s.checks)
+        .collect();
+    let evidence = if kinds.is_empty() {
+        super::model::StageEvidence::default()
+    } else {
+        stage_evidence(&service, &quality, &ctx, workspace_id, project_id, &kinds).await
+    };
     let items = service
-        .stage_status(&ctx, workspace_id, project_id)
+        .stage_status(&ctx, workspace_id, project_id, &evidence)
         .await
         .map_err(internal)?;
     Ok(Json(StageStatusListDto {
@@ -2107,6 +2290,9 @@ pub struct SpecModelSideDto {
     pub line_end: Option<u32>,
     /// The passage verbatim, or the document's title for a whole document.
     pub quote: Option<String>,
+    /// The document binding the path is, when the project binds it.
+    #[serde(default)]
+    pub binding_id: Option<String>,
 }
 
 #[derive(Debug)]
@@ -2127,6 +2313,8 @@ pub struct SpecModelFindingDto {
     pub edit: Option<SpecModelEditDto>,
     /// A member's word on it: `confirmed` (a real problem) or `dismissed`.
     pub decision: Option<String>,
+    /// For a reference to something missing: what it refers to.
+    pub target: Option<String>,
 }
 
 /// Replace `replace` with `with` in `path`.
@@ -2160,6 +2348,7 @@ impl From<super::spec_model::finding::Finding> for SpecModelFindingDto {
                     line_start: s.line_start.and_then(|n| u32::try_from(n).ok()),
                     line_end: s.line_end.and_then(|n| u32::try_from(n).ok()),
                     quote: s.quote,
+                    binding_id: None,
                 })
                 .collect(),
             decide: f.decide,
@@ -2169,8 +2358,55 @@ impl From<super::spec_model::finding::Finding> for SpecModelFindingDto {
                 with: e.with,
             }),
             decision: None,
+            target: f.target,
         }
     }
+}
+
+/// One field of an entity, as a person wrote it on the Domain model tab.
+#[derive(Debug)]
+#[toolkit_macros::api_dto(request)]
+pub struct SpecModelFieldInput {
+    pub name: String,
+    /// What it holds, in a few words.
+    #[serde(default)]
+    pub meaning: String,
+}
+
+/// One relation of an entity: "belongs to" Workspace.
+#[derive(Debug)]
+#[toolkit_macros::api_dto(request)]
+pub struct SpecModelRelationInput {
+    pub verb: String,
+    /// The entity it relates to, by name.
+    pub target: String,
+}
+
+/// An entity of the domain model as a person edited it: what it is, what it
+/// holds, how it relates. It replaces the entity's section of
+/// `docs/domain-model.md`.
+#[derive(Debug)]
+#[toolkit_macros::api_dto(request)]
+pub struct SpecModelEntityRequest {
+    pub name: String,
+    #[serde(default)]
+    pub definition: Option<String>,
+    #[serde(default)]
+    pub fields: Vec<SpecModelFieldInput>,
+    #[serde(default)]
+    pub relations: Vec<SpecModelRelationInput>,
+}
+
+/// Where a change to the documents landed.
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+pub struct SpecModelWriteDto {
+    /// The file written, from the repository's root.
+    pub path: String,
+    pub branch: String,
+    pub commit_sha: String,
+    /// Set when the change went as a pull request.
+    pub pr_url: Option<String>,
 }
 
 /// A member's ✓ or ✗ on one finding.
@@ -2180,6 +2416,8 @@ pub struct SpecModelDecisionRequest {
     pub project_id: String,
     /// `confirmed` (a real problem) or `dismissed` (not one).
     pub decision: String,
+    /// Why, in the member's words; at most 2000 characters.
+    pub note: Option<String>,
 }
 
 #[derive(Debug)]
@@ -2189,6 +2427,16 @@ pub struct SpecModelDecisionDto {
     pub decision: String,
     pub decided_by: String,
     pub decided_at: String,
+    pub note: Option<String>,
+    /// Whether the finding is still found: `false` once the documents no
+    /// longer show it (resolved), `null` when it was not a domain-model
+    /// finding the decision kept.
+    pub present: Option<bool>,
+    /// The finding as it stood when decided, when it was a domain-model one.
+    pub rule: Option<String>,
+    pub message: Option<String>,
+    pub target: Option<String>,
+    pub sides: Vec<SpecModelSideDto>,
 }
 
 /// Every ✓/✗ members gave on a project's findings.
@@ -2245,6 +2493,31 @@ pub struct GlossaryDecisionRequest {
     /// The `key` of the entry this one is another name of; `null` keeps it an
     /// entry of its own.
     pub alias_of: Option<String>,
+}
+
+/// A glossary rename to carry into the documents: the name they use and the
+/// name the project chose.
+#[derive(Debug)]
+#[toolkit_macros::api_dto(request)]
+pub struct GlossaryRenameRequest {
+    /// The old name, as the documents spell it (any case).
+    pub from: String,
+    /// The project's name for it.
+    pub to: String,
+}
+
+/// The pull request that renames a word across the documents.
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+pub struct GlossaryRenameProposalDto {
+    /// Every file changed, from the repository's root.
+    pub files: Vec<String>,
+    /// How many uses were renamed, across the files.
+    pub renamed: u32,
+    pub branch: String,
+    pub commit_sha: String,
+    /// Set when the change went as a pull request.
+    pub pr_url: Option<String>,
 }
 
 #[derive(Debug)]
@@ -2345,6 +2618,43 @@ pub struct SpecRequirementListDto {
 #[toolkit_macros::api_dto(request)]
 pub struct SpecModelBuildRequest {
     pub project_id: String,
+    /// One document to read again, whatever its state: its facts replace
+    /// that document's facts only, and the rest of the model stays as it is.
+    /// Without it, every document not read at its revision is read.
+    pub path: Option<String>,
+}
+
+/// What a build would read, and about how long it would take.
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+pub struct SpecModelBuildEstimateDto {
+    /// Documents the build would read: changed or never read, or the one
+    /// asked for.
+    pub documents: u32,
+    /// Documents of the project's model, read or not.
+    pub total_documents: u32,
+    pub characters: u64,
+    /// Characters over four: a rule of thumb, not the provider's tokenizer.
+    pub input_tokens: u64,
+    /// Seconds reading them is expected to take; the judge's stage after it
+    /// is not counted.
+    pub seconds: u64,
+    /// Wall-clock seconds per document at `parallel` reads at once.
+    pub seconds_per_document: f64,
+    /// True when the pace was measured on the project's earlier builds,
+    /// false when it is a default.
+    pub measured: bool,
+    /// Documents read at once.
+    pub parallel: u32,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct SpecBuildEstimateQuery {
+    pub project_id: String,
+    /// One document to estimate reading again, as `POST /spec-model/builds`
+    /// with a `path` would.
+    #[serde(default)]
+    pub path: Option<String>,
 }
 
 /// A project's build, as the process serving it knows it.
@@ -2363,6 +2673,12 @@ pub struct SpecModelBuildDto {
     pub error: Option<String>,
     pub started_at: Option<String>,
     pub finished_at: Option<String>,
+    /// Seconds reading the documents was estimated to take when it started:
+    /// the ETA until the first document is done, after which `done`,
+    /// `documents` and `started_at` give a better one.
+    pub estimated_seconds: Option<u64>,
+    /// The one document this build reads again, when it was asked for one.
+    pub path: Option<String>,
 }
 
 impl From<super::spec_model::build::BuildState> for SpecModelBuildDto {
@@ -2383,6 +2699,8 @@ impl From<super::spec_model::build::BuildState> for SpecModelBuildDto {
             error: s.error,
             started_at: at(s.started_at),
             finished_at: at(s.finished_at),
+            estimated_seconds: s.estimated_seconds,
+            path: s.path,
         }
     }
 }
@@ -2417,6 +2735,9 @@ pub struct SpecModelFactDto {
     /// `evidence`.
     pub status: String,
     pub status_because: String,
+    /// `domain`, `system` or `deployment` when the extractor stated where an
+    /// `entity` sits; absent otherwise.
+    pub layer: Option<String>,
     pub source: SpecModelSideDto,
 }
 
@@ -2501,11 +2822,13 @@ async fn get_spec_model(
                 text: f.text,
                 status: f.status,
                 status_because: f.status_because,
+                layer: f.layer,
                 source: SpecModelSideDto {
                     path: f.path,
                     line_start: u32::try_from(f.line_start).ok(),
                     line_end: u32::try_from(f.line_end).ok(),
                     quote: Some(f.quote),
+                    binding_id: None,
                 },
             })
             .collect(),
@@ -2528,17 +2851,15 @@ async fn start_spec_model_build(
     let models = quality.models()?;
     let (sources, _, coverage) =
         spec_model_state(&service, &ctx, workspace_id, project_id, reader.as_ref()).await?;
-    let wanted: std::collections::BTreeSet<&str> =
-        super::spec_model::to_read(&coverage).into_iter().collect();
-    let pending: Vec<super::spec_model::SourceText> = sources
-        .documents
-        .iter()
-        .filter(|d| wanted.contains(d.path.as_str()))
-        .cloned()
-        .collect();
+    let pending = spec_model_pending(&sources, &coverage, body.path.as_deref())?;
+    let estimate = spec_model_estimate(&service, workspace_id, project_id, &pending).await?;
     if !build::begin(project_id, pending.len()) {
         return Ok((StatusCode::ACCEPTED, Json(build::state(project_id).into())));
     }
+    build::update(project_id, |s| {
+        s.estimated_seconds = Some(estimate.seconds);
+        s.path.clone_from(&body.path);
+    });
     let findings_writer = quality.findings();
     let sources_for_record = super::spec_model::Sources {
         documents: sources.documents.clone(),
@@ -2548,31 +2869,26 @@ async fn start_spec_model_build(
     };
     let documents = sources.documents;
     tokio::spawn(async move {
-        for doc in pending {
-            build::update(project_id, |s| s.current = Some(doc.path.clone()));
-            let read = match build::read_document(
-                models.as_ref(),
-                &ctx,
-                &doc.path,
-                doc.doc_type.as_deref(),
-                &doc.text,
-            )
-            .await
-            {
-                Ok(read) => read,
-                Err(build::Stop(reason)) => {
-                    build::finish(project_id, Some(reason));
-                    return;
+        let service_ref = &service;
+        let read = build::read_all(
+            project_id,
+            models.as_ref(),
+            &ctx,
+            pending,
+            move |doc, read| async move {
+                let revision = super::spec_model::extract::revision(&doc.text);
+                if let Err(error) = service_ref
+                    .put_spec_extraction(workspace_id, project_id, &doc.path, &revision, &read)
+                    .await
+                {
+                    tracing::warn!(%error, path = %doc.path, "spec-model: an extraction could not be kept");
                 }
-            };
-            let revision = super::spec_model::extract::revision(&doc.text);
-            if let Err(error) = service
-                .put_spec_extraction(workspace_id, project_id, &doc.path, &revision, &read)
-                .await
-            {
-                tracing::warn!(%error, path = %doc.path, "spec-model: an extraction could not be kept");
-            }
-            build::update(project_id, |s| s.done += 1);
+            },
+        )
+        .await;
+        if let Err(build::Stop(reason)) = read {
+            build::finish(project_id, Some(reason));
+            return;
         }
         let reason = judge_new_candidates(
             &service,
@@ -2598,6 +2914,83 @@ async fn start_spec_model_build(
         build::finish(project_id, reason);
     });
     Ok((StatusCode::ACCEPTED, Json(build::state(project_id).into())))
+}
+
+/// The documents a build reads: every one not read at its revision, or the
+/// one named by `path` whatever its state (404 when it is not one of the
+/// model's documents).
+fn spec_model_pending(
+    sources: &super::spec_model::Sources,
+    coverage: &[super::spec_model::Coverage],
+    path: Option<&str>,
+) -> ApiResult<Vec<super::spec_model::SourceText>> {
+    if let Some(path) = path {
+        let doc = sources
+            .documents
+            .iter()
+            .find(|d| d.path == path)
+            .cloned()
+            .ok_or_else(|| {
+                DocumentsError::not_found("no such document in the project's model")
+                    .with_resource("document")
+                    .create()
+            })?;
+        return Ok(vec![doc]);
+    }
+    let wanted: std::collections::BTreeSet<&str> =
+        super::spec_model::to_read(coverage).into_iter().collect();
+    Ok(sources
+        .documents
+        .iter()
+        .filter(|d| wanted.contains(d.path.as_str()))
+        .cloned()
+        .collect())
+}
+
+/// What reading `pending` is expected to take, at the pace of the project's
+/// earlier builds when there were any.
+async fn spec_model_estimate(
+    service: &DocumentsService,
+    workspace_id: Uuid,
+    project_id: Uuid,
+    pending: &[super::spec_model::SourceText],
+) -> ApiResult<super::spec_model::build::Estimate> {
+    use super::spec_model::build;
+    let rows = service
+        .spec_extractions(workspace_id, project_id)
+        .await
+        .map_err(internal)?;
+    let kept_at: Vec<time::OffsetDateTime> = rows.iter().map(|r| r.created_at).collect();
+    let texts: Vec<&str> = pending.iter().map(|d| d.text.as_str()).collect();
+    Ok(build::estimate(&texts, build::pace_from(&kept_at)))
+}
+
+/// What a build of the project would read now, and about how long it would
+/// take.
+async fn get_spec_model_build_estimate(
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(service): Extension<Arc<DocumentsService>>,
+    Extension(quality): Extension<Quality>,
+    Query(query): Query<SpecBuildEstimateQuery>,
+) -> ApiResult<JsonBody<SpecModelBuildEstimateDto>> {
+    let project_id = parse_project_id(&query.project_id)?;
+    let workspace_id = parent_workspace(&service, &ctx, project_id).await?;
+    let reader = quality.reader()?;
+    let (sources, _, coverage) =
+        spec_model_state(&service, &ctx, workspace_id, project_id, reader.as_ref()).await?;
+    let pending = spec_model_pending(&sources, &coverage, query.path.as_deref())?;
+    let e = spec_model_estimate(&service, workspace_id, project_id, &pending).await?;
+    let count = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
+    Ok(Json(SpecModelBuildEstimateDto {
+        documents: count(e.documents),
+        total_documents: count(sources.documents.len()),
+        characters: u64::try_from(e.characters).unwrap_or(u64::MAX),
+        input_tokens: u64::try_from(e.input_tokens).unwrap_or(u64::MAX),
+        seconds: e.seconds,
+        seconds_per_document: e.seconds_per_document,
+        measured: e.measured,
+        parallel: count(super::spec_model::build::PARALLEL_READS),
+    }))
 }
 
 /// Today's candidates of the project's model and the judgements kept for
@@ -2798,18 +3191,82 @@ async fn list_spec_model_findings(
     let (findings, decisions) = spec_model_findings(&service, workspace_id, project_id, &sources)
         .await
         .map_err(internal)?;
+    let binding_of = binding_ids(&sources);
     let items: Vec<SpecModelFindingDto> = findings
         .into_iter()
         .map(|f| {
             let decision = decisions.get(&f.fingerprint).cloned();
-            SpecModelFindingDto {
+            let mut dto = SpecModelFindingDto {
                 decision,
                 ..f.into()
+            };
+            for side in &mut dto.sides {
+                side.binding_id = binding_of.get(&side.path).cloned();
             }
+            dto
         })
         .collect();
     let total = u32::try_from(items.len()).unwrap_or(u32::MAX);
     Ok(Json(SpecModelFindingListDto { items, total }))
+}
+
+/// Path → binding id, for every document the model read.
+fn binding_ids(sources: &super::spec_model::Sources) -> std::collections::BTreeMap<String, String> {
+    sources
+        .documents
+        .iter()
+        .filter_map(|d| d.binding.map(|b| (d.path.clone(), b.to_string())))
+        .collect()
+}
+
+/// A finding as a decision keeps it.
+fn finding_snapshot(f: &super::spec_model::finding::Finding) -> serde_json::Value {
+    serde_json::json!({
+        "rule": f.rule,
+        "message": f.message,
+        "target": f.target,
+        "sides": f.sides,
+    })
+}
+
+/// A decision with the finding it was taken on, and whether that is still found.
+fn spec_decision_dto(
+    d: super::entity::spec_decision::Model,
+    present: Option<bool>,
+    binding_of: &std::collections::BTreeMap<String, String>,
+) -> SpecModelDecisionDto {
+    let snap = d.snapshot.clone().unwrap_or(serde_json::Value::Null);
+    let text = |k: &str| {
+        snap.get(k)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+    };
+    let sides: Vec<super::spec_model::finding::Side> = snap
+        .get("sides")
+        .cloned()
+        .and_then(|v| serde_json::from_value(v).ok())
+        .unwrap_or_default();
+    SpecModelDecisionDto {
+        fingerprint: d.fingerprint,
+        decision: d.decision,
+        decided_by: d.decided_by.to_string(),
+        decided_at: rfc3339(d.decided_at),
+        note: d.note,
+        present: if d.snapshot.is_some() { present } else { None },
+        rule: text("rule"),
+        message: text("message"),
+        target: text("target"),
+        sides: sides
+            .into_iter()
+            .map(|s| SpecModelSideDto {
+                binding_id: binding_of.get(&s.path).cloned(),
+                path: s.path,
+                line_start: s.line_start.and_then(|n| u32::try_from(n).ok()),
+                line_end: s.line_end.and_then(|n| u32::try_from(n).ok()),
+                quote: s.quote,
+            })
+            .collect(),
+    }
 }
 
 /// Record a member's ✓ or ✗ on one finding. It holds for as long as the
@@ -2904,6 +3361,7 @@ async fn list_work_links(
                     line_start: first.line_start.and_then(|n| u32::try_from(n).ok()),
                     line_end: first.line_end.and_then(|n| u32::try_from(n).ok()),
                     quote: first.quote,
+                    binding_id: None,
                 },
                 work: l
                     .work
@@ -2980,6 +3438,7 @@ async fn list_spec_requirements(
                     line_start: line,
                     line_end: line,
                     quote: None,
+                    binding_id: None,
                 },
                 id: r.id,
                 title: r.title,
@@ -3604,6 +4063,590 @@ async fn list_decisions(
     }))
 }
 
+/// One part of the application beyond its gears.
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+pub struct ApplicationPartDto {
+    /// `configuration`, `storage` or `deployment`.
+    pub kind: String,
+    /// `owner/repo`.
+    pub repo: String,
+    /// A directory or a file in it.
+    pub reference: String,
+    pub name: String,
+    /// What it was recognised by; empty for a part only recorded.
+    pub evidence: String,
+    /// Still found in the repository.
+    pub present: bool,
+    pub owner: Option<String>,
+    pub owner_name: Option<String>,
+    pub description_path: Option<String>,
+    pub boundary: Option<String>,
+    pub related: Vec<String>,
+    pub updated_by: Option<String>,
+    pub updated_at: Option<String>,
+}
+
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+pub struct ApplicationPartListDto {
+    pub items: Vec<ApplicationPartDto>,
+    pub total: u32,
+    /// Repositories read.
+    pub repos: u32,
+}
+
+/// Record what is known about one part.
+#[derive(Debug)]
+#[toolkit_macros::api_dto(request)]
+pub struct ApplicationPartInput {
+    pub project_id: String,
+    pub repo: String,
+    pub kind: String,
+    pub reference: String,
+    pub owner: Option<String>,
+    pub owner_name: Option<String>,
+    pub description_path: Option<String>,
+    pub boundary: Option<String>,
+    pub related: Option<Vec<String>>,
+}
+
+fn part_dto(
+    kind: String,
+    repo: String,
+    reference: String,
+    name: String,
+    evidence: String,
+    present: bool,
+    record: Option<&super::entity::application_part::Model>,
+) -> ApplicationPartDto {
+    ApplicationPartDto {
+        kind,
+        repo,
+        reference,
+        name,
+        evidence,
+        present,
+        owner: record.and_then(|r| r.owner.clone()),
+        owner_name: record.and_then(|r| r.owner_name.clone()),
+        description_path: record.and_then(|r| r.description_path.clone()),
+        boundary: record.and_then(|r| r.boundary.clone()),
+        related: record
+            .map(|r| serde_json::from_value(r.related.clone()).unwrap_or_default())
+            .unwrap_or_default(),
+        updated_by: record.map(|r| r.updated_by.clone()),
+        updated_at: record.map(|r| rfc3339(r.updated_at)),
+    }
+}
+
+/// The application's configuration, storage and deployment parts, found in
+/// the project's repositories, with what people recorded about each.
+async fn list_application_parts(
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(service): Extension<Arc<DocumentsService>>,
+    Extension(quality): Extension<Quality>,
+    Query(query): Query<ProjectQuery>,
+) -> ApiResult<JsonBody<ApplicationPartListDto>> {
+    let project_id = parse_project_id(&query.project_id)?;
+    let workspace_id = parent_workspace(&service, &ctx, project_id).await?;
+    let records = service
+        .part_records(workspace_id, project_id)
+        .await
+        .map_err(internal)?;
+    let mut items = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    let mut repos = 0u32;
+    for (driver, auth, repo, branch) in
+        reachable_repositories(&service, &quality, &ctx, project_id).await
+    {
+        let Ok(list) = driver.list_files(&auth, &repo, Some(&branch)).await else {
+            continue;
+        };
+        repos += 1;
+        let paths: Vec<String> = list
+            .files
+            .into_iter()
+            .filter(|f| !f.is_dir)
+            .map(|f| f.path)
+            .collect();
+        for part in super::parts::detect(&repo, &paths) {
+            let record = records
+                .iter()
+                .find(|r| r.repo == repo && r.kind == part.kind && r.reference == part.reference);
+            seen.insert((repo.clone(), part.kind.to_string(), part.reference.clone()));
+            items.push(part_dto(
+                part.kind.to_string(),
+                repo.clone(),
+                part.reference,
+                part.name,
+                part.evidence,
+                true,
+                record,
+            ));
+        }
+    }
+    // A part someone recorded that the repositories no longer show.
+    for r in &records {
+        if !seen.contains(&(r.repo.clone(), r.kind.clone(), r.reference.clone())) {
+            let name = r
+                .reference
+                .rsplit('/')
+                .next()
+                .unwrap_or(&r.reference)
+                .to_string();
+            items.push(part_dto(
+                r.kind.clone(),
+                r.repo.clone(),
+                r.reference.clone(),
+                name,
+                String::new(),
+                false,
+                Some(r),
+            ));
+        }
+    }
+    Ok(Json(ApplicationPartListDto {
+        total: u32::try_from(items.len()).unwrap_or(u32::MAX),
+        items,
+        repos,
+    }))
+}
+
+async fn upsert_application_part(
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(service): Extension<Arc<DocumentsService>>,
+    Extension(quality): Extension<Quality>,
+    Json(body): Json<ApplicationPartInput>,
+) -> ApiResult<JsonBody<ApplicationPartDto>> {
+    let project_id = parse_project_id(&body.project_id)?;
+    let workspace_id = parent_workspace(&service, &ctx, project_id).await?;
+    let (me, _) = quality.caller(&ctx).await?;
+    let saved = service
+        .record_part(
+            workspace_id,
+            project_id,
+            body.repo.trim(),
+            body.kind.trim(),
+            body.reference.trim(),
+            super::service::PartRecord {
+                owner: body.owner,
+                owner_name: body.owner_name,
+                description_path: body.description_path,
+                boundary: body.boundary,
+                related: body.related.unwrap_or_default(),
+            },
+            &me,
+        )
+        .await
+        .map_err(invalid)?;
+    let name = saved
+        .reference
+        .rsplit('/')
+        .next()
+        .unwrap_or(&saved.reference)
+        .to_string();
+    Ok(Json(part_dto(
+        saved.kind.clone(),
+        saved.repo.clone(),
+        saved.reference.clone(),
+        name,
+        String::new(),
+        true,
+        Some(&saved),
+    )))
+}
+
+/// A new delivery scope.
+#[derive(Debug)]
+#[toolkit_macros::api_dto(request)]
+pub struct DeliveryScopeInput {
+    pub project_id: String,
+    pub title: String,
+    pub outcome: Option<String>,
+    /// Canonical person id.
+    pub owner: Option<String>,
+    pub owner_name: Option<String>,
+    /// `YYYY-MM-DD`.
+    pub target_date: Option<String>,
+    /// Requirement identifiers it delivers.
+    pub requirements: Option<Vec<String>>,
+    /// Gears it pins, by crate name.
+    pub gears: Option<Vec<String>>,
+    pub acceptance: Option<String>,
+    /// `planned` (default), `in_progress`, `delivered`, `dropped`.
+    pub state: Option<String>,
+}
+
+/// A change to a delivery scope: only the fields given change.
+#[derive(Debug)]
+#[toolkit_macros::api_dto(request)]
+pub struct DeliveryScopePatch {
+    pub project_id: String,
+    pub title: Option<String>,
+    pub outcome: Option<String>,
+    /// An empty string clears it.
+    pub owner: Option<String>,
+    pub owner_name: Option<String>,
+    /// An empty string clears it.
+    pub target_date: Option<String>,
+    pub requirements: Option<Vec<String>>,
+    pub gears: Option<Vec<String>>,
+    pub acceptance: Option<String>,
+    pub state: Option<String>,
+}
+
+/// A new limit on a scope.
+#[derive(Debug)]
+#[toolkit_macros::api_dto(request)]
+pub struct DeliveryLimitInput {
+    pub project_id: String,
+    /// `limitation`, `open_question` or `dependency`.
+    pub kind: String,
+    pub text: String,
+    pub blocking: Option<bool>,
+    /// For a dependency: another scope's id, or a decision record.
+    pub depends_on: Option<String>,
+}
+
+/// Resolve a limit, or change whether it blocks.
+#[derive(Debug)]
+#[toolkit_macros::api_dto(request)]
+pub struct DeliveryLimitPatch {
+    pub project_id: String,
+    /// The resolution; an empty string reopens the limit.
+    pub resolution: Option<String>,
+    pub blocking: Option<bool>,
+}
+
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+pub struct DeliveryLimitDto {
+    pub id: String,
+    pub scope_id: String,
+    pub kind: String,
+    pub text: String,
+    pub blocking: bool,
+    pub depends_on: Option<String>,
+    pub resolution: Option<String>,
+    pub resolved_by: Option<String>,
+    pub resolved_at: Option<String>,
+    pub created_by: String,
+    pub created_at: String,
+}
+
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+pub struct DeliveryScopeDto {
+    pub id: String,
+    pub project_id: String,
+    pub title: String,
+    pub outcome: String,
+    pub owner: Option<String>,
+    pub owner_name: Option<String>,
+    pub target_date: Option<String>,
+    pub requirements: Vec<String>,
+    pub gears: Vec<String>,
+    pub acceptance: String,
+    pub state: String,
+    /// A blocking limit still holds.
+    pub blocked: bool,
+    pub limits: Vec<DeliveryLimitDto>,
+    pub created_by: String,
+    pub created_at: String,
+    pub updated_by: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+pub struct DeliveryScopeListDto {
+    pub items: Vec<DeliveryScopeDto>,
+    pub total: u32,
+}
+
+/// One earlier version of a scope.
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+pub struct DeliveryScopeVersionDto {
+    /// The scope's fields as they were before the change.
+    pub snapshot: serde_json::Value,
+    pub changed_by: String,
+    pub changed_at: String,
+}
+
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+pub struct DeliveryScopeHistoryDto {
+    pub items: Vec<DeliveryScopeVersionDto>,
+    pub total: u32,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct ProjectQuery {
+    pub project_id: String,
+}
+
+fn limit_dto(l: super::entity::delivery_limit::Model) -> DeliveryLimitDto {
+    DeliveryLimitDto {
+        id: l.id.to_string(),
+        scope_id: l.scope_id.to_string(),
+        kind: l.kind,
+        text: l.text,
+        blocking: l.blocking,
+        depends_on: l.depends_on,
+        resolution: l.resolution,
+        resolved_by: l.resolved_by,
+        resolved_at: l.resolved_at.map(rfc3339),
+        created_by: l.created_by,
+        created_at: rfc3339(l.created_at),
+    }
+}
+
+fn scope_dto(
+    s: super::entity::delivery_scope::Model,
+    limits: Vec<super::entity::delivery_limit::Model>,
+    blocked: bool,
+) -> DeliveryScopeDto {
+    DeliveryScopeDto {
+        id: s.id.to_string(),
+        project_id: s.project_id.to_string(),
+        title: s.title,
+        outcome: s.outcome,
+        owner: s.owner,
+        owner_name: s.owner_name,
+        target_date: s.target_date,
+        requirements: serde_json::from_value(s.requirements).unwrap_or_default(),
+        gears: serde_json::from_value(s.gears).unwrap_or_default(),
+        acceptance: s.acceptance,
+        state: s.state,
+        blocked,
+        limits: limits.into_iter().map(limit_dto).collect(),
+        created_by: s.created_by,
+        created_at: rfc3339(s.created_at),
+        updated_by: s.updated_by,
+        updated_at: rfc3339(s.updated_at),
+    }
+}
+
+fn no_scope() -> CanonicalError {
+    DocumentsError::not_found("no such delivery scope in this project")
+        .with_resource("delivery_scope")
+        .create()
+}
+
+/// The scope as it now stands, with its limits and whether it is blocked.
+async fn scope_view_dto(
+    service: &DocumentsService,
+    workspace_id: Uuid,
+    project_id: Uuid,
+    id: Uuid,
+) -> ApiResult<DeliveryScopeDto> {
+    let view = service
+        .delivery_scopes(workspace_id, project_id)
+        .await
+        .map_err(internal)?
+        .into_iter()
+        .find(|v| v.scope.id == id)
+        .ok_or_else(no_scope)?;
+    Ok(scope_dto(view.scope, view.limits, view.blocked))
+}
+
+async fn list_delivery_scopes(
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(service): Extension<Arc<DocumentsService>>,
+    Query(query): Query<ProjectQuery>,
+) -> ApiResult<JsonBody<DeliveryScopeListDto>> {
+    let project_id = parse_project_id(&query.project_id)?;
+    let workspace_id = parent_workspace(&service, &ctx, project_id).await?;
+    let items: Vec<DeliveryScopeDto> = service
+        .delivery_scopes(workspace_id, project_id)
+        .await
+        .map_err(internal)?
+        .into_iter()
+        .map(|v| scope_dto(v.scope, v.limits, v.blocked))
+        .collect();
+    Ok(Json(DeliveryScopeListDto {
+        total: u32::try_from(items.len()).unwrap_or(u32::MAX),
+        items,
+    }))
+}
+
+async fn create_delivery_scope(
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(service): Extension<Arc<DocumentsService>>,
+    Extension(quality): Extension<Quality>,
+    Json(body): Json<DeliveryScopeInput>,
+) -> ApiResult<(StatusCode, JsonBody<DeliveryScopeDto>)> {
+    let project_id = parse_project_id(&body.project_id)?;
+    let workspace_id = parent_workspace(&service, &ctx, project_id).await?;
+    let (me, _) = quality.caller(&ctx).await?;
+    let saved = service
+        .create_scope(
+            workspace_id,
+            project_id,
+            super::delivery::ScopeFields {
+                title: body.title,
+                outcome: body.outcome.unwrap_or_default(),
+                owner: body.owner,
+                owner_name: body.owner_name,
+                target_date: body.target_date,
+                requirements: body.requirements.unwrap_or_default(),
+                gears: body.gears.unwrap_or_default(),
+                acceptance: body.acceptance.unwrap_or_default(),
+                state: body.state.unwrap_or_default(),
+            },
+            &me,
+        )
+        .await
+        .map_err(invalid)?;
+    Ok((
+        StatusCode::CREATED,
+        Json(scope_dto(saved, Vec::new(), false)),
+    ))
+}
+
+async fn update_delivery_scope(
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(service): Extension<Arc<DocumentsService>>,
+    Extension(quality): Extension<Quality>,
+    Path(scope_id): Path<String>,
+    Json(body): Json<DeliveryScopePatch>,
+) -> ApiResult<JsonBody<DeliveryScopeDto>> {
+    let project_id = parse_project_id(&body.project_id)?;
+    let workspace_id = parent_workspace(&service, &ctx, project_id).await?;
+    let id = parse_uuid_field("scope_id", &scope_id)?;
+    let (me, _) = quality.caller(&ctx).await?;
+    let clearable = |v: Option<String>| v.map(|s| Some(s).filter(|s| !s.trim().is_empty()));
+    let patch = super::service::ScopePatch {
+        title: body.title,
+        outcome: body.outcome,
+        owner: clearable(body.owner),
+        owner_name: clearable(body.owner_name),
+        target_date: clearable(body.target_date),
+        requirements: body.requirements,
+        gears: body.gears,
+        acceptance: body.acceptance,
+        state: body.state,
+    };
+    service
+        .update_scope(workspace_id, project_id, id, patch, &me)
+        .await
+        .map_err(invalid)?
+        .ok_or_else(no_scope)?;
+    Ok(Json(
+        scope_view_dto(&service, workspace_id, project_id, id).await?,
+    ))
+}
+
+async fn delete_delivery_scope(
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(service): Extension<Arc<DocumentsService>>,
+    Path(scope_id): Path<String>,
+    Query(query): Query<ProjectQuery>,
+) -> ApiResult<StatusCode> {
+    let project_id = parse_project_id(&query.project_id)?;
+    let workspace_id = parent_workspace(&service, &ctx, project_id).await?;
+    let id = parse_uuid_field("scope_id", &scope_id)?;
+    if service
+        .delete_scope(workspace_id, project_id, id)
+        .await
+        .map_err(internal)?
+    {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(no_scope())
+    }
+}
+
+async fn list_delivery_scope_history(
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(service): Extension<Arc<DocumentsService>>,
+    Path(scope_id): Path<String>,
+    Query(query): Query<ProjectQuery>,
+) -> ApiResult<JsonBody<DeliveryScopeHistoryDto>> {
+    let project_id = parse_project_id(&query.project_id)?;
+    let workspace_id = parent_workspace(&service, &ctx, project_id).await?;
+    let id = parse_uuid_field("scope_id", &scope_id)?;
+    let items: Vec<DeliveryScopeVersionDto> = service
+        .scope_history(workspace_id, project_id, id)
+        .await
+        .map_err(internal)?
+        .ok_or_else(no_scope)?
+        .into_iter()
+        .map(|h| DeliveryScopeVersionDto {
+            snapshot: h.snapshot,
+            changed_by: h.changed_by,
+            changed_at: rfc3339(h.changed_at),
+        })
+        .collect();
+    Ok(Json(DeliveryScopeHistoryDto {
+        total: u32::try_from(items.len()).unwrap_or(u32::MAX),
+        items,
+    }))
+}
+
+async fn create_delivery_limit(
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(service): Extension<Arc<DocumentsService>>,
+    Extension(quality): Extension<Quality>,
+    Path(scope_id): Path<String>,
+    Json(body): Json<DeliveryLimitInput>,
+) -> ApiResult<(StatusCode, JsonBody<DeliveryLimitDto>)> {
+    let project_id = parse_project_id(&body.project_id)?;
+    let workspace_id = parent_workspace(&service, &ctx, project_id).await?;
+    let id = parse_uuid_field("scope_id", &scope_id)?;
+    let (me, _) = quality.caller(&ctx).await?;
+    let saved = service
+        .add_limit(
+            workspace_id,
+            project_id,
+            id,
+            super::delivery::LimitFields {
+                kind: body.kind,
+                text: body.text,
+                blocking: body.blocking.unwrap_or(false),
+                depends_on: body.depends_on,
+            },
+            &me,
+        )
+        .await
+        .map_err(invalid)?
+        .ok_or_else(no_scope)?;
+    Ok((StatusCode::CREATED, Json(limit_dto(saved))))
+}
+
+async fn update_delivery_limit(
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(service): Extension<Arc<DocumentsService>>,
+    Extension(quality): Extension<Quality>,
+    Path((scope_id, limit_id)): Path<(String, String)>,
+    Json(body): Json<DeliveryLimitPatch>,
+) -> ApiResult<JsonBody<DeliveryLimitDto>> {
+    let project_id = parse_project_id(&body.project_id)?;
+    let workspace_id = parent_workspace(&service, &ctx, project_id).await?;
+    let scope = parse_uuid_field("scope_id", &scope_id)?;
+    let limit = parse_uuid_field("limit_id", &limit_id)?;
+    let (me, _) = quality.caller(&ctx).await?;
+    let saved = service
+        .update_limit(
+            workspace_id,
+            project_id,
+            scope,
+            limit,
+            body.resolution,
+            body.blocking,
+            &me,
+        )
+        .await
+        .map_err(invalid)?
+        .ok_or_else(|| {
+            DocumentsError::not_found("no such limit on this scope")
+                .with_resource("delivery_limit")
+                .create()
+        })?;
+    Ok(Json(limit_dto(saved)))
+}
+
 /// Check the project's open pull requests.
 #[derive(Debug)]
 #[toolkit_macros::api_dto(request)]
@@ -4069,6 +5112,7 @@ fn side_at(path: &str, line: usize) -> SpecModelSideDto {
         line_start: line,
         line_end: line,
         quote: None,
+        binding_id: None,
     }
 }
 
@@ -4226,6 +5270,7 @@ async fn decide_glossary_entry(
 async fn decide_spec_model_finding(
     Extension(ctx): Extension<SecurityContext>,
     Extension(service): Extension<Arc<DocumentsService>>,
+    Extension(quality): Extension<Quality>,
     Path(fingerprint): Path<String>,
     Json(body): Json<SpecModelDecisionRequest>,
 ) -> ApiResult<(StatusCode, JsonBody<SpecModelDecisionDto>)> {
@@ -4252,20 +5297,405 @@ async fn decide_spec_model_finding(
             )
             .create());
     }
+    // Keep the finding as it stands, so a fixed one stays readable as
+    // resolved. A Spec Quality finding is not the model's: no snapshot.
+    let (snapshot, binding_of) = match quality.reader() {
+        Ok(reader) => match service
+            .spec_model_sources(&ctx, workspace_id, project_id, reader.as_ref())
+            .await
+        {
+            Ok(sources) => {
+                let found = spec_model_findings(&service, workspace_id, project_id, &sources)
+                    .await
+                    .ok()
+                    .and_then(|(fs, _)| fs.into_iter().find(|f| f.fingerprint == fingerprint));
+                (found.as_ref().map(finding_snapshot), binding_ids(&sources))
+            }
+            Err(_) => (None, Default::default()),
+        },
+        Err(_) => (None, Default::default()),
+    };
+    let present = snapshot.as_ref().map(|_| true);
     let saved = service
-        .put_spec_decision(&ctx, workspace_id, project_id, &fingerprint, &body.decision)
+        .put_spec_decision(
+            &ctx,
+            workspace_id,
+            project_id,
+            &fingerprint,
+            &body.decision,
+            body.note,
+            snapshot,
+        )
         .await
-        .map_err(internal)?;
+        .map_err(invalid)?;
     Ok((
         StatusCode::CREATED,
-        Json(SpecModelDecisionDto {
-            fingerprint: saved.fingerprint,
-            decision: saved.decision,
-            decided_by: saved.decided_by.to_string(),
-            decided_at: saved
-                .decided_at
-                .format(&time::format_description::well_known::Rfc3339)
-                .unwrap_or_default(),
+        Json(spec_decision_dto(saved, present, &binding_of)),
+    ))
+}
+
+/// studio-product's writer into the project's repository.
+fn project_files(quality: &Quality) -> ApiResult<Arc<dyn crate::product::port::ProjectFiles>> {
+    quality
+        .hub
+        .get::<dyn crate::product::port::ProjectFiles>()
+        .map_err(|_| {
+            CanonicalError::service_unavailable()
+                .with_detail(
+                    "studio-product is not running, so nothing can be written to a repository",
+                )
+                .create()
+        })
+}
+
+/// A branch name's part made of `name`: lowercase letters, digits, dashes.
+fn branch_part(name: &str) -> String {
+    let slug: String = name
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    let slug = slug
+        .split('-')
+        .filter(|w| !w.is_empty())
+        .collect::<Vec<_>>()
+        .join("-");
+    slug.chars().take(40).collect()
+}
+
+/// The first hex digits of `text`'s SHA-256: a branch for each new content,
+/// so saving the same thing twice lands on the same branch.
+fn content_tag(text: &str) -> String {
+    use sha2::Digest;
+    hex::encode(sha2::Sha256::digest(text.as_bytes()))[..6].to_owned()
+}
+
+/// Save one entity of the domain model as a person edited it: its section of
+/// `docs/domain-model.md` in the project's repository, the way the repository
+/// takes changes. The model reads it like any other document once its type is
+/// settled, on the next build.
+async fn upsert_spec_model_entity(
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(service): Extension<Arc<DocumentsService>>,
+    Extension(quality): Extension<Quality>,
+    Query(query): Query<SpecScopeQuery>,
+    Json(body): Json<SpecModelEntityRequest>,
+) -> ApiResult<JsonBody<SpecModelWriteDto>> {
+    let project_id = parse_project_id(&query.project_id)?;
+    parent_workspace(&service, &ctx, project_id).await?;
+    let invalid = |field: &str, why: &str| {
+        DocumentsError::invalid_argument()
+            .with_field_violation(field, why.to_owned(), "INVALID")
+            .create()
+    };
+    let name = body.name.trim();
+    if name.is_empty() || name.len() > GLOSSARY_TEXT_MAX {
+        return Err(invalid("name", "must be a name of at most 200 bytes"));
+    }
+    let definition = body
+        .definition
+        .as_deref()
+        .map(str::trim)
+        .filter(|d| !d.is_empty());
+    if definition.is_some_and(|d| d.len() > 4000) {
+        return Err(invalid("definition", "must be at most 4000 bytes"));
+    }
+    if body.fields.len() > 60 || body.relations.len() > 60 {
+        return Err(invalid("fields", "at most 60 fields and 60 relations"));
+    }
+    let short = |s: &str| !s.trim().is_empty() && s.len() <= GLOSSARY_TEXT_MAX;
+    if !body
+        .fields
+        .iter()
+        .all(|f| short(&f.name) && f.meaning.len() <= 1000)
+    {
+        return Err(invalid(
+            "fields",
+            "each field needs a name of at most 200 bytes",
+        ));
+    }
+    if !body
+        .relations
+        .iter()
+        .all(|r| short(&r.verb) && short(&r.target))
+    {
+        return Err(invalid(
+            "relations",
+            "each relation needs a verb and a target",
+        ));
+    }
+    let edit = super::spec_model::domain_doc::EntityEdit {
+        name: name.to_owned(),
+        definition: definition.map(str::to_owned),
+        fields: body
+            .fields
+            .iter()
+            .map(|f| (f.name.trim().to_owned(), f.meaning.trim().to_owned()))
+            .collect(),
+        relations: body
+            .relations
+            .iter()
+            .map(|r| (r.verb.trim().to_owned(), r.target.trim().to_owned()))
+            .collect(),
+    };
+    let files = project_files(&quality)?;
+    let path = super::spec_model::domain_doc::DOMAIN_DOC_PATH;
+    let project = project_id.to_string();
+    let current = files
+        .read(&ctx, &project, path)
+        .await
+        .map_err(invalid_or_internal)?;
+    let content = super::spec_model::domain_doc::upsert(current.as_deref(), &edit);
+    let branch = format!(
+        "domain-model/{}-{}",
+        branch_part(name),
+        content_tag(&content)
+    );
+    let written = files
+        .write(
+            &ctx,
+            &project,
+            &branch,
+            &[crate::product::port::DeclarationFile { path: path.to_owned(), content }],
+            &crate::product::port::PullRequestText {
+                message: format!("docs(domain-model): {name}"),
+                title: format!("Domain model: {name}"),
+                body: format!(
+                    "What `{name}` is, what it holds and how it relates, as edited on the Domain model tab. \
+                     Studio keeps `{path}` one section per entity; the model reads it on its next build."
+                ),
+            },
+            false,
+        )
+        .await
+        .map_err(invalid_or_internal)?;
+    Ok(Json(SpecModelWriteDto {
+        path: path.to_owned(),
+        branch: written.branch,
+        commit_sha: written.commit_sha,
+        pr_url: written.pr_url,
+    }))
+}
+
+/// Most files one rename proposes changes to: a word used in more is a
+/// review nobody finishes.
+const GLOSSARY_RENAME_FILES_MAX: usize = 100;
+
+/// Propose a glossary rename in the documents: every whole-word use of the
+/// old name in their prose replaced by the project's name, in one pull
+/// request over every file that uses it.
+async fn create_glossary_rename_proposal(
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(service): Extension<Arc<DocumentsService>>,
+    Extension(quality): Extension<Quality>,
+    Query(query): Query<SpecScopeQuery>,
+    Json(body): Json<GlossaryRenameRequest>,
+) -> ApiResult<(StatusCode, JsonBody<GlossaryRenameProposalDto>)> {
+    let project_id = parse_project_id(&query.project_id)?;
+    let workspace_id = parent_workspace(&service, &ctx, project_id).await?;
+    let invalid = |field: &str, why: &str| {
+        DocumentsError::invalid_argument()
+            .with_field_violation(field, why.to_owned(), "INVALID")
+            .create()
+    };
+    let from = body.from.trim();
+    let to = body.to.trim();
+    if from.is_empty() || from.len() > GLOSSARY_TEXT_MAX {
+        return Err(invalid("from", "must be a name of at most 200 bytes"));
+    }
+    if to.is_empty() || to.len() > GLOSSARY_TEXT_MAX {
+        return Err(invalid("to", "must be a name of at most 200 bytes"));
+    }
+    if from.to_lowercase() == to.to_lowercase() {
+        return Err(invalid("to", "must differ from `from` by more than case"));
+    }
+    let reader = quality.reader()?;
+    let sources = service
+        .spec_model_sources(&ctx, workspace_id, project_id, reader.as_ref())
+        .await
+        .map_err(internal)?;
+    let using: Vec<&str> = sources
+        .documents
+        .iter()
+        .filter(|d| super::spec_model::rename::rename(&d.text, from, to).is_some())
+        .map(|d| d.path.as_str())
+        .collect();
+    let unused = || {
+        DocumentsError::invalid_argument()
+            .with_constraint(format!(
+                "no document of the project uses \"{from}\" as a word outside code and links"
+            ))
+            .create()
+    };
+    if using.is_empty() {
+        return Err(unused());
+    }
+    if using.len() > GLOSSARY_RENAME_FILES_MAX {
+        return Err(DocumentsError::invalid_argument()
+            .with_constraint(format!(
+                "\"{from}\" is used in {} documents; one proposal changes at most {GLOSSARY_RENAME_FILES_MAX}",
+                using.len()
+            ))
+            .create());
+    }
+    // The repository's text, not the checkout's: the change is made to what
+    // the branch holds now.
+    let files = project_files(&quality)?;
+    let project = project_id.to_string();
+    let mut changed: Vec<crate::product::port::DeclarationFile> = Vec::new();
+    let mut renamed = 0usize;
+    for path in using {
+        let Some(text) = files
+            .read(&ctx, &project, path)
+            .await
+            .map_err(invalid_or_internal)?
+        else {
+            continue;
+        };
+        if let Some((content, n)) = super::spec_model::rename::rename(&text, from, to) {
+            renamed += n;
+            changed.push(crate::product::port::DeclarationFile {
+                path: path.to_owned(),
+                content,
+            });
+        }
+    }
+    if changed.is_empty() {
+        return Err(unused());
+    }
+    let tag = content_tag(
+        &changed
+            .iter()
+            .map(|f| format!("{}\n{}", f.path, f.content))
+            .collect::<String>(),
+    );
+    let branch = format!(
+        "glossary/{}-to-{}-{tag}",
+        branch_part(from),
+        branch_part(to)
+    );
+    let paths: Vec<String> = changed.iter().map(|f| f.path.clone()).collect();
+    let listed = paths
+        .iter()
+        .map(|p| format!("- `{p}`"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let written = files
+        .write(
+            &ctx,
+            &project,
+            &branch,
+            &changed,
+            &crate::product::port::PullRequestText {
+                message: format!("docs: call \"{from}\" \"{to}\""),
+                title: format!("Glossary: \"{from}\" is \"{to}\""),
+                body: format!(
+                    "The project's glossary calls \"{from}\" \"{to}\". {renamed} uses renamed in prose \
+                     (code, links and front matter left as they are):\n\n{listed}\n\n\
+                     Proposed from the Glossary."
+                ),
+            },
+            true,
+        )
+        .await
+        .map_err(invalid_or_internal)?;
+    Ok((
+        StatusCode::CREATED,
+        Json(GlossaryRenameProposalDto {
+            files: paths,
+            renamed: u32::try_from(renamed).unwrap_or(u32::MAX),
+            branch: written.branch,
+            commit_sha: written.commit_sha,
+            pr_url: written.pr_url,
+        }),
+    ))
+}
+
+/// A write refused for a reason the caller can act on (no repository, a
+/// connection the organization does not own) as such; anything else is ours.
+fn invalid_or_internal(error: anyhow::Error) -> CanonicalError {
+    let text = format!("{error:#}");
+    if text.contains("repository") || text.contains("connection") || text.contains("not owned") {
+        DocumentsError::invalid_argument()
+            .with_constraint(text)
+            .create()
+    } else {
+        internal(error)
+    }
+}
+
+/// Propose a finding's smallest fix as a pull request on the document it
+/// names: its passage replaced, matched the way the finding was checked.
+async fn create_spec_model_finding_proposal(
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(service): Extension<Arc<DocumentsService>>,
+    Extension(quality): Extension<Quality>,
+    Path(fingerprint): Path<String>,
+    Query(query): Query<SpecScopeQuery>,
+) -> ApiResult<(StatusCode, JsonBody<SpecModelWriteDto>)> {
+    let project_id = parse_project_id(&query.project_id)?;
+    let workspace_id = parent_workspace(&service, &ctx, project_id).await?;
+    let reader = quality.reader()?;
+    let sources = service
+        .spec_model_sources(&ctx, workspace_id, project_id, reader.as_ref())
+        .await
+        .map_err(internal)?;
+    let (findings, _) = spec_model_findings(&service, workspace_id, project_id, &sources)
+        .await
+        .map_err(internal)?;
+    let gone = || {
+        DocumentsError::not_found("no such finding now: the documents changed since it was shown")
+            .with_resource(fingerprint.clone())
+            .create()
+    };
+    let finding = findings
+        .into_iter()
+        .find(|f| f.fingerprint == fingerprint)
+        .ok_or_else(gone)?;
+    let edit = finding.edit.clone().ok_or_else(|| {
+        DocumentsError::invalid_argument()
+            .with_constraint("this finding names no edit: it needs a person's decision, not a fix")
+            .create()
+    })?;
+    let files = project_files(&quality)?;
+    let project = project_id.to_string();
+    let text = files
+        .read(&ctx, &project, &edit.path)
+        .await
+        .map_err(invalid_or_internal)?
+        .ok_or_else(gone)?;
+    let changed = super::spec_model::domain_doc::apply_edit(&text, &edit.replace, &edit.with).ok_or_else(|| {
+        DocumentsError::invalid_argument()
+            .with_constraint("the passage is no longer in the document as the finding saw it, or is there twice")
+            .create()
+    })?;
+    let branch = format!("fix/{}", &fingerprint[..fingerprint.len().min(12)]);
+    let title: String = finding.message.chars().take(70).collect();
+    let written = files
+        .write(
+            &ctx,
+            &project,
+            &branch,
+            &[crate::product::port::DeclarationFile { path: edit.path.clone(), content: changed }],
+            &crate::product::port::PullRequestText {
+                message: format!("docs: {title}"),
+                title: format!("Fix: {title}"),
+                body: format!(
+                    "{}\n\nIn `{}`:\n\n```diff\n- {}\n+ {}\n```\n\nProposed from the Domain model tab.",
+                    finding.message, edit.path, edit.replace, edit.with
+                ),
+            },
+            true,
+        )
+        .await
+        .map_err(invalid_or_internal)?;
+    Ok((
+        StatusCode::CREATED,
+        Json(SpecModelWriteDto {
+            path: edit.path,
+            branch: written.branch,
+            commit_sha: written.commit_sha,
+            pr_url: written.pr_url,
         }),
     ))
 }
@@ -4275,23 +5705,38 @@ async fn decide_spec_model_finding(
 async fn list_spec_model_decisions(
     Extension(ctx): Extension<SecurityContext>,
     Extension(service): Extension<Arc<DocumentsService>>,
+    Extension(quality): Extension<Quality>,
     Query(query): Query<SpecScopeQuery>,
 ) -> ApiResult<JsonBody<SpecModelDecisionListDto>> {
     let project_id = parse_project_id(&query.project_id)?;
     let workspace_id = parent_workspace(&service, &ctx, project_id).await?;
+    // Which fingerprints the documents still show: a decided finding no
+    // longer among them was resolved.
+    let (current, binding_of): (Option<std::collections::BTreeSet<String>>, _) =
+        match quality.reader() {
+            Ok(reader) => match service
+                .spec_model_sources(&ctx, workspace_id, project_id, reader.as_ref())
+                .await
+            {
+                Ok(sources) => (
+                    spec_model_findings(&service, workspace_id, project_id, &sources)
+                        .await
+                        .ok()
+                        .map(|(fs, _)| fs.into_iter().map(|f| f.fingerprint).collect()),
+                    binding_ids(&sources),
+                ),
+                Err(_) => (None, Default::default()),
+            },
+            Err(_) => (None, Default::default()),
+        };
     let items: Vec<SpecModelDecisionDto> = service
         .spec_decisions(workspace_id, project_id)
         .await
         .map_err(internal)?
         .into_iter()
-        .map(|d| SpecModelDecisionDto {
-            fingerprint: d.fingerprint,
-            decision: d.decision,
-            decided_by: d.decided_by.to_string(),
-            decided_at: d
-                .decided_at
-                .format(&time::format_description::well_known::Rfc3339)
-                .unwrap_or_default(),
+        .map(|d| {
+            let present = current.as_ref().map(|c| c.contains(&d.fingerprint));
+            spec_decision_dto(d, present, &binding_of)
         })
         .collect();
     Ok(Json(SpecModelDecisionListDto {
@@ -4321,6 +5766,10 @@ pub struct ReviewRequestInput {
     /// `document` (written in Studio) or `binding` (a repository file).
     pub subject_kind: String,
     pub subject_id: String,
+    /// Ignored: the review takes its type from the stored document or
+    /// binding, never from the caller (#744). Still accepted, so a client
+    /// that sends it is not refused.
+    #[allow(dead_code)]
     pub type_key: Option<String>,
     pub title: String,
     /// The version asked about: a commit sha or a revision.
@@ -4397,6 +5846,40 @@ pub struct ReviewRequestDto {
     pub outstanding: Vec<String>,
     pub created_at: String,
     pub verdicts: Vec<ApprovalDto>,
+    /// The version the document is at now: a binding's content digest, a
+    /// Studio document's content digest. `null` when the document is gone.
+    pub current_version: Option<String>,
+    /// The document changed since the version asked about.
+    pub stale: bool,
+    /// The detectors that pass on the document now.
+    pub recorded_checks: Vec<String>,
+}
+
+/// What a review was asked about, against what the document is now and the
+/// last version approved before it: the review card's diff.
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+pub struct ReviewDiffDto {
+    pub request_id: String,
+    pub version: String,
+    pub current_version: Option<String>,
+    pub stale: bool,
+    /// The text kept when the review was asked for; `null` for a request from
+    /// before texts were kept.
+    pub reviewed_text: Option<String>,
+    /// The text now; `null` when no checkout holds it.
+    pub current_text: Option<String>,
+    /// The newest earlier request on the same document that was approved.
+    pub base: Option<ReviewBaseDto>,
+}
+
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+pub struct ReviewBaseDto {
+    pub request_id: String,
+    pub version: String,
+    pub reviewed_text: Option<String>,
+    pub created_at: String,
 }
 
 #[derive(Debug)]
@@ -4404,6 +5887,12 @@ pub struct ReviewRequestDto {
 pub struct ReviewRequestListDto {
     pub items: Vec<ReviewRequestDto>,
     pub total: u32,
+    /// Open requests in the list.
+    pub open: u32,
+    /// Open requests past their due date.
+    pub overdue: u32,
+    /// Open requests whose document changed since the version asked about.
+    pub stale: u32,
 }
 
 /// A reviewer worth asking, from who was asked before.
@@ -4546,7 +6035,24 @@ fn review_dto(review: &super::service::Review, now: time::OffsetDateTime) -> Rev
         state: r.state.clone(),
         created_at: rfc3339(r.created_at),
         verdicts: review.verdicts.iter().map(approval_dto).collect(),
+        current_version: None,
+        stale: false,
+        recorded_checks: Vec::new(),
     }
+}
+
+/// Fold the document's current version and passing checks into a request.
+fn with_version(
+    mut dto: ReviewRequestDto,
+    versions: &std::collections::HashMap<Uuid, (String, Vec<String>)>,
+) -> ReviewRequestDto {
+    let current = Uuid::parse_str(&dto.subject_id)
+        .ok()
+        .and_then(|id| versions.get(&id));
+    dto.current_version = current.map(|(v, _)| v.clone());
+    dto.stale = current.is_some_and(|(v, _)| *v != dto.version);
+    dto.recorded_checks = current.map(|(_, c)| c.clone()).unwrap_or_default();
+    dto
 }
 
 /// Ask people to review one version of a document.
@@ -4576,12 +6082,28 @@ async fn create_review_request(
         None => None,
     };
     let requester = quality.caller(&ctx).await?;
+    let reader = quality.reader().ok();
+    let (current, text) = service
+        .subject_state(
+            &ctx,
+            workspace_id,
+            project_id,
+            &body.subject_kind,
+            subject_id,
+            reader.as_deref(),
+        )
+        .await
+        .map_err(internal)?;
+    // A request with no version is about the document as it is now.
+    let version = match body.version.trim() {
+        "" => current.clone().unwrap_or_default(),
+        v => v.to_string(),
+    };
     let ask = super::service::ReviewAsk {
         subject_kind: body.subject_kind,
         subject_id,
-        type_key: body.type_key,
         title: body.title,
-        version: body.version,
+        version,
         reviewers: body
             .reviewers
             .into_iter()
@@ -4594,10 +6116,17 @@ async fn create_review_request(
         due_at,
     };
     let review = service
-        .request_review(workspace_id, project_id, ask, requester)
+        .request_review(workspace_id, project_id, ask, requester, text)
         .await
         .map_err(invalid)?;
-    let dto = review_dto(&review, time::OffsetDateTime::now_utc());
+    let versions = service
+        .subject_versions(workspace_id, project_id)
+        .await
+        .unwrap_or_default();
+    let dto = with_version(
+        review_dto(&review, time::OffsetDateTime::now_utc()),
+        &versions,
+    );
     announce_review(&quality, &ctx, "review_request.created", &dto);
     Ok((StatusCode::CREATED, Json(dto)))
 }
@@ -4665,9 +6194,31 @@ async fn list_review_requests(
         }
     };
     let now = time::OffsetDateTime::now_utc();
-    let items: Vec<ReviewRequestDto> = reviews.iter().map(|r| review_dto(r, now)).collect();
+    let mut versions: std::collections::HashMap<Uuid, (String, Vec<String>)> =
+        std::collections::HashMap::new();
+    let projects: std::collections::BTreeSet<Uuid> =
+        reviews.iter().map(|r| r.request.project_id).collect();
+    for p in projects {
+        let ws = reviews
+            .iter()
+            .find(|r| r.request.project_id == p)
+            .map(|r| r.request.tenant_id)
+            .unwrap_or_default();
+        if let Ok(v) = service.subject_versions(ws, p).await {
+            versions.extend(v);
+        }
+    }
+    let items: Vec<ReviewRequestDto> = reviews
+        .iter()
+        .map(|r| with_version(review_dto(r, now), &versions))
+        .collect();
+    let count = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
+    let open: Vec<&ReviewRequestDto> = items.iter().filter(|r| r.state == "open").collect();
     Ok(Json(ReviewRequestListDto {
-        total: u32::try_from(items.len()).unwrap_or(u32::MAX),
+        total: count(items.len()),
+        open: count(open.len()),
+        overdue: count(open.iter().filter(|r| r.overdue).count()),
+        stale: count(open.iter().filter(|r| r.stale).count()),
         items,
     }))
 }
@@ -4685,7 +6236,14 @@ async fn create_review_approval(
     let request_id = parse_uuid_field("request_id", &request_id)?;
     let approver = quality.caller(&ctx).await?;
     let (review, approval) = service
-        .give_verdict(workspace_id, request_id, approver, &body.verdict, body.note)
+        .give_verdict(
+            workspace_id,
+            project_id,
+            request_id,
+            approver,
+            &body.verdict,
+            body.note,
+        )
         .await
         .map_err(invalid)?
         .ok_or_else(|| {
@@ -4711,7 +6269,7 @@ async fn cancel_review_request(
     let request_id = parse_uuid_field("request_id", &request_id)?;
     let (me, _) = quality.caller(&ctx).await?;
     let review = service
-        .withdraw_review(workspace_id, request_id, &me)
+        .withdraw_review(workspace_id, project_id, request_id, &me)
         .await
         .map_err(invalid)?
         .ok_or_else(|| {
@@ -4722,6 +6280,69 @@ async fn cancel_review_request(
     let dto = review_dto(&review, time::OffsetDateTime::now_utc());
     announce_review(&quality, &ctx, "review_request.cancelled", &dto);
     Ok(Json(dto))
+}
+
+/// A request's reviewed text, the document now, and the last approved
+/// version before it.
+async fn get_review_request_diff(
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(service): Extension<Arc<DocumentsService>>,
+    Extension(quality): Extension<Quality>,
+    Path(request_id): Path<String>,
+    Query(query): Query<ProjectQuery>,
+) -> ApiResult<JsonBody<ReviewDiffDto>> {
+    let project_id = parse_project_id(&query.project_id)?;
+    let workspace_id = parent_workspace(&service, &ctx, project_id).await?;
+    let request_id = parse_uuid_field("request_id", &request_id)?;
+    let all = service
+        .reviews_with_verdicts(workspace_id, project_id, None)
+        .await
+        .map_err(internal)?;
+    let Some(this) = all.iter().find(|r| r.request.id == request_id) else {
+        return Err(
+            DocumentsError::not_found("no such review request in this project")
+                .with_resource("review_request")
+                .create(),
+        );
+    };
+    let r = &this.request;
+    let reader = quality.reader().ok();
+    let (current, text) = service
+        .subject_state(
+            &ctx,
+            workspace_id,
+            project_id,
+            &r.subject_kind,
+            r.subject_id,
+            reader.as_deref(),
+        )
+        .await
+        .map_err(internal)?;
+    // Newest first, as the repository lists them.
+    let base = all
+        .iter()
+        .filter(|o| {
+            o.request.subject_id == r.subject_id
+                && o.request.id != r.id
+                && o.request.state == "approved"
+                && o.request.created_at < r.created_at
+        })
+        .max_by_key(|o| o.request.created_at)
+        .map(|o| ReviewBaseDto {
+            request_id: o.request.id.to_string(),
+            version: o.request.version.clone(),
+            reviewed_text: o.request.reviewed_text.clone(),
+            created_at: rfc3339(o.request.created_at),
+        });
+    Ok(Json(ReviewDiffDto {
+        request_id: r.id.to_string(),
+        version: r.version.clone(),
+        stale: current.as_ref().is_some_and(|c| *c != r.version),
+        current_version: current,
+        reviewed_text: r.reviewed_text.clone(),
+        current_text: text,
+        base,
+    }))
 }
 
 /// Whom to ask about a document, from who was asked before in the project.
@@ -5533,14 +7154,48 @@ pub fn register_routes(
              `GET /spec-model`. Not a studio-tasks run, because the queue worker cannot act as \
              the caller. A build already running for the project is answered with its state. \
              A document already read at its revision is never read again, so a build stopped \
-             part-way resumes where it stopped.",
+             part-way resumes where it stopped. Up to four documents are read at once. With \
+             `path`, only that document is read again, whatever its state: its facts replace \
+             its own and the rest of the model stays (404 when it is not one of the model's \
+             documents).",
         )
         .tag("StudioDocuments")
         .authenticated()
         .require_license_features::<License>([])
-        .json_request::<SpecModelBuildRequest>(openapi, "The project")
+        .json_request::<SpecModelBuildRequest>(
+            openapi,
+            "The project, and one document to read again",
+        )
         .handler(start_spec_model_build)
         .json_response_with_schema::<SpecModelBuildDto>(openapi, StatusCode::ACCEPTED, "The build")
+        .error_400(openapi)
+        .error_401(openapi)
+        .error_404(openapi)
+        .error_500(openapi)
+        .error_503(openapi)
+        .register(router, openapi);
+
+    router = OperationBuilder::get("/studio-documents/v1/spec-model/build-estimate")
+        .operation_id("studio_documents.get_spec_model_build_estimate")
+        .summary("What a build of a project's model would read, and about how long it would take")
+        .description(
+            "The documents `POST /spec-model/builds` would read now (changed or never read, or \
+             the one `path` names), their size in characters and approximate input tokens \
+             (characters over four), and the seconds reading them should take: at the pace of \
+             the project's earlier builds when there were any (`measured`), else a default. \
+             The judge's stage after the reading is not counted. No model is called.",
+        )
+        .tag("StudioDocuments")
+        .authenticated()
+        .require_license_features::<License>([])
+        .query_param("project_id", true, "The project whose build to estimate")
+        .query_param("path", false, "One document to estimate reading again")
+        .handler(get_spec_model_build_estimate)
+        .json_response_with_schema::<SpecModelBuildEstimateDto>(
+            openapi,
+            StatusCode::OK,
+            "The estimate",
+        )
         .error_400(openapi)
         .error_401(openapi)
         .error_404(openapi)
@@ -5599,6 +7254,56 @@ pub fn register_routes(
             .error_500(openapi)
             .register(router, openapi);
 
+    router = OperationBuilder::post("/studio-documents/v1/spec-model/entities")
+        .operation_id("studio_documents.upsert_spec_model_entity")
+        .summary("Save an entity of the domain model to the project's documentation")
+        .description(
+            "What the entity is, what it holds and how it relates, as a person edited it. It \
+             replaces the entity's section of `docs/domain-model.md` in the project's repository, \
+             which Studio keeps one section per entity and which the model reads like any other \
+             document once its type is settled. Written the way the repository takes changes: \
+             onto its branch, or on a `domain-model/…` branch with a pull request.",
+        )
+        .tag("StudioDocuments")
+        .authenticated()
+        .require_license_features::<License>([])
+        .query_param("project_id", true, "The project whose model it is")
+        .json_request::<SpecModelEntityRequest>(openapi, "The entity as edited")
+        .handler(upsert_spec_model_entity)
+        .json_response_with_schema::<SpecModelWriteDto>(openapi, StatusCode::OK, "Where it landed")
+        .error_400(openapi)
+        .error_401(openapi)
+        .error_404(openapi)
+        .error_500(openapi)
+        .register(router, openapi);
+
+    router =
+        OperationBuilder::post("/studio-documents/v1/spec-model/findings/{fingerprint}/proposals")
+            .operation_id("studio_documents.create_spec_model_finding_proposal")
+            .summary("Propose a finding's fix as a pull request on its document")
+            .description(
+                "The finding's smallest edit applied to the passage it names, matched across line \
+         breaks the way it was checked, on a `fix/…` branch with a pull request: a proposal, \
+         never a commit onto the document's branch. 404 when the finding is gone; 400 when it \
+         names no edit or its passage is no longer in the document.",
+            )
+            .tag("StudioDocuments")
+            .authenticated()
+            .require_license_features::<License>([])
+            .path_param("fingerprint", "The finding's fingerprint")
+            .query_param("project_id", true, "The project the finding is in")
+            .handler(create_spec_model_finding_proposal)
+            .json_response_with_schema::<SpecModelWriteDto>(
+                openapi,
+                StatusCode::CREATED,
+                "The pull request",
+            )
+            .error_400(openapi)
+            .error_401(openapi)
+            .error_404(openapi)
+            .error_500(openapi)
+            .register(router, openapi);
+
     router = OperationBuilder::get("/studio-documents/v1/spec-model/glossary")
         .operation_id("studio_documents.get_spec_model_glossary")
         .summary("The project's glossary: what its documents name, and by which names")
@@ -5646,6 +7351,34 @@ pub fn register_routes(
         .error_401(openapi)
         .error_404(openapi)
         .error_500(openapi)
+        .register(router, openapi);
+
+    router = OperationBuilder::post("/studio-documents/v1/spec-model/glossary/proposals")
+        .operation_id("studio_documents.create_spec_model_glossary_proposal")
+        .summary("Propose a glossary rename in the documents as one pull request")
+        .description(
+            "Every whole-word use of `from` (any case) in the prose of the project's documents \
+             replaced by `to`, the first letter keeping its case; code, links' destinations and \
+             front matter are left as they are. One pull request on a `glossary/…` branch over \
+             every file that uses it: a proposal, never a commit onto the documents' branch. 400 \
+             when no document uses the name.",
+        )
+        .tag("StudioDocuments")
+        .authenticated()
+        .require_license_features::<License>([])
+        .query_param("project_id", true, "The project whose documents to change")
+        .json_request::<GlossaryRenameRequest>(openapi, "The old name and the project's name")
+        .handler(create_glossary_rename_proposal)
+        .json_response_with_schema::<GlossaryRenameProposalDto>(
+            openapi,
+            StatusCode::CREATED,
+            "The pull request",
+        )
+        .error_400(openapi)
+        .error_401(openapi)
+        .error_404(openapi)
+        .error_500(openapi)
+        .error_503(openapi)
         .register(router, openapi);
 
     router = OperationBuilder::post("/studio-documents/v1/review-requests")
@@ -5750,6 +7483,28 @@ pub fn register_routes(
         .error_503(openapi)
         .register(router, openapi);
 
+    router = OperationBuilder::get("/studio-documents/v1/review-requests/{request_id}/diff")
+        .operation_id("studio_documents.get_review_request_diff")
+        .summary("What a review was asked about, the document now, and the last approved version")
+        .description(
+            "The text kept when the review was asked for, the document's text now, whether it \
+             changed since (`stale`), and `base`: the newest earlier request on the same \
+             document that was approved, with its text, for a Before / Proposed diff. Texts \
+             are kept from this version on; an older request answers `reviewed_text: null`.",
+        )
+        .tag("StudioDocuments")
+        .authenticated()
+        .require_license_features::<License>([])
+        .path_param("request_id", "The review request")
+        .query_param("project_id", true, "The project")
+        .handler(get_review_request_diff)
+        .json_response_with_schema::<ReviewDiffDto>(openapi, StatusCode::OK, "The texts")
+        .error_400(openapi)
+        .error_401(openapi)
+        .error_404(openapi)
+        .error_500(openapi)
+        .register(router, openapi);
+
     router = OperationBuilder::get("/studio-documents/v1/review-requests/reviewer-suggestions")
         .operation_id("studio_documents.list_reviewer_suggestions")
         .summary("Whom to ask to review a document, from who was asked before")
@@ -5777,6 +7532,204 @@ pub fn register_routes(
         .error_500(openapi)
         .error_503(openapi)
         .register(router, openapi);
+
+    router = OperationBuilder::get("/studio-documents/v1/application-parts")
+        .operation_id("studio_documents.list_application_parts")
+        .summary("The application's configuration, storage and deployment parts beyond its gears")
+        .description(
+            "Found in the project's repositories by what the files are: Helm charts and their \
+             values, Dockerfiles, compose files, Kubernetes and Terraform directories, \
+             deployment workflows, configuration files and directories, migrations and \
+             schemas; each with the owner, describing document, boundary and related parts \
+             people recorded. A recorded part the repositories no longer show is listed with \
+             `present: false` (issue #786).",
+        )
+        .tag("StudioDocuments")
+        .authenticated()
+        .require_license_features::<License>([])
+        .query_param("project_id", true, "The project")
+        .handler(list_application_parts)
+        .json_response_with_schema::<ApplicationPartListDto>(openapi, StatusCode::OK, "The parts")
+        .error_400(openapi)
+        .error_401(openapi)
+        .error_404(openapi)
+        .error_500(openapi)
+        .register(router, openapi);
+
+    router = OperationBuilder::put("/studio-documents/v1/application-parts")
+        .operation_id("studio_documents.upsert_application_part")
+        .summary("Record the owner, describing document, boundary and related parts of one part")
+        .description(
+            "Keyed by the repository, the kind and the reference; replaces what was recorded \
+             for it. A part need not have been found to be recorded.",
+        )
+        .tag("StudioDocuments")
+        .authenticated()
+        .require_license_features::<License>([])
+        .json_request::<ApplicationPartInput>(openapi, "The part and what is known about it")
+        .handler(upsert_application_part)
+        .json_response_with_schema::<ApplicationPartDto>(openapi, StatusCode::OK, "The part")
+        .error_400(openapi)
+        .error_401(openapi)
+        .error_404(openapi)
+        .error_500(openapi)
+        .error_503(openapi)
+        .register(router, openapi);
+
+    router = OperationBuilder::get("/studio-documents/v1/delivery-scopes")
+        .operation_id("studio_documents.list_delivery_scopes")
+        .summary("A project's delivery scopes, with their limits and whether each is blocked")
+        .description(
+            "Every delivery scope of the project, oldest first: its outcome, owner, target \
+             date, the requirement identifiers it delivers, the gears it pins, its acceptance \
+             and state, and its limits (limitations, open questions, dependencies). `blocked` \
+             is true while a blocking limit holds: unresolved, and for a dependency on another \
+             scope, that scope not delivered (issue #784).",
+        )
+        .tag("StudioDocuments")
+        .authenticated()
+        .require_license_features::<License>([])
+        .query_param("project_id", true, "The project")
+        .handler(list_delivery_scopes)
+        .json_response_with_schema::<DeliveryScopeListDto>(openapi, StatusCode::OK, "The scopes")
+        .error_400(openapi)
+        .error_401(openapi)
+        .error_404(openapi)
+        .error_500(openapi)
+        .register(router, openapi);
+
+    router = OperationBuilder::post("/studio-documents/v1/delivery-scopes")
+        .operation_id("studio_documents.create_delivery_scope")
+        .summary("Add a delivery scope to a project")
+        .description(
+            "A scope is one outcome the project promises: title, outcome, owner, target date \
+             (YYYY-MM-DD), the requirement identifiers it delivers (as decisions name them), \
+             the gears it pins, how it is accepted, and its state (`planned` by default).",
+        )
+        .tag("StudioDocuments")
+        .authenticated()
+        .require_license_features::<License>([])
+        .json_request::<DeliveryScopeInput>(openapi, "The scope")
+        .handler(create_delivery_scope)
+        .json_response_with_schema::<DeliveryScopeDto>(openapi, StatusCode::CREATED, "The scope")
+        .error_400(openapi)
+        .error_401(openapi)
+        .error_404(openapi)
+        .error_500(openapi)
+        .error_503(openapi)
+        .register(router, openapi);
+
+    router = OperationBuilder::patch("/studio-documents/v1/delivery-scopes/{scope_id}")
+        .operation_id("studio_documents.patch_delivery_scope")
+        .summary("Change a delivery scope; the version it replaces is kept")
+        .description(
+            "Only the fields given change; an empty owner or target date clears it. The \
+             version the change replaces is kept in the scope's history, with who changed it \
+             and when.",
+        )
+        .tag("StudioDocuments")
+        .authenticated()
+        .require_license_features::<License>([])
+        .path_param("scope_id", "The scope")
+        .json_request::<DeliveryScopePatch>(openapi, "The project and the fields to change")
+        .handler(update_delivery_scope)
+        .json_response_with_schema::<DeliveryScopeDto>(openapi, StatusCode::OK, "The scope")
+        .error_400(openapi)
+        .error_401(openapi)
+        .error_404(openapi)
+        .error_500(openapi)
+        .error_503(openapi)
+        .register(router, openapi);
+
+    router = OperationBuilder::delete("/studio-documents/v1/delivery-scopes/{scope_id}")
+        .operation_id("studio_documents.delete_delivery_scope")
+        .summary("Remove a delivery scope with its limits and history")
+        .description(
+            "Removes the scope, its limits and its history. To keep a scope on record without \
+             it counting, set its state to `dropped` instead.",
+        )
+        .tag("StudioDocuments")
+        .authenticated()
+        .require_license_features::<License>([])
+        .path_param("scope_id", "The scope")
+        .query_param("project_id", true, "The project")
+        .handler(delete_delivery_scope)
+        .no_content_response(StatusCode::NO_CONTENT, "Removed")
+        .error_400(openapi)
+        .error_401(openapi)
+        .error_404(openapi)
+        .error_500(openapi)
+        .register(router, openapi);
+
+    router = OperationBuilder::get("/studio-documents/v1/delivery-scopes/{scope_id}/history")
+        .operation_id("studio_documents.list_delivery_scope_history")
+        .summary("Earlier versions of a delivery scope, newest first")
+        .description(
+            "Each version a change replaced, with who changed it and when. The scope as it \
+             stands is the scope itself, not a version here.",
+        )
+        .tag("StudioDocuments")
+        .authenticated()
+        .require_license_features::<License>([])
+        .path_param("scope_id", "The scope")
+        .query_param("project_id", true, "The project")
+        .handler(list_delivery_scope_history)
+        .json_response_with_schema::<DeliveryScopeHistoryDto>(
+            openapi,
+            StatusCode::OK,
+            "The versions",
+        )
+        .error_400(openapi)
+        .error_401(openapi)
+        .error_404(openapi)
+        .error_500(openapi)
+        .register(router, openapi);
+
+    router = OperationBuilder::post("/studio-documents/v1/delivery-scopes/{scope_id}/limits")
+        .operation_id("studio_documents.create_delivery_limit")
+        .summary("Add a limit to a delivery scope: a limitation, an open question or a dependency")
+        .description(
+            "A limit may block the scope (`blocking`). A dependency names what it depends on: \
+             another scope's id (it stops holding once that scope is delivered) or a decision \
+             record.",
+        )
+        .tag("StudioDocuments")
+        .authenticated()
+        .require_license_features::<License>([])
+        .path_param("scope_id", "The scope")
+        .json_request::<DeliveryLimitInput>(openapi, "The limit")
+        .handler(create_delivery_limit)
+        .json_response_with_schema::<DeliveryLimitDto>(openapi, StatusCode::CREATED, "The limit")
+        .error_400(openapi)
+        .error_401(openapi)
+        .error_404(openapi)
+        .error_500(openapi)
+        .error_503(openapi)
+        .register(router, openapi);
+
+    router = OperationBuilder::patch(
+        "/studio-documents/v1/delivery-scopes/{scope_id}/limits/{limit_id}",
+    )
+    .operation_id("studio_documents.patch_delivery_limit")
+    .summary("Resolve a limit, reopen it, or change whether it blocks")
+    .description(
+        "A resolution records who resolved it and when; an empty resolution reopens it. A \
+         resolved limit no longer blocks its scope.",
+    )
+    .tag("StudioDocuments")
+    .authenticated()
+    .require_license_features::<License>([])
+    .path_param("scope_id", "The scope")
+    .path_param("limit_id", "The limit")
+    .json_request::<DeliveryLimitPatch>(openapi, "The project and the change")
+    .handler(update_delivery_limit)
+    .json_response_with_schema::<DeliveryLimitDto>(openapi, StatusCode::OK, "The limit")
+    .error_400(openapi)
+    .error_401(openapi)
+    .error_404(openapi)
+    .error_500(openapi)
+    .error_503(openapi)
+    .register(router, openapi);
 
     router = OperationBuilder::post("/studio-documents/v1/pull-request-checks")
         .operation_id("studio_documents.run_pull_request_checks")

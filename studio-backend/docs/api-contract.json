@@ -1,6 +1,6 @@
 {
   "note": "The API surface studio-backend declares. Generated from source by `cargo run --quiet -- api-contract`; the rules it must follow are docs/api-conventions.md.",
-  "open_violations": 246,
+  "open_violations": 256,
   "operations": [
     {
       "method": "DELETE",
@@ -39,6 +39,20 @@
       "summary": "Remove a connection and its stored token",
       "authenticated": true,
       "errors": [
+        "401",
+        "404",
+        "500"
+      ]
+    },
+    {
+      "method": "DELETE",
+      "path": "/studio-documents/v1/delivery-scopes/{scope_id}",
+      "operation_id": "studio_documents.delete_delivery_scope",
+      "tag": "StudioDocuments",
+      "summary": "Remove a delivery scope with its limits and history",
+      "authenticated": true,
+      "errors": [
+        "400",
         "401",
         "404",
         "500"
@@ -402,6 +416,22 @@
         "RepoFilesResponse"
       ],
       "errors": [
+        "401",
+        "500"
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/studio-artifact-ingest/v1/runs",
+      "operation_id": "studio_artifact_ingest.list_ci_runs",
+      "tag": "StudioArtifactIngest",
+      "summary": "A project's CI runs, by revision or branch: execution evidence",
+      "authenticated": true,
+      "responses": [
+        "CiRunListDto"
+      ],
+      "errors": [
+        "400",
         "401",
         "500"
       ]
@@ -876,6 +906,23 @@
     },
     {
       "method": "GET",
+      "path": "/studio-documents/v1/application-parts",
+      "operation_id": "studio_documents.list_application_parts",
+      "tag": "StudioDocuments",
+      "summary": "The application's configuration, storage and deployment parts beyond its gears",
+      "authenticated": true,
+      "responses": [
+        "ApplicationPartListDto"
+      ],
+      "errors": [
+        "400",
+        "401",
+        "404",
+        "500"
+      ]
+    },
+    {
+      "method": "GET",
       "path": "/studio-documents/v1/decisions",
       "operation_id": "studio_documents.list_decisions",
       "tag": "StudioDocuments",
@@ -883,6 +930,40 @@
       "authenticated": true,
       "responses": [
         "DecisionListDto"
+      ],
+      "errors": [
+        "400",
+        "401",
+        "404",
+        "500"
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/studio-documents/v1/delivery-scopes",
+      "operation_id": "studio_documents.list_delivery_scopes",
+      "tag": "StudioDocuments",
+      "summary": "A project's delivery scopes, with their limits and whether each is blocked",
+      "authenticated": true,
+      "responses": [
+        "DeliveryScopeListDto"
+      ],
+      "errors": [
+        "400",
+        "401",
+        "404",
+        "500"
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/studio-documents/v1/delivery-scopes/{scope_id}/history",
+      "operation_id": "studio_documents.list_delivery_scope_history",
+      "tag": "StudioDocuments",
+      "summary": "Earlier versions of a delivery scope, newest first",
+      "authenticated": true,
+      "responses": [
+        "DeliveryScopeHistoryDto"
       ],
       "errors": [
         "400",
@@ -1026,6 +1107,23 @@
     },
     {
       "method": "GET",
+      "path": "/studio-documents/v1/review-requests/{request_id}/diff",
+      "operation_id": "studio_documents.get_review_request_diff",
+      "tag": "StudioDocuments",
+      "summary": "What a review was asked about, the document now, and the last approved version",
+      "authenticated": true,
+      "responses": [
+        "ReviewDiffDto"
+      ],
+      "errors": [
+        "400",
+        "401",
+        "404",
+        "500"
+      ]
+    },
+    {
+      "method": "GET",
       "path": "/studio-documents/v1/spec-model",
       "operation_id": "studio_documents.get_spec_model",
       "tag": "StudioDocuments",
@@ -1033,6 +1131,23 @@
       "authenticated": true,
       "responses": [
         "SpecModelDto"
+      ],
+      "errors": [
+        "400",
+        "401",
+        "404",
+        "500"
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/studio-documents/v1/spec-model/build-estimate",
+      "operation_id": "studio_documents.get_spec_model_build_estimate",
+      "tag": "StudioDocuments",
+      "summary": "What a build of a project's model would read, and about how long it would take",
+      "authenticated": true,
+      "responses": [
+        "SpecModelBuildEstimateDto"
       ],
       "errors": [
         "400",
@@ -1929,6 +2044,22 @@
     },
     {
       "method": "GET",
+      "path": "/studio-product/v1/gear-explanations",
+      "operation_id": "studio_product.list_gear_explanations",
+      "tag": "StudioProduct",
+      "summary": "The organization's plain explanations of gears",
+      "authenticated": true,
+      "responses": [
+        "GearExplanationListDto"
+      ],
+      "errors": [
+        "401",
+        "404",
+        "500"
+      ]
+    },
+    {
+      "method": "GET",
       "path": "/studio-product/v1/gearbox",
       "operation_id": "studio_product.get_gearbox_status",
       "tag": "StudioProduct",
@@ -1973,6 +2104,20 @@
     },
     {
       "method": "GET",
+      "path": "/studio-product/v1/gearbox/corpus/{source_id}/info/refs",
+      "operation_id": "studio_product.get_root_refs",
+      "tag": "StudioProduct",
+      "summary": "Git smart-HTTP ref advertisement for one of the platform's gear repositories",
+      "authenticated": false,
+      "errors": [
+        "400",
+        "401",
+        "404",
+        "500"
+      ]
+    },
+    {
+      "method": "GET",
       "path": "/studio-product/v1/gearbox/extension-points",
       "operation_id": "studio_product.list_extension_points",
       "tag": "StudioProduct",
@@ -1983,6 +2128,20 @@
       ],
       "errors": [
         "401",
+        "500"
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/studio-product/v1/organizations/{organization_id}/gearbox/corpus/{source_id}/info/refs",
+      "operation_id": "studio_product.get_org_root_refs",
+      "tag": "StudioProduct",
+      "summary": "Git smart-HTTP ref advertisement for one of an organization's gear repositories",
+      "authenticated": false,
+      "errors": [
+        "400",
+        "401",
+        "404",
         "500"
       ]
     },
@@ -2487,6 +2646,23 @@
     },
     {
       "method": "GET",
+      "path": "/studio-user/v1/capacity",
+      "operation_id": "studio_user.list_capacity",
+      "tag": "StudioUser",
+      "summary": "An organization's capacity for one week: availability and allocation per person",
+      "authenticated": true,
+      "responses": [
+        "CapacityListDto"
+      ],
+      "errors": [
+        "400",
+        "401",
+        "403",
+        "500"
+      ]
+    },
+    {
+      "method": "GET",
       "path": "/studio-user/v1/me",
       "operation_id": "studio_user.get_me",
       "tag": "StudioUser",
@@ -2719,6 +2895,42 @@
     },
     {
       "method": "PATCH",
+      "path": "/studio-documents/v1/delivery-scopes/{scope_id}",
+      "operation_id": "studio_documents.patch_delivery_scope",
+      "tag": "StudioDocuments",
+      "summary": "Change a delivery scope; the version it replaces is kept",
+      "authenticated": true,
+      "request": "DeliveryScopePatch",
+      "responses": [
+        "DeliveryScopeDto"
+      ],
+      "errors": [
+        "400",
+        "401",
+        "404",
+        "500"
+      ]
+    },
+    {
+      "method": "PATCH",
+      "path": "/studio-documents/v1/delivery-scopes/{scope_id}/limits/{limit_id}",
+      "operation_id": "studio_documents.patch_delivery_limit",
+      "tag": "StudioDocuments",
+      "summary": "Resolve a limit, reopen it, or change whether it blocks",
+      "authenticated": true,
+      "request": "DeliveryLimitPatch",
+      "responses": [
+        "DeliveryLimitDto"
+      ],
+      "errors": [
+        "400",
+        "401",
+        "404",
+        "500"
+      ]
+    },
+    {
+      "method": "PATCH",
       "path": "/studio-domain-model/v1/types/{id}/fields/{name}",
       "operation_id": "studio_domain_model.edit_field",
       "tag": "StudioDomainModel",
@@ -2767,6 +2979,42 @@
       "errors": [
         "400",
         "401",
+        "500"
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/studio-artifact-ingest/v1/projects/{project_id}/builds",
+      "operation_id": "studio_artifact_ingest.report_build",
+      "tag": "StudioArtifactIngest",
+      "summary": "Record a build the IDE ran: its start, or its end",
+      "authenticated": true,
+      "request": "BuildReportRequest",
+      "responses": [
+        "ArtifactNodeDto"
+      ],
+      "errors": [
+        "400",
+        "401",
+        "404",
+        "500"
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/studio-artifact-ingest/v1/projects/{project_id}/builds/dispatch",
+      "operation_id": "studio_artifact_ingest.dispatch_build",
+      "tag": "StudioArtifactIngest",
+      "summary": "Start the project's build workflow in CI",
+      "authenticated": true,
+      "request": "BuildDispatchRequest",
+      "responses": [
+        "BuildDispatchedDto"
+      ],
+      "errors": [
+        "400",
+        "401",
+        "404",
         "500"
       ]
     },
@@ -3155,6 +3403,42 @@
     },
     {
       "method": "POST",
+      "path": "/studio-documents/v1/delivery-scopes",
+      "operation_id": "studio_documents.create_delivery_scope",
+      "tag": "StudioDocuments",
+      "summary": "Add a delivery scope to a project",
+      "authenticated": true,
+      "request": "DeliveryScopeInput",
+      "responses": [
+        "DeliveryScopeDto"
+      ],
+      "errors": [
+        "400",
+        "401",
+        "404",
+        "500"
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/studio-documents/v1/delivery-scopes/{scope_id}/limits",
+      "operation_id": "studio_documents.create_delivery_limit",
+      "tag": "StudioDocuments",
+      "summary": "Add a limit to a delivery scope: a limitation, an open question or a dependency",
+      "authenticated": true,
+      "request": "DeliveryLimitInput",
+      "responses": [
+        "DeliveryLimitDto"
+      ],
+      "errors": [
+        "400",
+        "401",
+        "404",
+        "500"
+      ]
+    },
+    {
+      "method": "POST",
       "path": "/studio-documents/v1/organizations/{organization_id}/capabilities",
       "operation_id": "studio_documents.upsert_organization_capability",
       "tag": "StudioDocuments",
@@ -3335,6 +3619,24 @@
     },
     {
       "method": "POST",
+      "path": "/studio-documents/v1/spec-model/entities",
+      "operation_id": "studio_documents.upsert_spec_model_entity",
+      "tag": "StudioDocuments",
+      "summary": "Save an entity of the domain model to the project's documentation",
+      "authenticated": true,
+      "request": "SpecModelEntityRequest",
+      "responses": [
+        "SpecModelWriteDto"
+      ],
+      "errors": [
+        "400",
+        "401",
+        "404",
+        "500"
+      ]
+    },
+    {
+      "method": "POST",
       "path": "/studio-documents/v1/spec-model/findings/{fingerprint}/decision",
       "operation_id": "studio_documents.decide_spec_model_finding",
       "tag": "StudioDocuments",
@@ -3353,6 +3655,23 @@
     },
     {
       "method": "POST",
+      "path": "/studio-documents/v1/spec-model/findings/{fingerprint}/proposals",
+      "operation_id": "studio_documents.create_spec_model_finding_proposal",
+      "tag": "StudioDocuments",
+      "summary": "Propose a finding's fix as a pull request on its document",
+      "authenticated": true,
+      "responses": [
+        "SpecModelWriteDto"
+      ],
+      "errors": [
+        "400",
+        "401",
+        "404",
+        "500"
+      ]
+    },
+    {
+      "method": "POST",
       "path": "/studio-documents/v1/spec-model/glossary/decisions",
       "operation_id": "studio_documents.decide_spec_model_glossary_entry",
       "tag": "StudioDocuments",
@@ -3361,6 +3680,24 @@
       "request": "GlossaryDecisionRequest",
       "responses": [
         "GlossaryDecisionDto"
+      ],
+      "errors": [
+        "400",
+        "401",
+        "404",
+        "500"
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/studio-documents/v1/spec-model/glossary/proposals",
+      "operation_id": "studio_documents.create_spec_model_glossary_proposal",
+      "tag": "StudioDocuments",
+      "summary": "Propose a glossary rename in the documents as one pull request",
+      "authenticated": true,
+      "request": "GlossaryRenameRequest",
+      "responses": [
+        "GlossaryRenameProposalDto"
       ],
       "errors": [
         "400",
@@ -4064,6 +4401,25 @@
     },
     {
       "method": "POST",
+      "path": "/studio-product/v1/gear-explanations/{gear_id}/generations",
+      "operation_id": "studio_product.create_gear_explanation_generation",
+      "tag": "StudioProduct",
+      "summary": "Have a model explain a gear in plain words, and keep it",
+      "authenticated": true,
+      "request": "CreateGearExplanationGenerationRequest",
+      "responses": [
+        "GearExplanationDto"
+      ],
+      "errors": [
+        "400",
+        "401",
+        "403",
+        "404",
+        "500"
+      ]
+    },
+    {
+      "method": "POST",
       "path": "/studio-product/v1/gearbox/brings",
       "operation_id": "studio_product.query_gear_brings",
       "tag": "StudioProduct",
@@ -4119,6 +4475,32 @@
       "operation_id": "studio_product.pull_corpus_pack",
       "tag": "StudioProduct",
       "summary": "Git smart-HTTP upload-pack (clone and fetch) for the gear corpus",
+      "authenticated": false,
+      "errors": [
+        "401",
+        "404",
+        "500"
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/studio-product/v1/gearbox/corpus/{source_id}/git-upload-pack",
+      "operation_id": "studio_product.pull_root_pack",
+      "tag": "StudioProduct",
+      "summary": "Git smart-HTTP upload-pack for one of the platform's gear repositories",
+      "authenticated": false,
+      "errors": [
+        "401",
+        "404",
+        "500"
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/studio-product/v1/organizations/{organization_id}/gearbox/corpus/{source_id}/git-upload-pack",
+      "operation_id": "studio_product.pull_org_root_pack",
+      "tag": "StudioProduct",
+      "summary": "Git smart-HTTP upload-pack for one of an organization's gear repositories",
       "authenticated": false,
       "errors": [
         "401",
@@ -4799,6 +5181,24 @@
     },
     {
       "method": "PUT",
+      "path": "/studio-documents/v1/application-parts",
+      "operation_id": "studio_documents.upsert_application_part",
+      "tag": "StudioDocuments",
+      "summary": "Record the owner, describing document, boundary and related parts of one part",
+      "authenticated": true,
+      "request": "ApplicationPartInput",
+      "responses": [
+        "ApplicationPartDto"
+      ],
+      "errors": [
+        "400",
+        "401",
+        "404",
+        "500"
+      ]
+    },
+    {
+      "method": "PUT",
       "path": "/studio-documents/v1/workspaces/{workspace_id}/document-bindings/{id}",
       "operation_id": "studio_documents.decide_binding",
       "tag": "StudioDocuments",
@@ -4916,6 +5316,25 @@
       "request": "UpsertOrganizationLogoRequest",
       "responses": [
         "OrganizationLogoDto"
+      ],
+      "errors": [
+        "400",
+        "401",
+        "403",
+        "404",
+        "500"
+      ]
+    },
+    {
+      "method": "PUT",
+      "path": "/studio-product/v1/gear-explanations/{gear_id}",
+      "operation_id": "studio_product.update_gear_explanation",
+      "tag": "StudioProduct",
+      "summary": "Save a person's plain explanation of a gear",
+      "authenticated": true,
+      "request": "UpdateGearExplanationRequest",
+      "responses": [
+        "GearExplanationDto"
       ],
       "errors": [
         "400",
@@ -5066,6 +5485,36 @@
         "400",
         "401",
         "404",
+        "500"
+      ]
+    },
+    {
+      "method": "PUT",
+      "path": "/studio-user/v1/capacity/allocations",
+      "operation_id": "studio_user.update_capacity_allocation",
+      "tag": "StudioUser",
+      "summary": "Set or clear one person's hours on a project in a week",
+      "authenticated": true,
+      "request": "AllocationRequest",
+      "errors": [
+        "400",
+        "401",
+        "403",
+        "500"
+      ]
+    },
+    {
+      "method": "PUT",
+      "path": "/studio-user/v1/capacity/availability",
+      "operation_id": "studio_user.update_capacity_availability",
+      "tag": "StudioUser",
+      "summary": "Set or clear one person's available hours in a week",
+      "authenticated": true,
+      "request": "AvailabilityRequest",
+      "errors": [
+        "400",
+        "401",
+        "403",
         "500"
       ]
     },

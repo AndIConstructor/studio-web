@@ -33,7 +33,7 @@
 //! (`STUDIO_GEARBOX_CORPUS_URL` / `_REF`) is the one root, under the source id
 //! `gears-rust`. No organization's settings or sync can change either.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -855,9 +855,11 @@ pub struct Brought {
     pub database: bool,
 }
 
-/// A contract the product would get from two gears: one it has, one the
-/// candidate brings — the second audit store a certified platform cannot
-/// keep (interview problem 4.7).
+/// A contract the product would get from two gears because of the
+/// candidate: one it has and one the candidate brings, or two the candidate
+/// brings — the second audit store a certified platform cannot keep
+/// (interview problem 4.7). A contract the product already gets twice, with
+/// nothing more brought for it, is not the candidate's doing and is not one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Overlap {
     pub contract: String,
@@ -980,7 +982,7 @@ pub fn brings(
     }
     let overlaps = by_contract
         .into_iter()
-        .filter(|(_, (a, b))| !a.is_empty() && !b.is_empty())
+        .filter(|(_, (a, b))| !b.is_empty() && a.len() + b.len() > 1)
         .map(|(contract, (a, b))| Overlap {
             contract,
             already: a.into_iter().collect(),
@@ -1011,6 +1013,94 @@ fn fact(v: &str) -> Value {
 
 fn lamp(v: &str, s: &str) -> Value {
     serde_json::json!({ "v": v, "b": v, "s": s })
+}
+
+/// What the catalogue says of the gear `name` (engine id or crate name), as
+/// the facts an explanation is written from: its own words from the engine's
+/// raw descriptor (`display_name`, `description`, `category`, `maturity`) and
+/// what the parsed catalogue proves (host, choices, plugins, colocated
+/// gears). `None` for a gear the corpus does not describe. The README is
+/// read separately, from the checkout.
+pub fn gear_brief(
+    catalogue: &EngineCatalogue,
+    raw: &Value,
+    name: &str,
+) -> Option<super::explanations::GearBrief> {
+    let g = catalogue.find(name.trim())?;
+    let text_of = |id: &str, field: &str| {
+        raw.get("gears")
+            .and_then(|gs| gs.get(id))
+            .and_then(|d| d.get(field))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+    };
+    // A gear as a person reads it: its display name, else its crate.
+    let label = |other: &EngineGear| {
+        text_of(&other.id, "display_name").unwrap_or_else(|| other.package.crate_name.clone())
+    };
+    let points = g
+        .extension_points
+        .iter()
+        .map(|p| {
+            p.trait_ident
+                .clone()
+                .unwrap_or_else(|| p.sdk.crate_name.clone())
+        })
+        .collect();
+    Some(super::explanations::GearBrief {
+        id: g.id.clone(),
+        crate_name: g.package.crate_name.clone(),
+        display_name: text_of(&g.id, "display_name"),
+        description: text_of(&g.id, "description"),
+        category: text_of(&g.id, "category"),
+        maturity: text_of(&g.id, "maturity"),
+        runtime_caps: g.runtime_caps.clone(),
+        host: g
+            .fills
+            .as_ref()
+            .and_then(|_| catalogue.host_of(g).map(label)),
+        points,
+        plugins: catalogue.implementers(g).into_iter().map(label).collect(),
+        brings: g
+            .colocated_deps
+            .iter()
+            .map(|d| catalogue.gears.get(d).map_or_else(|| d.clone(), label))
+            .collect(),
+        path: g.package.path.clone(),
+        readme: None,
+    })
+}
+
+/// The README of the crate at `path` (relative to the corpus at `dir`), at
+/// most `max` bytes; `None` when there is none or the path leaves the corpus.
+pub fn read_readme(dir: &Path, path: &str, max: usize) -> Option<String> {
+    let rel = Path::new(path.trim());
+    if rel.is_absolute()
+        || rel
+            .components()
+            .any(|c| !matches!(c, std::path::Component::Normal(_)))
+    {
+        return None;
+    }
+    // A package path may name the crate's manifest rather than its directory.
+    let crate_dir = if rel.extension().is_some_and(|e| e == "toml") {
+        rel.parent().unwrap_or(rel)
+    } else {
+        rel
+    };
+    ["README.md", "readme.md", "README"]
+        .iter()
+        .map(|f| dir.join(crate_dir).join(f))
+        .find(|f| f.is_file())
+        .and_then(|f| std::fs::File::open(f).ok())
+        .and_then(|f| {
+            let mut buf = Vec::new();
+            f.take(max as u64).read_to_end(&mut buf).ok()?;
+            let text = String::from_utf8_lossy(&buf).into_owned();
+            (!text.trim().is_empty()).then_some(text)
+        })
 }
 
 /// Profile fields for every gear the corpus describes, keyed by crate name.
@@ -1133,6 +1223,8 @@ pub struct HostPoint {
     pub sdk_path: String,
     /// Whether the host can run in a product from this corpus.
     pub runs: bool,
+    /// The root (gear repository) the host is in, by source id.
+    pub source: String,
 }
 
 pub fn host_points(catalogue: &EngineCatalogue) -> Vec<HostPoint> {
@@ -1152,6 +1244,10 @@ pub fn host_points(catalogue: &EngineCatalogue) -> Vec<HostPoint> {
                     sdk_lib: p.sdk.lib_ident.clone()?,
                     sdk_path: p.sdk.path.clone()?,
                     runs,
+                    source: g
+                        .source
+                        .clone()
+                        .unwrap_or_else(|| CORPUS_SOURCE_ID.to_string()),
                 })
             })
         })
@@ -1181,10 +1277,10 @@ pub fn sdk_path_in_repo(parent_dir: &str, sdk_path: &str) -> String {
     )
 }
 
-/// The SDK path from a gear in a project's own repository to the corpus
-/// checkout beside it in a Studio workspace: `<checkout>/<parent_dir>/<slug>`
-/// up to the workspace, then `gears-rust/`.
-pub fn sdk_path_beside(parent_dir: &str, sdk_path: &str) -> String {
+/// The SDK path from a gear in a project's own repository to the checkout of
+/// the gear repository `source_id` beside it in a Studio workspace:
+/// `<checkout>/<parent_dir>/<slug>` up to the workspace, then `<source_id>/`.
+pub fn sdk_path_beside(parent_dir: &str, source_id: &str, sdk_path: &str) -> String {
     let depth = parent_dir
         .trim_matches('/')
         .split('/')
@@ -1192,7 +1288,7 @@ pub fn sdk_path_beside(parent_dir: &str, sdk_path: &str) -> String {
         .count()
         + 2;
     format!(
-        "{}{CORPUS_SOURCE_ID}/{}",
+        "{}{source_id}/{}",
         "../".repeat(depth),
         sdk_path.trim_start_matches('/')
     )
@@ -1816,6 +1912,9 @@ pub struct GearboxStatus {
     pub problem: Option<String>,
     /// Each root the engine reads, in its order.
     pub sources: Vec<SourceStatus>,
+    /// The organization's repositories left out because a platform repository
+    /// has the same source id, by source id.
+    pub shadowed: Vec<String>,
 }
 
 /// One gear repository as the engine last read it.
@@ -1831,7 +1930,24 @@ pub struct SourceStatus {
     /// The gear repository connection it comes from; `None` for the
     /// deployment's corpus.
     pub connection_id: Option<uuid::Uuid>,
+    /// The tier it belongs to: `platform`, or `organization`.
+    pub tier: &'static str,
 }
+
+/// A root of the corpus as it was read: where it comes from, the commit, and
+/// how many gears the engine found in it.
+#[derive(Clone)]
+pub struct ReadRoot {
+    pub root: GearRoot,
+    pub commit: Option<String>,
+    pub gears: usize,
+}
+
+/// Which corpus a call reads (ADR-0046): the platform's gear repositories
+/// (`None`), or an organization's (`Some(org)`) -- the platform's, then the
+/// organization's own. An organization with none of its own reads the
+/// platform's corpus.
+pub type Scope = Option<uuid::Uuid>;
 
 /// A root of the corpus: a gear repository and the id the engine knows it by.
 #[derive(Clone)]
@@ -1840,12 +1956,16 @@ pub struct GearRoot {
     pub source: CorpusSource,
     /// The connection it is read through; `None` for the deployment's corpus.
     pub connection_id: Option<uuid::Uuid>,
+    /// An organization's own repository, rather than the platform's.
+    pub organization: bool,
 }
 
 impl GearRoot {
     /// What decides whether a checkout is still the one asked for.
     fn same(&self, other: &Self) -> bool {
         self.id == other.id
+            && self.connection_id == other.connection_id
+            && self.source.key == other.source.key
             && self.source.url == other.source.url
             && self.source.git_ref == other.source.git_ref
             && self.source.token == other.source.token
@@ -1862,8 +1982,9 @@ struct Root {
 
 struct Corpus {
     roots: Vec<Root>,
-    /// The [`RootSet`] generation these roots were checked out for.
-    generation: u64,
+    /// The generations (the platform's list, the organization's) these roots
+    /// were checked out for.
+    generation: (u64, u64),
     refreshed: Instant,
     catalogue: Option<Arc<EngineCatalogue>>,
     /// The engine's answer verbatim, for a client that reads more of it than
@@ -1878,11 +1999,45 @@ impl Corpus {
     }
 }
 
-/// The roots asked for, and when the platform's list was last read.
+/// The roots asked for, and when their list was last read.
 struct RootSet {
     list: Vec<GearRoot>,
     generation: u64,
     checked: Option<Instant>,
+}
+
+impl RootSet {
+    fn new(list: Vec<GearRoot>) -> Self {
+        Self {
+            list,
+            generation: 0,
+            checked: None,
+        }
+    }
+
+    fn due(&self) -> bool {
+        self.checked.is_none_or(|t| t.elapsed() >= ROOTS_RECHECK)
+    }
+
+    /// Take `list`; a list unlike the last one is a new generation.
+    fn take(&mut self, list: Vec<GearRoot>) {
+        self.checked = Some(Instant::now());
+        let unchanged =
+            self.list.len() == list.len() && self.list.iter().zip(&list).all(|(a, b)| a.same(b));
+        if !unchanged {
+            self.list = list;
+            self.generation += 1;
+        }
+    }
+}
+
+/// What a scope reads: its roots in the engine's order, the generations they
+/// come from, and the organization's roots left out for a clash.
+struct ScopeView {
+    scope: Scope,
+    roots: Vec<GearRoot>,
+    generation: (u64, u64),
+    shadowed: Vec<String>,
 }
 
 /// A repository checked out under the engine's working directory: a root of
@@ -1902,10 +2057,21 @@ pub struct CorpusSource {
     pub git_ref: String,
 }
 
+/// One lock per checkout directory: a platform root is read by the platform's
+/// corpus and by every organization's, and two fetches into one directory at
+/// once break it.
+type CheckoutLocks = Arc<std::sync::Mutex<HashMap<PathBuf, Arc<std::sync::Mutex<()>>>>>;
+
 pub struct Gearbox {
     cfg: GearboxConfig,
-    corpus: Mutex<Option<Corpus>>,
+    /// One corpus per scope, each behind its own lock, so one organization's
+    /// fetch does not hold up another's previews.
+    corpora: std::sync::Mutex<HashMap<Scope, Arc<Mutex<Option<Corpus>>>>>,
+    /// The platform's roots.
     roots: std::sync::Mutex<RootSet>,
+    /// Each organization's own roots, by organization.
+    org_roots: std::sync::Mutex<HashMap<uuid::Uuid, RootSet>>,
+    checkouts: CheckoutLocks,
 }
 
 /// The deployment's corpus as the one root, when it names one.
@@ -1931,7 +2097,24 @@ fn deployment_roots(cfg: &GearboxConfig) -> Vec<GearRoot> {
             git_ref: cfg.corpus_ref.clone(),
         },
         connection_id: None,
+        organization: false,
     }]
+}
+
+/// The platform's roots, then the organization's -- less any whose source id
+/// a platform root already has: the engine names a root by its directory, so
+/// two roots cannot share an id. Returns the roots and the ids left out.
+fn merged_roots(platform: &[GearRoot], own: &[GearRoot]) -> (Vec<GearRoot>, Vec<String>) {
+    let mut roots = platform.to_vec();
+    let mut shadowed = Vec::new();
+    for r in own {
+        if roots.iter().any(|p| p.id == r.id) {
+            shadowed.push(r.id.clone());
+        } else {
+            roots.push(r.clone());
+        }
+    }
+    (roots, shadowed)
 }
 
 impl Gearbox {
@@ -1939,27 +2122,59 @@ impl Gearbox {
         let list = deployment_roots(&cfg);
         Self {
             cfg,
-            corpus: Mutex::new(None),
-            roots: std::sync::Mutex::new(RootSet {
-                list,
-                generation: 0,
-                checked: None,
-            }),
+            corpora: std::sync::Mutex::new(HashMap::new()),
+            roots: std::sync::Mutex::new(RootSet::new(list)),
+            org_roots: std::sync::Mutex::new(HashMap::new()),
+            checkouts: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
-    /// The roots the corpus is read from, in the engine's order.
+    /// The platform's roots, in the engine's order.
+    #[cfg(test)]
     pub fn roots(&self) -> Vec<GearRoot> {
         self.roots.lock().expect("gearbox roots").list.clone()
     }
 
+    /// What `scope` reads. An organization with no roots of its own reads the
+    /// platform's corpus, under the platform's scope.
+    fn view(&self, scope: Scope) -> ScopeView {
+        let (platform, pg) = {
+            let set = self.roots.lock().expect("gearbox roots");
+            (set.list.clone(), set.generation)
+        };
+        let own = scope.and_then(|org| {
+            let orgs = self.org_roots.lock().expect("gearbox org roots");
+            orgs.get(&org)
+                .filter(|s| !s.list.is_empty())
+                .map(|s| (org, s.list.clone(), s.generation))
+        });
+        match own {
+            Some((org, list, og)) => {
+                let (roots, shadowed) = merged_roots(&platform, &list);
+                ScopeView {
+                    scope: Some(org),
+                    roots,
+                    generation: (pg, og),
+                    shadowed,
+                }
+            }
+            None => ScopeView {
+                scope: None,
+                roots: platform,
+                generation: (pg, 0),
+                shadowed: Vec::new(),
+            },
+        }
+    }
+
+    /// The roots `scope` reads, in the engine's order.
+    pub fn roots_in(&self, scope: Scope) -> Vec<GearRoot> {
+        self.view(scope).roots
+    }
+
     /// Whether the platform's gear repositories are due to be read again.
     pub fn roots_due(&self) -> bool {
-        self.roots
-            .lock()
-            .expect("gearbox roots")
-            .checked
-            .is_none_or(|t| t.elapsed() >= ROOTS_RECHECK)
+        self.roots.lock().expect("gearbox roots").due()
     }
 
     /// Read the corpus from `repositories` (the platform's gear repositories,
@@ -1971,14 +2186,7 @@ impl Gearbox {
         } else {
             repositories
         };
-        let mut set = self.roots.lock().expect("gearbox roots");
-        set.checked = Some(Instant::now());
-        let unchanged =
-            set.list.len() == list.len() && set.list.iter().zip(&list).all(|(a, b)| a.same(b));
-        if !unchanged {
-            set.list = list;
-            set.generation += 1;
-        }
+        self.roots.lock().expect("gearbox roots").take(list);
     }
 
     /// Note a failed read of the platform's list, so it is not retried on
@@ -1987,13 +2195,62 @@ impl Gearbox {
         self.roots.lock().expect("gearbox roots").checked = Some(Instant::now());
     }
 
-    fn first_source(&self) -> Option<CorpusSource> {
-        self.roots().into_iter().next().map(|r| r.source)
+    /// Whether organization `org`'s own gear repositories are due to be read.
+    pub fn org_roots_due(&self, org: uuid::Uuid) -> bool {
+        self.org_roots
+            .lock()
+            .expect("gearbox org roots")
+            .get(&org)
+            .is_none_or(RootSet::due)
     }
 
-    /// Whether `repo_key` (`owner/repo`) is one of the corpus's repositories.
-    pub fn is_corpus_repo(&self, repo_key: &str) -> bool {
-        self.roots()
+    /// Organization `org`'s own gear repositories (ADR-0046 phase 3), read
+    /// after the platform's in that organization's corpus.
+    pub fn use_org_repositories(&self, org: uuid::Uuid, repositories: Vec<GearRoot>) {
+        let list = repositories
+            .into_iter()
+            .map(|mut r| {
+                r.organization = true;
+                r
+            })
+            .collect();
+        self.org_roots
+            .lock()
+            .expect("gearbox org roots")
+            .entry(org)
+            .or_insert_with(|| RootSet::new(Vec::new()))
+            .take(list);
+    }
+
+    /// Note a failed read of `org`'s list.
+    pub fn mark_org_roots_checked(&self, org: uuid::Uuid) {
+        self.org_roots
+            .lock()
+            .expect("gearbox org roots")
+            .entry(org)
+            .or_insert_with(|| RootSet::new(Vec::new()))
+            .checked = Some(Instant::now());
+    }
+
+    fn cell(&self, scope: Scope) -> Arc<Mutex<Option<Corpus>>> {
+        Arc::clone(
+            self.corpora
+                .lock()
+                .expect("gearbox corpora")
+                .entry(scope)
+                .or_insert_with(|| Arc::new(Mutex::new(None))),
+        )
+    }
+
+    fn first_source(&self, scope: Scope) -> Option<CorpusSource> {
+        self.roots_in(scope).into_iter().next().map(|r| r.source)
+    }
+
+    /// Whether `repo_key` (`owner/repo`) is one of the repositories `scope`
+    /// reads.
+    #[cfg(test)]
+    pub fn is_corpus_repo(&self, scope: Scope, repo_key: &str) -> bool {
+        self.roots_in(scope)
             .iter()
             .any(|r| self::repo_key(&r.source.url) == repo_key)
     }
@@ -2006,8 +2263,12 @@ impl Gearbox {
 
     /// The corpus the catalogue, previews and facts are read from, as a label:
     /// each root's `owner/repo@ref`.
-    pub fn corpus_label(&self) -> String {
-        let labels: Vec<String> = self.roots().into_iter().map(|r| r.source.label).collect();
+    pub fn corpus_label(&self, scope: Scope) -> String {
+        let labels: Vec<String> = self
+            .roots_in(scope)
+            .into_iter()
+            .map(|r| r.source.label)
+            .collect();
         if labels.is_empty() {
             "no gear repository".to_string()
         } else {
@@ -2018,27 +2279,36 @@ impl Gearbox {
     /// Where a client can clone the corpus's first root itself: its URL and
     /// ref, and whether reaching it takes the token this backend holds (which
     /// is never handed out, so such a corpus cannot be cloned from a laptop
-    /// directly). One root for now: the relay per root is ADR-0046 phase 2.
-    pub fn corpus_origin(&self) -> (String, String, bool) {
-        self.first_source()
+    /// directly). Every root: [`Self::read_roots`].
+    pub fn corpus_origin(&self, scope: Scope) -> (String, String, bool) {
+        self.first_source(scope)
             .map(|s| (s.url, s.git_ref, !s.token.is_empty()))
             .unwrap_or_default()
     }
 
     /// The source id of the root [`Self::corpus_origin`] names.
-    pub fn corpus_source_id(&self) -> String {
-        self.roots()
+    pub fn corpus_source_id(&self, scope: Scope) -> String {
+        self.roots_in(scope)
             .into_iter()
             .next()
             .map_or_else(|| CORPUS_SOURCE_ID.to_string(), |r| r.id)
     }
 
-    /// What the corpus Git relay sends upstream: the repository URL and the
-    /// token it is read with (empty for a public corpus). Server-side only.
-    pub(crate) fn corpus_fetch(&self) -> (String, String) {
-        self.first_source()
-            .map(|s| (s.url, s.token))
-            .unwrap_or_default()
+    /// What the corpus Git relay sends upstream for root `source_id` of
+    /// `scope` -- the first root when none is named: the repository URL and
+    /// the token it is read with (empty for a public one). Server-side only.
+    /// `None` when `scope` reads no such root.
+    pub(crate) fn corpus_fetch(
+        &self,
+        scope: Scope,
+        source_id: Option<&str>,
+    ) -> Option<(String, String)> {
+        let roots = self.roots_in(scope);
+        let root = match source_id {
+            Some(id) => roots.into_iter().find(|r| r.id == id),
+            None => roots.into_iter().next(),
+        }?;
+        Some((root.source.url, root.source.token))
     }
 
     /// Check `source` out (or bring its checkout up to date) under the engine's
@@ -2072,16 +2342,54 @@ impl Gearbox {
     /// What the engine knows about every gear the corpus describes, keyed by
     /// crate name and shaped as component-profile fields (`{v, b, s}`), with
     /// the corpus they were read from.
-    pub async fn facts(&self) -> anyhow::Result<(String, BTreeMap<String, Value>)> {
-        let (_, commit, catalogue) = self.ensure_corpus().await?;
-        let mut label = self.corpus_label();
+    pub async fn facts(&self, scope: Scope) -> anyhow::Result<(String, BTreeMap<String, Value>)> {
+        let (_, commit, catalogue) = self.ensure_corpus(scope).await?;
+        let mut label = self.corpus_label(scope);
         if let Some(c) = commit {
             label = format!("{label} ({})", &c[..c.len().min(7)]);
         }
         Ok((label.clone(), gear_facts(&catalogue, &label)))
     }
 
-    pub async fn status(&self) -> GearboxStatus {
+    /// Every root `scope` reads, with the commit it was last read at and the
+    /// gears the engine found in it. Roots not checked out yet have no commit.
+    pub async fn read_roots(&self, scope: Scope) -> Vec<ReadRoot> {
+        let view = self.view(scope);
+        let cell = self.cell(view.scope);
+        let guard = cell.lock().await;
+        let commits: BTreeMap<String, Option<String>> = guard
+            .as_ref()
+            .map(|c| {
+                c.roots
+                    .iter()
+                    .map(|r| (r.id.clone(), r.commit.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+        if let Some(raw) = guard.as_ref().and_then(|c| c.raw.clone()) {
+            for g in raw
+                .get("gears")
+                .and_then(Value::as_object)
+                .into_iter()
+                .flat_map(|m| m.values())
+            {
+                if let Some(src) = g.get("source").and_then(Value::as_str) {
+                    *counts.entry(src.to_string()).or_default() += 1;
+                }
+            }
+        }
+        view.roots
+            .into_iter()
+            .map(|root| ReadRoot {
+                commit: commits.get(&root.id).cloned().flatten(),
+                gears: counts.get(&root.id).copied().unwrap_or(0),
+                root,
+            })
+            .collect()
+    }
+
+    pub async fn status(&self, scope: Scope) -> GearboxStatus {
         let bin = self.cfg.bin.clone();
         let version =
             tokio::task::spawn_blocking(move || run_engine(&bin, &["--version".into()], None).ok())
@@ -2089,50 +2397,30 @@ impl Gearbox {
                 .ok()
                 .flatten()
                 .filter(|o| o.success)
-                .map(|o| o.stdout.trim().to_string());
-        let (commit, problem) = match self.ensure_corpus().await {
+                .map(|o| with_revision(o.stdout.trim(), engine_revision().as_deref()));
+        let (commit, problem) = match self.ensure_corpus(scope).await {
             Ok((_, commit, _)) => (commit, None),
             Err(e) => (None, Some(format!("{e:#}"))),
         };
-        let roots = self.roots();
-        let (commits, counts) = {
-            let guard = self.corpus.lock().await;
-            let commits: BTreeMap<String, Option<String>> = guard
-                .as_ref()
-                .map(|c| {
-                    c.roots
-                        .iter()
-                        .map(|r| (r.id.clone(), r.commit.clone()))
-                        .collect()
-                })
-                .unwrap_or_default();
-            let mut counts: BTreeMap<String, usize> = BTreeMap::new();
-            if let Some(raw) = guard.as_ref().and_then(|c| c.raw.clone()) {
-                for g in raw
-                    .get("gears")
-                    .and_then(Value::as_object)
-                    .into_iter()
-                    .flat_map(|m| m.values())
-                {
-                    if let Some(src) = g.get("source").and_then(Value::as_str) {
-                        *counts.entry(src.to_string()).or_default() += 1;
-                    }
-                }
-            }
-            (commits, counts)
-        };
-        let sources = roots
+        let shadowed = self.view(scope).shadowed;
+        let read = self.read_roots(scope).await;
+        let sources = read
             .iter()
             .map(|r| SourceStatus {
-                source_id: r.id.clone(),
-                repo: repo_key(&r.source.url),
-                git_ref: r.source.git_ref.clone(),
-                commit: commits.get(&r.id).cloned().flatten(),
-                gears: counts.get(&r.id).copied().unwrap_or(0),
-                connection_id: r.connection_id,
+                source_id: r.root.id.clone(),
+                repo: repo_key(&r.root.source.url),
+                git_ref: r.root.source.git_ref.clone(),
+                commit: r.commit.clone(),
+                gears: r.gears,
+                connection_id: r.root.connection_id,
+                tier: if r.root.organization {
+                    "organization"
+                } else {
+                    "platform"
+                },
             })
             .collect();
-        let first = roots.first().map(|r| r.source.clone());
+        let first = read.first().map(|r| r.root.source.clone());
         GearboxStatus {
             problem: if version.is_none() {
                 Some(format!(
@@ -2147,32 +2435,34 @@ impl Gearbox {
             corpus_ref: first.map(|s| s.git_ref).unwrap_or_default(),
             corpus_commit: commit,
             sources,
+            shadowed,
         }
     }
 
-    /// The corpus's roots checked out, refreshed at most once per `refresh`
-    /// and whenever the roots asked for change, and their catalogue, loaded
-    /// once per set of commits. Returns each root's id and directory, the
-    /// first root's commit, and the catalogue.
+    /// `scope`'s roots checked out, refreshed at most once per `refresh` and
+    /// whenever the roots asked for change, and their catalogue, loaded once
+    /// per set of commits. Returns each root's id and directory, the first
+    /// root's commit, and the catalogue.
     async fn ensure_corpus(
         &self,
+        scope: Scope,
     ) -> anyhow::Result<(Vec<(String, PathBuf)>, Option<String>, Arc<EngineCatalogue>)> {
-        let (wanted, generation) = {
-            let set = self.roots.lock().expect("gearbox roots");
-            (set.list.clone(), set.generation)
-        };
+        let view = self.view(scope);
+        let (wanted, generation) = (view.roots, view.generation);
         if wanted.is_empty() {
             bail!(
                 "no gear repository: the platform has none connected, and the deployment names \
                  no corpus (STUDIO_GEARBOX_CORPUS_URL)"
             );
         }
-        let mut guard = self.corpus.lock().await;
+        let cell = self.cell(view.scope);
+        let mut guard = cell.lock().await;
         let stale = guard.as_ref().is_none_or(|c| {
             c.generation != generation || c.refreshed.elapsed() >= self.cfg.refresh
         });
         if stale {
             let workdir = self.cfg.workdir.clone();
+            let locks = Arc::clone(&self.checkouts);
             let asked = wanted.clone();
             let cloned = tokio::task::spawn_blocking(move || {
                 asked
@@ -2183,9 +2473,18 @@ impl Gearbox {
                         // `gearbox-roots/<key>/<source id>`: the engine names a
                         // root by its directory -- the real one, after links
                         // are followed -- so the checkout itself carries the
-                        // id; the key keeps two connections apart.
+                        // id; the key keeps two repositories apart.
+                        let dir = workdir.join("gearbox-roots").join(&s.key).join(&r.id);
+                        let lock = Arc::clone(
+                            locks
+                                .lock()
+                                .expect("gearbox checkout locks")
+                                .entry(dir.clone())
+                                .or_default(),
+                        );
+                        let _held = lock.lock().unwrap_or_else(|p| p.into_inner());
                         crate::connectors::sdk::git_checkout::clone_or_update_into(
-                            &workdir.join("gearbox-roots").join(&s.key).join(&r.id),
+                            &dir,
                             &s.url,
                             &s.username,
                             &s.token,
@@ -2279,46 +2578,84 @@ impl Gearbox {
     }
 
     /// The corpus's catalogue as the engine printed it (`gearbox catalogue
-    /// --format json`), and the commit it was read at. One checkout serves
-    /// every project, so an IDE lists the gears without cloning the corpus.
-    pub async fn catalogue_json(&self) -> anyhow::Result<(Arc<Value>, Option<String>)> {
-        self.ensure_corpus().await?;
-        let guard = self.corpus.lock().await;
+    /// --format json`), and the first root's commit. One checkout serves every
+    /// project, so an IDE lists the gears without cloning the corpus.
+    pub async fn catalogue_json(
+        &self,
+        scope: Scope,
+    ) -> anyhow::Result<(Arc<Value>, Option<String>)> {
+        self.ensure_corpus(scope).await?;
+        let cell = self.cell(self.view(scope).scope);
+        let guard = cell.lock().await;
         let corpus = guard.as_ref().context("the corpus is not checked out")?;
         let raw = corpus.raw.clone().context("the corpus has no catalogue")?;
         Ok((raw, corpus.commit()))
     }
 
-    /// [`complete`] against the current corpus.
+    /// The facts an explanation of the gear `name` is written from, with its
+    /// crate's README from the checkout. `None` for a gear the corpus does
+    /// not describe. The platform's corpus: an explanation is the
+    /// platform's, shared by every organization.
+    pub async fn gear_brief(
+        &self,
+        name: &str,
+    ) -> anyhow::Result<Option<super::explanations::GearBrief>> {
+        let (roots, _, catalogue) = self.ensure_corpus(None).await?;
+        let (raw, _) = self.catalogue_json(None).await?;
+        let Some(mut brief) = gear_brief(&catalogue, &raw, name) else {
+            return Ok(None);
+        };
+        if let Some(path) = brief.path.clone() {
+            // The catalogue does not say which repository a gear came from,
+            // so the README is looked for under each root in turn.
+            brief.readme = tokio::task::spawn_blocking(move || {
+                roots.iter().find_map(|(_, dir)| {
+                    read_readme(dir, &path, super::explanations::MAX_README_BYTES)
+                })
+            })
+            .await
+            .ok()
+            .flatten();
+        }
+        Ok(Some(brief))
+    }
+
+    /// [`complete`] against `scope`'s corpus.
     pub async fn complete(
         &self,
+        scope: Scope,
         picked: &[String],
         config: &GearConfig,
     ) -> anyhow::Result<Completion> {
-        let (_, _, catalogue) = self.ensure_corpus().await?;
+        let (_, _, catalogue) = self.ensure_corpus(scope).await?;
         Ok(complete(&catalogue, picked, config))
     }
 
-    /// [`brings`] against the current corpus.
+    /// [`brings`] against `scope`'s corpus.
     pub async fn brings(
         &self,
+        scope: Scope,
         current: &[String],
         candidate: &str,
         config: &GearConfig,
     ) -> anyhow::Result<Brings> {
-        let (_, _, catalogue) = self.ensure_corpus().await?;
+        let (_, _, catalogue) = self.ensure_corpus(scope).await?;
         Ok(brings(&catalogue, current, candidate, config))
     }
 
-    /// [`config_schemas`] against the current corpus.
-    pub async fn config_schemas(&self, names: &[String]) -> anyhow::Result<Vec<GearConfigSchema>> {
-        let (_, _, catalogue) = self.ensure_corpus().await?;
+    /// [`config_schemas`] against `scope`'s corpus.
+    pub async fn config_schemas(
+        &self,
+        scope: Scope,
+        names: &[String],
+    ) -> anyhow::Result<Vec<GearConfigSchema>> {
+        let (_, _, catalogue) = self.ensure_corpus(scope).await?;
         Ok(config_schemas(&catalogue, names))
     }
 
     /// The extension points a new plugin gear can fill, one per host.
-    pub async fn extension_points(&self) -> anyhow::Result<Vec<HostPoint>> {
-        let (_, _, catalogue) = self.ensure_corpus().await?;
+    pub async fn extension_points(&self, scope: Scope) -> anyhow::Result<Vec<HostPoint>> {
+        let (_, _, catalogue) = self.ensure_corpus(scope).await?;
         Ok(host_points(&catalogue))
     }
 
@@ -2364,7 +2701,7 @@ impl Gearbox {
         answer_gdl(&result)
     }
 
-    pub async fn preview(&self, input: PreviewInput) -> anyhow::Result<Preview> {
+    pub async fn preview(&self, scope: Scope, input: PreviewInput) -> anyhow::Result<Preview> {
         if !is_kebab_id(&input.product_id) {
             bail!(
                 "product id `{}` is not a kebab-case id (lowercase letters, digits, single hyphens)",
@@ -2378,29 +2715,17 @@ impl Gearbox {
                 PROFILES.join(", ")
             );
         }
-        let (named, commit, catalogue) = self.ensure_corpus().await?;
+        let (named, commit, catalogue) = self.ensure_corpus(scope).await?;
         let composition = compose(&catalogue, &input.gears);
         // Each root at the commit it was read at, so the description says by
         // itself what it was built from.
-        let checked: BTreeMap<String, Option<String>> = {
-            let guard = self.corpus.lock().await;
-            guard
-                .as_ref()
-                .map(|c| {
-                    c.roots
-                        .iter()
-                        .map(|r| (r.id.clone(), r.commit.clone()))
-                        .collect()
-                })
-                .unwrap_or_default()
-        };
-        let roots = self.roots();
-        let pins: Vec<SourcePin<'_>> = roots
+        let read = self.read_roots(scope).await;
+        let pins: Vec<SourcePin<'_>> = read
             .iter()
             .map(|r| SourcePin {
-                id: &r.id,
-                url: &r.source.url,
-                rev: checked.get(&r.id).and_then(|c| c.as_deref()),
+                id: &r.root.id,
+                url: &r.root.source.url,
+                rev: r.commit.as_deref(),
             })
             .collect();
         let gear_source: BTreeMap<String, String> = catalogue
@@ -2459,6 +2784,31 @@ impl Gearbox {
             resolution,
             corpus_commit: commit,
         })
+    }
+}
+
+/// Where the image records the engine's commit: the `gearbox` stage writes it
+/// beside the binary it builds, because `gearbox --version` says only the
+/// crate's version, which has stayed `0.1.0` across every commit.
+const ENGINE_REVISION_FILE: &str = "/usr/local/share/gearbox/REVISION";
+
+/// The engine's commit: `STUDIO_GEARBOX_REV`, else the image's record.
+fn engine_revision() -> Option<String> {
+    std::env::var("STUDIO_GEARBOX_REV")
+        .ok()
+        .or_else(|| std::fs::read_to_string(ENGINE_REVISION_FILE).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// `gearbox 0.1.0` with its commit: `gearbox 0.1.0-ea964f9`, so two images
+/// with the same crate version say which engine each runs.
+fn with_revision(version: &str, revision: Option<&str>) -> String {
+    match revision {
+        Some(rev) if !version.contains(&rev[..rev.len().min(7)]) => {
+            format!("{version}-{}", &rev[..rev.len().min(7)])
+        }
+        _ => version.to_string(),
     }
 }
 
@@ -2716,6 +3066,42 @@ mod tests {
         v.iter().map(|s| (*s).to_string()).collect()
     }
 
+    #[test]
+    fn a_brief_says_what_the_catalogue_proves_in_a_person_s_names() {
+        let raw = json!({"gears": {
+            "authn-resolver": {"display_name": "Sign-in", "description": " ", "category": "security"},
+            "static-authn-plugin": {"display_name": "Static sign-in", "maturity": "beta"}
+        }});
+        let c = catalogue();
+        let host = gear_brief(&c, &raw, "cf-gears-authn-resolver").expect("found by crate");
+        assert_eq!(host.id, "authn-resolver");
+        assert_eq!(host.display_name.as_deref(), Some("Sign-in"));
+        // A blank description is none.
+        assert_eq!(host.description, None);
+        assert_eq!(host.category.as_deref(), Some("security"));
+        assert_eq!(host.points, names(&["cf-gears-authn-resolver-sdk"]));
+        let mut plugins = host.plugins.clone();
+        plugins.sort();
+        assert_eq!(
+            plugins,
+            names(&["Static sign-in", "cf-gears-oidc-authn-plugin"])
+        );
+        assert_eq!(host.host, None);
+
+        let plugin = gear_brief(&c, &raw, "static-authn-plugin").expect("found by id");
+        assert_eq!(plugin.host.as_deref(), Some("Sign-in"));
+        assert_eq!(plugin.maturity.as_deref(), Some("beta"));
+        assert!(gear_brief(&c, &raw, "nothing").is_none());
+    }
+
+    #[test]
+    fn a_readme_is_never_read_from_outside_the_corpus() {
+        let dir = Path::new("/no-such-corpus");
+        assert_eq!(read_readme(dir, "../etc", 100), None);
+        assert_eq!(read_readme(dir, "/etc", 100), None);
+        assert_eq!(read_readme(dir, "gears/x/Cargo.toml", 100), None);
+    }
+
     /// A product with an audit store, and a candidate that brings its own.
     fn audited() -> EngineCatalogue {
         serde_json::from_value(json!({"gears": {
@@ -2754,6 +3140,29 @@ mod tests {
                 contract: "audit/AuditLog@v1".into(),
                 already: vec!["cf-gears-audit".into()],
                 brought: vec!["cf-gears-billing-audit".into()],
+            }]
+        );
+    }
+
+    /// #744: two gears the candidate brings that provide one contract are an
+    /// overlap too, with nothing of it in the product yet.
+    #[test]
+    fn two_gears_a_candidate_brings_for_one_contract_overlap() {
+        let catalogue: EngineCatalogue = serde_json::from_value(json!({"gears": {
+            "ledger": {"id": "ledger", "package": {"crate_name": "cf-gears-ledger"},
+                       "provides": [{"contract": "audit/AuditLog@v1"}],
+                       "colocated_deps": ["ledger-audit"]},
+            "ledger-audit": {"id": "ledger-audit", "package": {"crate_name": "cf-gears-ledger-audit"},
+                             "provides": [{"contract": "audit/AuditLog@v1"}]}
+        }}))
+        .expect("fixture parses");
+        let b = brings(&catalogue, &[], "cf-gears-ledger", &GearConfig::new());
+        assert_eq!(
+            b.overlaps,
+            vec![Overlap {
+                contract: "audit/AuditLog@v1".into(),
+                already: vec![],
+                brought: vec!["cf-gears-ledger".into(), "cf-gears-ledger-audit".into()],
             }]
         );
     }
@@ -3384,10 +3793,17 @@ mod tests {
     #[test]
     fn from_a_projects_own_repository_the_sdk_is_in_the_checkout_beside_it() {
         assert_eq!(
-            sdk_path_beside("gears", "gears/system/x-sdk"),
+            sdk_path_beside("gears", "gears-rust", "gears/system/x-sdk"),
             "../../../gears-rust/gears/system/x-sdk"
         );
-        assert_eq!(sdk_path_beside("", "x-sdk"), "../../gears-rust/x-sdk");
+        assert_eq!(
+            sdk_path_beside("", "gears-rust", "x-sdk"),
+            "../../gears-rust/x-sdk"
+        );
+        assert_eq!(
+            sdk_path_beside("", "gears-bss", "x-sdk"),
+            "../../gears-bss/x-sdk"
+        );
     }
 
     #[test]
@@ -3564,6 +3980,7 @@ mod tests {
                 git_ref: String::new(),
             },
             connection_id: Some(uuid::Uuid::new_v4()),
+            organization: false,
         }
     }
 
@@ -3588,27 +4005,89 @@ mod tests {
         g.use_repositories(vec![core.clone(), bss.clone()]);
         assert_eq!(ids(&g), ["gears-core", "gears-bss"]);
         assert!(!g.roots_due());
-        assert!(g.is_corpus_repo("constructorfabric/gears-bss"));
-        assert!(!g.is_corpus_repo("MikeFalcon77/gears-rust"));
+        assert!(g.is_corpus_repo(None, "constructorfabric/gears-bss"));
+        assert!(!g.is_corpus_repo(None, "MikeFalcon77/gears-rust"));
         let generation = g.roots.lock().expect("roots").generation;
 
         // The same list again is not a change: nothing is checked out afresh.
         g.use_repositories(vec![core.clone(), bss.clone()]);
         assert_eq!(g.roots.lock().expect("roots").generation, generation);
         // Another order is: the engine's order decides which declaration wins.
-        g.use_repositories(vec![bss, core]);
+        g.use_repositories(vec![bss.clone(), core]);
         assert_eq!(g.roots.lock().expect("roots").generation, generation + 1);
+        // Removed and added again as it was: another connection, so another
+        // root -- its status must name the connection that exists.
+        let again = repo_root(
+            "gears-core",
+            "https://github.com/constructorfabric/gears-core.git",
+        );
+        g.use_repositories(vec![bss, again.clone()]);
+        assert_eq!(g.roots.lock().expect("roots").generation, generation + 2);
+        assert_eq!(g.roots()[1].connection_id, again.connection_id);
 
         g.use_repositories(Vec::new());
         assert_eq!(ids(&g), ["gears-rust"]);
     }
 
     #[test]
+    fn an_organization_reads_the_platforms_repositories_then_its_own() {
+        let g = Gearbox::new(config("https://github.com/MikeFalcon77/gears-rust.git"));
+        let core = repo_root(
+            "gears-core",
+            "https://github.com/constructorfabric/gears-core.git",
+        );
+        g.use_repositories(vec![core.clone()]);
+        let acme = uuid::Uuid::new_v4();
+        let other = uuid::Uuid::new_v4();
+        assert!(g.org_roots_due(acme));
+
+        // With none of its own, an organization reads the platform's corpus,
+        // under the platform's scope: one checkout, one catalogue.
+        g.use_org_repositories(acme, Vec::new());
+        assert!(!g.org_roots_due(acme));
+        assert_eq!(g.view(Some(acme)).scope, None);
+
+        let own = repo_root("acme-gears", "https://github.com/acme/gears.git");
+        let clash = repo_root("gears-core", "https://github.com/acme/core.git");
+        g.use_org_repositories(acme, vec![own.clone(), clash]);
+        let view = g.view(Some(acme));
+        assert_eq!(view.scope, Some(acme));
+        let ids: Vec<&str> = view.roots.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, ["gears-core", "acme-gears"]);
+        // A root whose id the platform already has is left out, and said so.
+        assert_eq!(view.shadowed, ["gears-core"]);
+        assert!(view.roots[1].organization && !view.roots[0].organization);
+        // Another organization still reads only the platform's.
+        assert_eq!(g.roots_in(Some(other)).len(), 1);
+        assert!(g.is_corpus_repo(Some(acme), "acme/gears"));
+        assert!(!g.is_corpus_repo(None, "acme/gears"));
+
+        // The relay finds a root by id, in the scope that reads it only.
+        let (url, _) = g
+            .corpus_fetch(Some(acme), Some("acme-gears"))
+            .expect("acme's");
+        assert_eq!(url, "https://github.com/acme/gears.git");
+        assert!(g.corpus_fetch(Some(other), Some("acme-gears")).is_none());
+        assert_eq!(
+            g.corpus_fetch(None, None).map(|(u, _)| u),
+            Some("https://github.com/constructorfabric/gears-core.git".to_string())
+        );
+
+        // A change on either side is a new generation of the merged view.
+        let before = g.view(Some(acme)).generation;
+        g.use_repositories(vec![core]);
+        assert_eq!(g.view(Some(acme)).generation, before);
+        g.use_org_repositories(acme, vec![own]);
+        assert_ne!(g.view(Some(acme)).generation, before);
+    }
+
+    #[test]
     fn without_a_corpus_or_a_gear_repository_there_is_nothing_to_read() {
         let g = Gearbox::new(config(""));
         assert!(g.roots().is_empty());
-        assert_eq!(g.corpus_label(), "no gear repository");
-        assert_eq!(g.corpus_origin(), (String::new(), String::new(), false));
+        assert_eq!(g.corpus_label(None), "no gear repository");
+        assert_eq!(g.corpus_origin(None), (String::new(), String::new(), false));
+        assert_eq!(g.corpus_fetch(None, None), None);
     }
 
     #[test]
@@ -3649,5 +4128,22 @@ mod tests {
             "{gdl}"
         );
         assert!(gdl.contains("gearbox resolve --root ../../../gears-core --root ../../../gears-security --product"), "{gdl}");
+    }
+
+    #[test]
+    fn the_engines_version_says_which_commit_it_was_built_from() {
+        assert_eq!(
+            with_revision(
+                "gearbox 0.1.0",
+                Some("ea964f94a59627ab818f4215d8251cbd64db098d")
+            ),
+            "gearbox 0.1.0-ea964f9"
+        );
+        assert_eq!(with_revision("gearbox 0.1.0", None), "gearbox 0.1.0");
+        // An engine that names its commit itself is left as it says.
+        assert_eq!(
+            with_revision("gearbox 0.2.0 (ea964f9)", Some("ea964f94a5")),
+            "gearbox 0.2.0 (ea964f9)"
+        );
     }
 }

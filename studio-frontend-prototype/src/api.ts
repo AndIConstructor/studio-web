@@ -23,6 +23,7 @@ import type { Report, ReportSchedule, ReportSource, ReportSourceInput } from "./
 import { sectionBody, type MirrorSummary, type Plan, type PlanPeople, type PlanSection } from "./plan-model";
 import type { DomainEntity } from "./domain-model.gen";
 import type { DomainQuery, DomainQueryResult } from "./domain-query";
+import type { SpecModelBuildEstimate } from "./build-eta";
 
 // Minimal typed client for the studio-backend REST API (/cf prefix).
 // The live OpenAPI contract is /cf/openapi.json, shown grouped by component
@@ -105,6 +106,31 @@ export interface MemberDirectory {
 
 /** Somebody the caller shares an organization with, as any member sees them
  *  (ADR-0036): no addresses and no sign-ins. One row per organization. */
+/** An entity of the domain model as a person edits it on the tab. */
+export interface SpecModelEntityEdit {
+  name: string;
+  definition?: string | null;
+  fields: { name: string; meaning: string }[];
+  relations: { verb: string; target: string }[];
+}
+
+/** Where a change to the documents landed. */
+export interface SpecModelWrite {
+  path: string;
+  branch: string;
+  commit_sha: string;
+  pr_url?: string | null;
+}
+
+/** The pull request that renames a word across the documents. */
+export interface GlossaryRenameProposal {
+  files: string[];
+  renamed: number;
+  branch: string;
+  commit_sha: string;
+  pr_url?: string | null;
+}
+
 /** An organization's logo, as `GET …/organizations/{id}/logo` answers. */
 export interface OrganizationLogo {
   content_type: string;
@@ -426,6 +452,9 @@ export interface OrgGearRepository {
   branch: string;
   set_by?: string | null;
   set_at?: string | null;
+  /** Taken from the organization's Sources (ADR-0046 phase 3): its gear
+   *  repository marked for new gears, changed there. */
+  from_sources?: boolean;
 }
 
 /** `GET /registry/gear-repository`: the setting, and whether the caller may
@@ -503,8 +532,12 @@ export interface RegistryDecisionInput {
   replaced_by?: string;
   merge_into?: string;
   version?: string;
-  /** For `publish` only: answer `publish_preview`, write and record nothing. */
+  /** For `publish` and `extract` only: answer `publish_preview` or
+   *  `extract_preview`, write and record nothing. */
   dry_run?: boolean;
+  /** For `publish` only: the platform's gear repository it goes into, by
+   *  source id (ADR-0046 phase 4); the server's pick when absent. */
+  target?: string;
 }
 
 /** An organization's request that the platform take one of its gears
@@ -543,6 +576,12 @@ export interface RegistryPublishPreview {
   /** Not copied (not text), relative to the gear's directory. */
   skipped: string[];
   title: string;
+  /** The platform's gear repository it goes into, by source id; absent while
+   *  the platform names its repository by a catalogue source. */
+  source_id?: string | null;
+  /** Every platform gear repository it could go into, with how many gears of
+   *  its category each holds (ADR-0046 phase 4). */
+  targets?: { source_id: string; repo: string; gears_in_category: number }[];
 }
 
 /** One component of the organization's registry (ADR-0041). */
@@ -566,6 +605,10 @@ export interface RegistryEntry {
   /** The pull request that gave it to the platform (ADR-0042 §4); the entry
    *  stays `registered` until the platform's catalogue has it. */
   contribution?: RegistryContribution | null;
+  /** Extract (ADR-0044 §1): the two pull requests that move it into the
+   *  organization's gear repository; `completed_at` once both were merged
+   *  and the version tagged (the entry is then `extracted`). */
+  extraction?: RegistryExtraction | null;
   /** The projects that use it without declaring it (ADR-0041 P4). */
   consumers?: RegistryConsumer[];
   /** What a model last proposed for it; never a state change. */
@@ -583,9 +626,53 @@ export interface RegistryEntry {
   occurrences: RegistryOccurrence[];
   /** What a `publish` with `dry_run` would write; absent otherwise. */
   publish_preview?: RegistryPublishPreview | null;
+  /** What an `extract` with `dry_run: true` would write. */
+  extract_preview?: RegistryExtractPreview | null;
 }
 
 /** A gear given to the platform: the pull request into its gear repository. */
+/** A gear leaving its project for the organization's gear repository
+ *  (ADR-0044 §1). */
+export interface RegistryExtraction {
+  crate_name: string;
+  version: string;
+  /** `<gear>/v<version>`, made once both pull requests are merged. */
+  tag: string;
+  gear_repo: string;
+  gear_path: string;
+  gear_pr_url?: string | null;
+  project_id?: string | null;
+  project_name?: string | null;
+  source_repo: string;
+  source_path: string;
+  source_pr_url?: string | null;
+  at: string;
+  by: string;
+  by_name?: string | null;
+  completed_at?: string | null;
+  tagged_commit?: string | null;
+}
+
+/** What Extract would write: an `extract` with `dry_run: true`. */
+export interface RegistryExtractPreview {
+  crate_name: string;
+  version: string;
+  tag: string;
+  gear_repo: string;
+  gear_base: string;
+  gear_path: string;
+  gear_files: string[];
+  source_repo: string;
+  source_base: string;
+  source_files: string[];
+  source_deleted: string[];
+  /** `extract/<name>`, in both. */
+  branch: string;
+  skipped: string[];
+  /** The new crate's `Cargo.toml`, as written. */
+  manifest?: string | null;
+}
+
 export interface RegistryContribution {
   repo: string;
   /** `contribute/<organization>/<name>`. */
@@ -791,6 +878,8 @@ export interface ProjectConfig {
   brief?: string;
   /** The project's repositories: the one record of them (`project-sources.ts`). */
   sources?: import("./project-sources").ProjectSource[];
+  /** The CI workflow that builds the product (ADR-0045): Build starts it. */
+  build?: { repo: string; workflow: string };
 }
 
 // Workspace settings live as AM tenant metadata (schema seeded by the backend config).
@@ -2621,6 +2710,9 @@ export interface GearboxStatus {
   /** Every gear repository the engine reads, in its order (ADR-0046): the
    *  platform's, or the deployment's corpus while it has none. */
   sources?: GearboxSource[];
+  /** The organization's repositories left out: a platform repository has
+   *  the same source id. */
+  shadowed?: string[];
 }
 
 /** One gear repository as the engine last read it. */
@@ -2634,6 +2726,8 @@ export interface GearboxSource {
   gears: number;
   /** The gear repository connection; absent for the deployment's corpus. */
   connection_id?: string | null;
+  /** The platform's, or the organization's own (ADR-0046 phase 3). */
+  tier?: "platform" | "organization";
 }
 
 export interface GearboxDiagnostic {
@@ -2677,6 +2771,18 @@ export interface GearConfigField {
   default?: unknown;
   /** Written by generation from the topology (an address); not the product's. */
   derived: boolean;
+}
+
+/** An organization's plain explanation of a gear: what it is, what a
+ *  product gets from it, when to pick it. `generated` by a model, or
+ *  `edited` by a person -- a model never writes over a person's words unless
+ *  asked to. */
+export interface GearExplanation {
+  /** The gear's engine id, as the catalogue keys it. */
+  gear_id: string;
+  text: string;
+  source: "generated" | "edited";
+  updated_at: string;
 }
 
 /** A gear's config schema, keyed by the name it was asked for. */
@@ -2804,6 +2910,13 @@ export interface SpecQualityVerdict {
   recognised?: boolean | null;
   /** What the detector found, each placed in the text. */
   findings?: SpecFindingItem[];
+}
+
+/** `path` naming the organization on screen, for a route that keeps data per
+ *  organization; `path` itself when none is known. The path stays one literal,
+ *  so the application map (scripts/prototype-api-map.mjs) reads it whole. */
+function withOrganization(path: string): string {
+  return `${path}${orgQuery(currentOrganization, path.includes("?") ? "&" : "?")}`;
 }
 
 /** `?organization_id=` for a reports call, or nothing when no organization is known. */
@@ -2934,12 +3047,22 @@ export const api = {
     request<SpecModel>(`/studio-documents/v1/spec-model?project_id=${encodeURIComponent(projectId)}`, token),
   /** Read every document not yet read at its revision, on the caller's own
    *  model key, in the background. A build already running is answered with
-   *  its state. */
-  startSpecModelBuild: (token: string, projectId: string) =>
+   *  its state. With `path`, that one document is read again and only its
+   *  facts are replaced. */
+  startSpecModelBuild: (token: string, projectId: string, path?: string) =>
     request<SpecModelBuild>("/studio-documents/v1/spec-model/builds", token, {
       method: "POST",
-      body: JSON.stringify({ project_id: projectId }),
+      body: JSON.stringify(path ? { project_id: projectId, path } : { project_id: projectId }),
     }),
+  /** What a build would read now (or, with `path`, one document again), and
+   *  about how long it would take. No model is called. */
+  specModelBuildEstimate: (token: string, projectId: string, path?: string) =>
+    request<SpecModelBuildEstimate>(
+      `/studio-documents/v1/spec-model/build-estimate?project_id=${encodeURIComponent(projectId)}${
+        path ? `&path=${encodeURIComponent(path)}` : ""
+      }`,
+      token,
+    ),
   /** Where the documents disagree, or refer to what is not there, with each
    *  finding's decision. */
   specModelFindings: (token: string, projectId: string) =>
@@ -3059,6 +3182,14 @@ export const api = {
       token,
       { method: "POST", body: JSON.stringify({ project_id: projectId, key, ...decision }) },
     ),
+  /** Propose a glossary rename in the documents: every whole-word use of
+   *  `from` in their prose becomes `to`, in one pull request. */
+  proposeGlossaryRename: (token: string, projectId: string, from: string, to: string) =>
+    request<GlossaryRenameProposal>(
+      `/studio-documents/v1/spec-model/glossary/proposals?project_id=${encodeURIComponent(projectId)}`,
+      token,
+      { method: "POST", body: JSON.stringify({ from, to }) },
+    ),
   /** A member's ✓ (confirmed) or ✗ (dismissed) on one finding. */
   /** A project's review requests, newest first; one document's with `subjectId`. */
   reviewRequests: (token: string, projectId: string, subjectId?: string) =>
@@ -3111,6 +3242,20 @@ export const api = {
       items: { fingerprint: string; decision: "confirmed" | "dismissed"; decided_by: string; decided_at: string }[];
       total: number;
     }>(`/studio-documents/v1/spec-model/decisions?project_id=${encodeURIComponent(projectId)}`, token),
+  /** Save one entity of the domain model as a person edited it: its section
+   *  of docs/domain-model.md, written the way the repository takes changes. */
+  saveSpecModelEntity: (token: string, projectId: string, entity: SpecModelEntityEdit) =>
+    request<SpecModelWrite>(`/studio-documents/v1/spec-model/entities?project_id=${encodeURIComponent(projectId)}`, token, {
+      method: "POST",
+      body: JSON.stringify(entity),
+    }),
+  /** Propose a finding's fix as a pull request on the document it names. */
+  proposeSpecModelFix: (token: string, projectId: string, fingerprint: string) =>
+    request<SpecModelWrite>(
+      `/studio-documents/v1/spec-model/findings/${encodeURIComponent(fingerprint)}/proposals?project_id=${encodeURIComponent(projectId)}`,
+      token,
+      { method: "POST" },
+    ),
   decideSpecModelFinding: (
     token: string,
     projectId: string,
@@ -3635,7 +3780,7 @@ export const api = {
   patchConnection: (
     token: string,
     id: string,
-    input: { label?: string; base_url?: string; token?: string },
+    input: { label?: string; base_url?: string; token?: string; options?: Record<string, string> },
     tenantId?: string,
   ) =>
     request<ConnectionTest>(
@@ -4444,6 +4589,15 @@ export const api = {
     );
   },
 
+  /** Build in CI (ADR-0045 phase 3): start the project's build workflow, or
+   *  the one named, on a ref or the repository's branch. */
+  dispatchBuild: (token: string, projectId: string, body: { repo?: string; workflow?: string; ref?: string }) =>
+    request<{ repo: string; workflow: string; ref: string }>(
+      `/studio-artifact-ingest/v1/projects/${encodeURIComponent(projectId)}/builds/dispatch`,
+      token,
+      { method: "POST", body: JSON.stringify(body) },
+    ),
+
   /** Relations between ingested nodes (authored_by / modifies / …), optionally
    * scoped to a tenant (both endpoints must be in-scope). */
   artifactEdges: async (token: string, scope?: string) => ({
@@ -4977,9 +5131,40 @@ export const api = {
       `/studio-product/v1/gearbox/catalogue`,
       token,
     ),
+  /** The organization's plain explanations of gears, by engine id. Kept
+   *  per organization: the one on screen is named. `may_manage`: the caller
+   *  may change them (an organization or platform administrator). */
+  gearExplanations: (token: string) =>
+    request<{ items: GearExplanation[]; total: number; may_manage?: boolean }>(
+      withOrganization(`/studio-product/v1/gear-explanations`),
+      token,
+    ),
+  /** Keep a person's explanation of a gear (marked `edited`). */
+  updateGearExplanation: (token: string, gearId: string, text: string) =>
+    request<GearExplanation>(
+      withOrganization(`/studio-product/v1/gear-explanations/${encodeURIComponent(gearId)}`),
+      token,
+      { method: "PUT", body: JSON.stringify({ text }) },
+    ),
+  /** Have a model explain a gear on the caller's own key, and keep it. 400
+   *  `EXPLANATION_EDITED` over a person's words unless `force`; 400
+   *  `PROVIDER_KEY_REQUIRED` without a model key. */
+  generateGearExplanation: (token: string, gearId: string, force = false) =>
+    request<GearExplanation>(
+      withOrganization(`/studio-product/v1/gear-explanations/${encodeURIComponent(gearId)}/generations`),
+      token,
+      { method: "POST", body: JSON.stringify({ force }) },
+    ),
   /** Whether product previews can run, and against which gear corpus. */
-  gearboxStatus: (token: string, refresh = false) =>
-    request<GearboxStatus>(`/studio-product/v1/gearbox${refresh ? "?refresh=true" : ""}`, token),
+  /** `organizationId`: that organization's corpus -- the platform's gear
+   *  repositories, then its own (ADR-0046 phase 3). */
+  gearboxStatus: (token: string, refresh = false, organizationId?: string) => {
+    const q = [
+      refresh ? "refresh=true" : "",
+      organizationId ? `organization_id=${encodeURIComponent(organizationId)}` : "",
+    ].filter(Boolean);
+    return request<GearboxStatus>(`/studio-product/v1/gearbox${q.length ? `?${q.join("&")}` : ""}`, token);
+  },
   /** Compose a product.gdl from picked gears and resolve it with the Gearbox
    *  engine. `write` also commits it to the project's repository -- where its
    *  source's share mode says (onto the base branch, or a `product/…` branch

@@ -108,6 +108,24 @@ pub fn engine(hub: &ClientHub) -> Option<Arc<Gearbox>> {
     hub.get::<Gearbox>().ok()
 }
 
+/// Which corpus a request in `tenant` reads (ADR-0046): its organization's --
+/// the platform's gear repositories, then the organization's own, read into
+/// the engine when due -- or the platform's when `tenant` is in none. The
+/// caller has already shown that `ctx` reaches `tenant`.
+pub async fn engine_scope(
+    hub: &Arc<ClientHub>,
+    ctx: &SecurityContext,
+    tenant: Uuid,
+) -> super::gearbox::Scope {
+    let gearbox = engine(hub)?;
+    let am = hub
+        .get::<dyn account_management_sdk::AccountManagementClient>()
+        .ok()?;
+    let org = crate::organizations::sdk::organization_of(am.as_ref(), ctx, tenant).await;
+    let connectors = crate::connectors::sdk::Connectors::new(Arc::clone(hub));
+    super::gear_roots::scope_for(&gearbox, &connectors, ctx, org, false).await
+}
+
 /// `router` with the platform's gear repositories read into the engine on the
 /// way into a route that may run it (ADR-0046). A gear whose routes use the
 /// engine wraps them with this; without an engine it is `router` unchanged.
@@ -201,6 +219,96 @@ pub trait GearDeclarations: Send + Sync {
         files: &[DeclarationFile],
         text: &PullRequestText,
     ) -> anyhow::Result<DeclarationWritten>;
+}
+
+/// How another gear writes into a project's repository, the one its product
+/// description goes to: read a file there, and commit files the way the
+/// repository takes changes (its source's `share_mode`), or always as a
+/// pull request when what is written is only a proposal.
+#[async_trait]
+pub trait ProjectFiles: Send + Sync {
+    /// `path`'s text on the repository's base branch; `None` when absent.
+    async fn read(
+        &self,
+        ctx: &SecurityContext,
+        project_id: &str,
+        path: &str,
+    ) -> anyhow::Result<Option<String>>;
+
+    /// Commit `files`. With `propose`, or when the repository takes changes
+    /// as pull requests, they go on `branch` with a pull request; when it
+    /// takes them straight onto its branch, they are committed there.
+    async fn write(
+        &self,
+        ctx: &SecurityContext,
+        project_id: &str,
+        branch: &str,
+        files: &[DeclarationFile],
+        text: &PullRequestText,
+        propose: bool,
+    ) -> anyhow::Result<DeclarationWritten>;
+}
+
+/// studio-product's [`ProjectFiles`]: its own project writer.
+pub struct Files {
+    service: Arc<super::service::ProductService>,
+}
+
+impl Files {
+    pub(super) fn new(service: Arc<super::service::ProductService>) -> Self {
+        Self { service }
+    }
+}
+
+#[async_trait]
+impl ProjectFiles for Files {
+    async fn read(
+        &self,
+        ctx: &SecurityContext,
+        project_id: &str,
+        path: &str,
+    ) -> anyhow::Result<Option<String>> {
+        self.service.read_project_file(ctx, project_id, path).await
+    }
+
+    async fn write(
+        &self,
+        ctx: &SecurityContext,
+        project_id: &str,
+        branch: &str,
+        files: &[DeclarationFile],
+        text: &PullRequestText,
+        propose: bool,
+    ) -> anyhow::Result<DeclarationWritten> {
+        let onto_base = !propose
+            && matches!(
+                self.service.write_share_mode(ctx, project_id).await,
+                Some(crate::project_sources::ShareMode::Branch)
+            );
+        let files: Vec<super::scaffold::ScaffoldFile> = files
+            .iter()
+            .map(|f| super::scaffold::ScaffoldFile {
+                path: f.path.clone(),
+                content: f.content.clone(),
+            })
+            .collect();
+        let w = self
+            .service
+            .write_to_project_repo(
+                ctx,
+                project_id,
+                (!onto_base).then_some(branch),
+                &files,
+                &text.message,
+                (!onto_base).then_some(text.title.as_str()),
+            )
+            .await?;
+        Ok(DeclarationWritten {
+            branch: w.branch,
+            commit_sha: w.commit_sha,
+            pr_url: w.pr_url,
+        })
+    }
 }
 
 /// studio-product's [`GearDeclarations`]: the skeleton's manifest, the
@@ -307,6 +415,37 @@ pub trait GearContributions: Send + Sync {
         files: &[DeclarationFile],
         text: &PullRequestText,
     ) -> anyhow::Result<DeclarationWritten>;
+
+    /// [`Self::contribute`], with `deleted` removed in the same commit: the
+    /// pull request Extract opens into the project a gear leaves
+    /// (ADR-0044). A writer that cannot delete refuses one that would.
+    async fn contribute_changes(
+        &self,
+        ctx: &SecurityContext,
+        target: &RepositoryTarget,
+        branch: &str,
+        files: &[DeclarationFile],
+        deleted: &[String],
+        text: &PullRequestText,
+    ) -> anyhow::Result<DeclarationWritten> {
+        if deleted.is_empty() {
+            return self.contribute(ctx, target, branch, files, text).await;
+        }
+        anyhow::bail!("this writer cannot delete files")
+    }
+
+    /// Tag the tip of the target's base branch as `tag` (Extract's version,
+    /// `<gear>/vX.Y.Z`); answers the commit tagged. A tag already there is
+    /// not an error.
+    async fn tag(
+        &self,
+        ctx: &SecurityContext,
+        target: &RepositoryTarget,
+        tag: &str,
+    ) -> anyhow::Result<String> {
+        let _ = (ctx, target, tag);
+        anyhow::bail!("this writer cannot create tags")
+    }
 }
 
 /// studio-product's [`GearContributions`]: the scaffold's writer.
@@ -346,6 +485,42 @@ impl GearContributions for Contributions {
             commit_sha: w.commit_sha,
             pr_url: w.pr_url,
         })
+    }
+
+    async fn contribute_changes(
+        &self,
+        ctx: &SecurityContext,
+        target: &RepositoryTarget,
+        branch: &str,
+        files: &[DeclarationFile],
+        deleted: &[String],
+        text: &PullRequestText,
+    ) -> anyhow::Result<DeclarationWritten> {
+        let files: Vec<super::scaffold::ScaffoldFile> = files
+            .iter()
+            .map(|f| super::scaffold::ScaffoldFile {
+                path: f.path.clone(),
+                content: f.content.clone(),
+            })
+            .collect();
+        let w = self
+            .service
+            .write_changes_to_repository(ctx, target, branch, &files, deleted, text)
+            .await?;
+        Ok(DeclarationWritten {
+            branch: w.branch,
+            commit_sha: w.commit_sha,
+            pr_url: w.pr_url,
+        })
+    }
+
+    async fn tag(
+        &self,
+        ctx: &SecurityContext,
+        target: &RepositoryTarget,
+        tag: &str,
+    ) -> anyhow::Result<String> {
+        self.service.tag_repository(ctx, target, tag).await
     }
 }
 
@@ -436,7 +611,8 @@ impl GearScaffolds for Scaffolds {
         gear: &NewGear,
     ) -> Result<ScaffoldOutcome, ScaffoldFailure> {
         let gearbox = engine(&self.hub);
-        let files = super::new_gear::files(gearbox.as_deref(), &target.repo, gear).await?;
+        let scope = engine_scope(&self.hub, ctx, ctx.subject_tenant_id()).await;
+        let files = super::new_gear::files(gearbox.as_deref(), scope, &target.repo, gear).await?;
         let listed: Vec<DeclarationFile> = files
             .iter()
             .map(|f| DeclarationFile {

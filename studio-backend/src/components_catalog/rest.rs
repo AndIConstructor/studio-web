@@ -480,6 +480,9 @@ pub struct ProjectComponentDto {
     pub owners: Vec<String>,
     pub last_change: Option<String>,
     pub open_pulls: u32,
+    /// `open_pulls` is a lower bound: the repository has more open pull
+    /// requests, or one with more files, than one read returns.
+    pub open_pulls_partial: bool,
     /// `ready`, `caution` or `not_ready`.
     pub readiness: String,
     pub reasons: Vec<String>,
@@ -505,7 +508,10 @@ const COMPONENT_HISTORY_MAX: usize = 25;
 const OPEN_PULL_FILES_QUERY: &str = r#"
 query($owner: String!, $name: String!) {
   repository(owner: $owner, name: $name) {
-    pullRequests(states: OPEN, first: 50) { nodes { files(first: 100) { nodes { path } } } }
+    pullRequests(states: OPEN, first: 50) {
+      pageInfo { hasNextPage }
+      nodes { files(first: 100) { pageInfo { hasNextPage } nodes { path } } }
+    }
   }
 }
 "#;
@@ -578,47 +584,30 @@ async fn list_project_components(
             })
             .collect();
         let found = detect(&source.repo, &paths, &gear_dirs);
-        // Open pull requests, once per repository: which files each changes.
-        let open_files: Vec<Vec<String>> = match (source.repo.split_once('/'), source.connection_id)
-        {
-            (Some((owner, name)), Some(connection_id)) => {
-                match connectors
-                    .driver_and_auth(&ctx, source.tenant, connection_id)
-                    .await
-                {
-                    Ok((driver, auth, _)) => driver
-                        .graphql(
-                            &auth,
-                            &serde_json::json!({
-                                "query": OPEN_PULL_FILES_QUERY,
-                                "variables": { "owner": owner, "name": name },
-                            }),
-                        )
+        // Open pull requests, once per repository: which files each changes,
+        // and whether that is all of them.
+        let (open_files, all_read): (Vec<Vec<String>>, bool) =
+            match (source.repo.split_once('/'), source.connection_id) {
+                (Some((owner, name)), Some(connection_id)) => {
+                    match connectors
+                        .driver_and_auth(&ctx, source.tenant, connection_id)
                         .await
-                        .ok()
-                        .and_then(|a| a.pointer("/data/repository/pullRequests/nodes").cloned())
-                        .and_then(|n| n.as_array().cloned())
-                        .unwrap_or_default()
-                        .iter()
-                        .map(|pr| {
-                            pr.pointer("/files/nodes")
-                                .and_then(serde_json::Value::as_array)
-                                .map(|f| {
-                                    f.iter()
-                                        .filter_map(|x| {
-                                            x.get("path").and_then(serde_json::Value::as_str)
-                                        })
-                                        .map(str::to_string)
-                                        .collect()
-                                })
-                                .unwrap_or_default()
-                        })
-                        .collect(),
-                    Err(_) => Vec::new(),
+                    {
+                        Ok((driver, auth, _)) => driver
+                            .graphql(
+                                &auth,
+                                &serde_json::json!({
+                                    "query": OPEN_PULL_FILES_QUERY,
+                                    "variables": { "owner": owner, "name": name },
+                                }),
+                            )
+                            .await
+                            .map_or((Vec::new(), true), |a| super::services::open_pull_files(&a)),
+                        Err(_) => (Vec::new(), true),
+                    }
                 }
-            }
-            _ => Vec::new(),
-        };
+                _ => (Vec::new(), true),
+            };
         for f in found {
             let prefix = if f.dir.is_empty() {
                 String::new()
@@ -666,6 +655,7 @@ async fn list_project_components(
                 days_since_change: days,
                 authors: owners.len(),
                 open_pulls,
+                open_pulls_partial: !all_read,
                 has_tests: f.has_tests,
                 has_readme: f.has_readme,
                 has_contract: !f.contracts.is_empty(),
@@ -682,6 +672,7 @@ async fn list_project_components(
                 owners: owners.into_iter().take(3).collect(),
                 last_change,
                 open_pulls: u32::try_from(open_pulls).unwrap_or(u32::MAX),
+                open_pulls_partial: !all_read,
                 readiness: r.signal.to_string(),
                 reasons: r.reasons,
             });
@@ -1249,8 +1240,9 @@ fn engine_cache_file(gearbox: &Gearbox) -> std::path::PathBuf {
 /// Read the engine's catalogue into the cache, and keep a copy on disk so the
 /// first reference after a restart does not wait for a fetch and an engine run.
 async fn load_engine(gearbox: &Gearbox) -> anyhow::Result<EngineHit> {
-    let (raw, commit) = gearbox.catalogue_json().await?;
-    let mut label = gearbox.corpus_label();
+    // The platform's corpus: the reference is the common set.
+    let (raw, commit) = gearbox.catalogue_json(None).await?;
+    let mut label = gearbox.corpus_label(None);
     if let Some(c) = &commit {
         label = format!("{label} ({})", &c[..c.len().min(7)]);
     }
@@ -1283,7 +1275,7 @@ async fn load_engine_from_disk(gearbox: &Gearbox) -> Option<EngineHit> {
         label: saved
             .get("label")
             .and_then(Value::as_str)
-            .map_or_else(|| gearbox.corpus_label(), str::to_string),
+            .map_or_else(|| gearbox.corpus_label(None), str::to_string),
         at: std::time::Instant::now()
             .checked_sub(ENGINE_TTL)
             .unwrap_or_else(std::time::Instant::now),
@@ -1905,9 +1897,10 @@ pub struct RegistryDecisionDto {
 #[toolkit_macros::api_dto(request)]
 pub struct RegistryDecisionRequest {
     /// `register`, `reject`, `deprecate`, `restore`, `request_publication`,
-    /// `publish`, `decline_publication`, `mark_published`, `merge` or `edit`.
-    /// `publish`, `decline_publication` and `mark_published` are a platform
-    /// curator's; the rest an organization administrator's.
+    /// `publish`, `decline_publication`, `mark_published`, `merge`, `edit`,
+    /// `extract` or `complete_extraction` (ADR-0044). `publish`,
+    /// `decline_publication` and `mark_published` are a platform curator's;
+    /// the rest an organization administrator's.
     pub action: String,
     /// Why. Required to reject; for `publish`, said in the pull request.
     pub reason: Option<String>,
@@ -1924,9 +1917,14 @@ pub struct RegistryDecisionRequest {
     /// For `request_publication`: the version asked for; for
     /// `mark_published`: the version the platform published.
     pub version: Option<String>,
-    /// For `publish` only: answer the target repository, branch, path and
-    /// files in `publish_preview`, writing and recording nothing.
+    /// For `publish` and `extract` only: answer what would be written (in
+    /// `publish_preview` or `extract_preview`), writing and recording
+    /// nothing.
     pub dry_run: Option<bool>,
+    /// For `publish` only: which of the platform's gear repositories it goes
+    /// into, by source id (ADR-0046 phase 4). Absent: the one holding most
+    /// gears of the entry's category, as `publish_preview.targets` shows.
+    pub target: Option<String>,
 }
 
 /// One component of the organization's registry.
@@ -1936,9 +1934,9 @@ pub struct RegistryEntryDto {
     pub name: String,
     /// `gear`, `plugin`, `frontx` or `kit`.
     pub kind: String,
-    /// `candidate`, `declared`, `registered`, `published`, `rejected`,
-    /// `deprecated` or `merged`. A walk writes `declared` and never moves it;
-    /// the rest are people's decisions.
+    /// `candidate`, `declared`, `registered`, `extracted`, `published`,
+    /// `rejected`, `deprecated` or `merged`. A walk writes `declared` and
+    /// never moves it; the rest are people's decisions.
     pub state: String,
     pub description: Option<String>,
     pub category: Option<String>,
@@ -1956,6 +1954,10 @@ pub struct RegistryEntryDto {
     /// `publish` decision opened one; it stays `registered` until the
     /// platform's catalogue has it.
     pub contribution: Option<RegistryContributionDto>,
+    /// Extract (ADR-0044 §1): the two pull requests that move it into the
+    /// organization's gear repository; `completed_at` once both were merged
+    /// and the version tagged (the entry is then `extracted`).
+    pub extraction: Option<RegistryExtractionDto>,
     /// The projects that use it without declaring it (P4): by a Cargo
     /// dependency of their code, by their product's picks, or both.
     pub consumers: Vec<RegistryConsumerDto>,
@@ -1978,6 +1980,63 @@ pub struct RegistryEntryDto {
     pub decisions: Option<Vec<RegistryDecisionDto>>,
     /// What a `publish` with `dry_run: true` would write; null otherwise.
     pub publish_preview: Option<RegistryPublishPreviewDto>,
+    /// What an `extract` with `dry_run: true` would write; null otherwise.
+    pub extract_preview: Option<RegistryExtractPreviewDto>,
+}
+
+/// A gear leaving its project (ADR-0044 §1).
+#[derive(Debug, Clone, PartialEq)]
+#[toolkit_macros::api_dto(response)]
+pub struct RegistryExtractionDto {
+    pub crate_name: String,
+    pub version: String,
+    /// `<gear>/v<version>`, made once both pull requests are merged.
+    pub tag: String,
+    /// The organization's gear repository, `owner/name`, and the crate's
+    /// directory there.
+    pub gear_repo: String,
+    pub gear_path: String,
+    pub gear_pr_url: Option<String>,
+    /// The project it leaves.
+    pub project_id: Option<Uuid>,
+    pub project_name: Option<String>,
+    pub source_repo: String,
+    pub source_path: String,
+    pub source_pr_url: Option<String>,
+    /// RFC 3339; who opened it.
+    pub at: String,
+    pub by: String,
+    pub by_name: Option<String>,
+    /// RFC 3339: when both were merged and the version tagged.
+    pub completed_at: Option<String>,
+    pub tagged_commit: Option<String>,
+}
+
+/// What Extract would write: the answer of an `extract` with `dry_run: true`.
+#[derive(Debug, Clone, PartialEq)]
+#[toolkit_macros::api_dto(response)]
+pub struct RegistryExtractPreviewDto {
+    pub crate_name: String,
+    pub version: String,
+    pub tag: String,
+    /// The organization's gear repository, its base branch, and the files
+    /// written there.
+    pub gear_repo: String,
+    pub gear_base: String,
+    pub gear_path: String,
+    pub gear_files: Vec<String>,
+    /// The project's repository, its base branch, the files changed there
+    /// and the files deleted.
+    pub source_repo: String,
+    pub source_base: String,
+    pub source_files: Vec<String>,
+    pub source_deleted: Vec<String>,
+    /// `extract/<name>`, in both.
+    pub branch: String,
+    /// What is not moved (not text).
+    pub skipped: Vec<String>,
+    /// The new crate's `Cargo.toml`, as written.
+    pub manifest: Option<String>,
 }
 
 /// What publishing would write into the platform's gear repository: the
@@ -1999,6 +2058,24 @@ pub struct RegistryPublishPreviewDto {
     pub skipped: Vec<String>,
     /// The pull request's title.
     pub title: String,
+    /// The platform's gear repository it goes into, by source id; absent
+    /// while the platform names its gear repository the old way (a catalogue
+    /// source).
+    pub source_id: Option<String>,
+    /// Every gear repository of the platform it could go into, with how many
+    /// gears of the entry's category each holds (ADR-0046 phase 4).
+    pub targets: Vec<RegistryPublishTargetDto>,
+}
+
+/// One of the platform's gear repositories a published gear can go into.
+#[derive(Debug, Clone, PartialEq)]
+#[toolkit_macros::api_dto(response)]
+pub struct RegistryPublishTargetDto {
+    pub source_id: String,
+    /// `owner/name`.
+    pub repo: String,
+    /// Gears of the entry's category the engine found in it.
+    pub gears_in_category: u32,
 }
 
 /// A gear given to the platform: the pull request into the platform's gear
@@ -2189,6 +2266,7 @@ pub(crate) fn registry_entry_dto(e: super::registry::RegistryEntry) -> RegistryE
         merged_into: e.entry.merged_into,
         replaced_by: e.entry.replaced_by,
         version: e.entry.version,
+        extraction: e.entry.extraction.map(extraction_dto),
         contribution: e.entry.contribution.map(|c| RegistryContributionDto {
             repo: c.repo,
             branch: c.branch,
@@ -2240,6 +2318,56 @@ pub(crate) fn registry_entry_dto(e: super::registry::RegistryEntry) -> RegistryE
             .collect(),
         decisions: None,
         publish_preview: None,
+        extract_preview: None,
+    }
+}
+
+/// An extraction as the registry routes answer it.
+pub(crate) fn extraction_dto(x: super::registry::Extraction) -> RegistryExtractionDto {
+    RegistryExtractionDto {
+        crate_name: x.crate_name,
+        version: x.version,
+        tag: x.tag,
+        gear_repo: x.gear_repo,
+        gear_path: x.gear_path,
+        gear_pr_url: x.gear_pr_url,
+        project_id: x.project_id,
+        project_name: x.project_name,
+        source_repo: x.source_repo,
+        source_path: x.source_path,
+        source_pr_url: x.source_pr_url,
+        at: x.at,
+        by: x.by,
+        by_name: x.by_name,
+        completed_at: x.completed_at,
+        tagged_commit: x.tagged_commit,
+    }
+}
+
+/// An extraction's plan as a dry run answers it.
+pub(crate) fn extract_preview_dto(
+    p: super::registry_extract::ExtractPlan,
+) -> RegistryExtractPreviewDto {
+    let manifest_path = format!("{}/Cargo.toml", p.extraction.gear_path);
+    RegistryExtractPreviewDto {
+        manifest: p
+            .gear_files
+            .iter()
+            .find(|f| f.path == manifest_path)
+            .map(|f| f.content.clone()),
+        crate_name: p.extraction.crate_name,
+        version: p.extraction.version,
+        tag: p.extraction.tag,
+        gear_repo: p.gear_target.repo,
+        gear_base: p.gear_target.base_branch,
+        gear_path: p.extraction.gear_path,
+        gear_files: p.gear_files.into_iter().map(|f| f.path).collect(),
+        source_repo: p.source_target.repo,
+        source_base: p.source_target.base_branch,
+        source_files: p.source_files.into_iter().map(|f| f.path).collect(),
+        source_deleted: p.source_deleted,
+        branch: p.extraction.gear_branch,
+        skipped: p.skipped,
     }
 }
 
@@ -2255,6 +2383,16 @@ pub(crate) fn publish_preview_dto(
         files: p.files.into_iter().map(|f| f.path).collect(),
         skipped: p.skipped,
         title: p.text.title,
+        source_id: p.source_id,
+        targets: p
+            .targets
+            .into_iter()
+            .map(|t| RegistryPublishTargetDto {
+                source_id: t.source_id,
+                repo: t.repo,
+                gears_in_category: u32::try_from(t.gears_in_category).unwrap_or(u32::MAX),
+            })
+            .collect(),
     }
 }
 
@@ -2314,7 +2452,12 @@ fn decision_input(body: RegistryDecisionRequest) -> super::registry_decisions::D
         merge_into: body.merge_into,
         version: body.version,
         contribution: None,
+        extraction: None,
         dry_run: body.dry_run.unwrap_or(false),
+        target: body
+            .target
+            .map(|t| t.trim().to_owned())
+            .filter(|t| !t.is_empty()),
     }
 }
 
@@ -2800,14 +2943,23 @@ pub(super) async fn decide_as(
             .create());
     }
     let org = ctx.subject_tenant_id();
-    if input.dry_run && action != Some(super::registry_decisions::Action::Publish) {
+    if input.dry_run && !matches!(action, Some(Action::Publish | Action::Extract)) {
         return Err(StudioComponentsCatalogError::invalid_argument()
             .with_field_violation(
                 "dry_run",
-                "only a publish has a dry run; every other decision is recorded as made",
+                "only a publish or an extract has a dry run; every other decision is recorded as made",
                 "INVALID",
             )
             .create());
+    }
+    // Extract opens two pull requests, and completing it checks them and
+    // tags the version (ADR-0044 §1).
+    match action {
+        Some(Action::Extract) => return extract::extract(catalog, ctx, name, &input).await,
+        Some(Action::CompleteExtraction) => {
+            return extract::complete(catalog, ctx, name, &input).await;
+        }
+        _ => {}
     }
     // Publishing opens a pull request into the platform (ADR-0042 §4), and
     // only on the organization's request.
@@ -3149,6 +3301,9 @@ mod curation;
 
 #[path = "registry_readiness_rest.rs"]
 mod readiness_routes;
+
+#[path = "registry_extract_rest.rs"]
+mod extract;
 
 #[cfg(test)]
 #[path = "sources_rest_tests.rs"]
@@ -4161,8 +4316,12 @@ mod registry_dto_tests {
     #[test]
     fn a_refused_move_says_which_states_the_action_applies_to() {
         use crate::components_catalog::registry_decisions::DecisionError;
-        assert_eq!(allowed_from("publish"), "registered");
-        assert_eq!(allowed_from("deprecate"), "registered, published");
+        assert_eq!(allowed_from("publish"), "registered, extracted");
+        assert_eq!(
+            allowed_from("deprecate"),
+            "registered, extracted, published"
+        );
+        assert_eq!(allowed_from("complete_extraction"), "registered");
         let problem = decision_problem(DecisionError::Illegal {
             action: "publish".into(),
             from: "declared".into(),

@@ -11,7 +11,7 @@
 
 use std::sync::Arc;
 
-use axum::extract::Query;
+use axum::extract::{Path, Query};
 use axum::http::HeaderMap;
 use axum::{Extension, Router};
 use serde_json::Value;
@@ -583,6 +583,201 @@ fn token_refused(refused: &super::service::TokenRefused) -> CanonicalError {
     StudioArtifactIngestError::failed_precondition()
         .with_precondition_violation(subject, refused.to_string(), CONNECTION_NOT_OWNED)
         .create()
+}
+
+// ── Builds (ADR-0045 phases 2 and 3) ─────────────────────────────────────────
+
+/// One report of a build the IDE ran: its start, or its end.
+#[derive(Debug)]
+#[toolkit_macros::api_dto(request)]
+pub struct BuildReportRequest {
+    /// The IDE's id for the build, the same at its start and its end: 8 to 64
+    /// letters, digits and hyphens.
+    pub build_id: String,
+    /// `desktop` | `session`.
+    pub r#where: String,
+    /// `build` (default) | `run`.
+    #[serde(default)]
+    pub action: Option<String>,
+    /// `running` | `passed` | `failed` | `cancelled`.
+    pub status: String,
+    #[serde(default)]
+    pub product: Option<String>,
+    #[serde(default)]
+    pub profile: Option<String>,
+    /// `owner/repo` of the repository the product lives in.
+    #[serde(default)]
+    pub repository: Option<String>,
+    #[serde(default)]
+    pub commit: Option<String>,
+    #[serde(default)]
+    pub branch: Option<String>,
+    /// The `product.lock` hash.
+    #[serde(default)]
+    pub lock_hash: Option<String>,
+    /// RFC 3339; the server's clock when absent from a start.
+    #[serde(default)]
+    pub started_at: Option<String>,
+    /// RFC 3339; the server's clock when absent from an end.
+    #[serde(default)]
+    pub finished_at: Option<String>,
+    /// The first error, when it failed.
+    #[serde(default)]
+    pub failure: Option<String>,
+    /// The step it failed in.
+    #[serde(default)]
+    pub failure_step: Option<String>,
+    /// The images it built.
+    #[serde(default)]
+    pub outputs: Vec<String>,
+}
+
+/// What Build asks CI for.
+#[derive(Debug)]
+#[toolkit_macros::api_dto(request)]
+pub struct BuildDispatchRequest {
+    /// `owner/repo`: one of the project's repositories. Default: the
+    /// project's build workflow's.
+    #[serde(default)]
+    pub repo: Option<String>,
+    /// The workflow's file (`build.yml`) or id. Default: the project's build
+    /// workflow.
+    #[serde(default)]
+    pub workflow: Option<String>,
+    /// Branch or tag. Default: the repository's branch in the project, else
+    /// its default branch.
+    #[serde(default, rename = "ref")]
+    pub git_ref: Option<String>,
+}
+
+/// Where Build started a run.
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+pub struct BuildDispatchedDto {
+    pub repo: String,
+    pub workflow: String,
+    #[serde(rename = "ref")]
+    pub git_ref: String,
+}
+
+fn build_problem(e: super::builds::BuildRefusal) -> CanonicalError {
+    use super::builds::BuildRefusal;
+    match e {
+        BuildRefusal::Invalid(why) => StudioArtifactIngestError::invalid_argument()
+            .with_constraint(why)
+            .create(),
+        BuildRefusal::NotFound(why) => StudioArtifactIngestError::not_found(why)
+            .with_resource("build".to_owned())
+            .create(),
+        BuildRefusal::Finished(why) => StudioArtifactIngestError::failed_precondition()
+            .with_precondition_violation("build".to_owned(), why, "BUILD_FINISHED")
+            .create(),
+        BuildRefusal::NotOwned(n) => StudioArtifactIngestError::failed_precondition()
+            .with_precondition_violation(
+                format!("connection:{}", n.holder),
+                n.to_string(),
+                crate::connectors::sdk::ownership::CONNECTION_NOT_OWNED,
+            )
+            .create(),
+        BuildRefusal::Provider(why) => StudioArtifactIngestError::failed_precondition()
+            .with_precondition_violation("ci".to_owned(), why, "CI_REFUSED")
+            .create(),
+        BuildRefusal::Internal(e) => CanonicalError::internal(format!("{e:#}")).create(),
+    }
+}
+
+/// The project's workspace, read as the caller: `None` (404) when the caller
+/// does not reach the project.
+async fn reachable_project(
+    ingest: &Ingest,
+    ctx: &SecurityContext,
+    project_id: Uuid,
+) -> ApiResult<(
+    Arc<dyn account_management_sdk::AccountManagementClient>,
+    Option<Uuid>,
+)> {
+    let am = ingest
+        .hub
+        .get::<dyn account_management_sdk::AccountManagementClient>()
+        .map_err(|_| {
+            CanonicalError::service_unavailable()
+                .with_detail("account-management is not available")
+                .create()
+        })?;
+    let tenant = am.get_tenant(ctx, project_id).await.map_err(|_| {
+        StudioArtifactIngestError::not_found(format!("project {project_id} is not found"))
+            .with_resource(project_id.to_string())
+            .create()
+    })?;
+    Ok((am, tenant.parent_id.map(|p| p.0)))
+}
+
+async fn report_build(
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(ingest): Extension<Ingest>,
+    Path(project_id): Path<Uuid>,
+    Json(req): Json<BuildReportRequest>,
+) -> ApiResult<JsonBody<ArtifactNodeDto>> {
+    let svc = ingest.get()?;
+    let (_, workspace) = reachable_project(&ingest, &ctx, project_id).await?;
+    let report = super::builds::BuildReport {
+        build_id: req.build_id,
+        r#where: req.r#where,
+        action: req.action,
+        status: req.status,
+        product: req.product,
+        profile: req.profile,
+        repository: req.repository,
+        commit: req.commit,
+        branch: req.branch,
+        lock_hash: req.lock_hash,
+        started_at: req.started_at,
+        finished_at: req.finished_at,
+        failure: req.failure,
+        failure_step: req.failure_step,
+        outputs: req.outputs,
+    };
+    let workspace = workspace.map(|w| w.to_string());
+    let node = svc
+        .record_build(&ctx, &project_id.to_string(), workspace.as_deref(), &report)
+        .await
+        .map_err(build_problem)?;
+    Ok(Json(ArtifactNodeDto {
+        type_id: node.type_id.to_string(),
+        instance_id: node.instance_id,
+        value: node.value,
+    }))
+}
+
+async fn dispatch_build(
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(ingest): Extension<Ingest>,
+    Path(project_id): Path<Uuid>,
+    Json(req): Json<BuildDispatchRequest>,
+) -> ApiResult<(StatusCode, JsonBody<BuildDispatchedDto>)> {
+    let svc = ingest.get()?;
+    let (am, _) = reachable_project(&ingest, &ctx, project_id).await?;
+    let (repo, workflow, git_ref) = svc
+        .dispatch_build(
+            &ctx,
+            am.as_ref(),
+            project_id,
+            &super::builds::BuildDispatch {
+                repo: req.repo,
+                workflow: req.workflow,
+                git_ref: req.git_ref,
+            },
+        )
+        .await
+        .map_err(build_problem)?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(BuildDispatchedDto {
+            repo,
+            workflow,
+            git_ref,
+        }),
+    ))
 }
 
 async fn reconcile(
@@ -1437,6 +1632,94 @@ async fn scoped_values(
 }
 
 /// The same, keeping each node's instance id — what a feed row is keyed on.
+/// One CI run, as the sync kept it.
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+pub struct CiRunDto {
+    pub id: String,
+    pub repo: Option<String>,
+    pub workflow: String,
+    pub workflow_path: Option<String>,
+    pub title: Option<String>,
+    pub event: Option<String>,
+    pub branch: Option<String>,
+    pub sha: String,
+    pub status: Option<String>,
+    pub conclusion: Option<String>,
+    pub url: Option<String>,
+    pub number: Option<i64>,
+    pub created_at: Option<String>,
+    pub updated_at: Option<String>,
+}
+
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+pub struct CiRunListDto {
+    pub items: Vec<CiRunDto>,
+    pub total: u32,
+    /// The newest completed run on a mainline (else the newest completed
+    /// run): what says whether the project's code passes now.
+    pub latest_completed: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct CiRunQuery {
+    pub project_id: String,
+    /// A full or short commit sha.
+    pub revision: Option<String>,
+    pub branch: Option<String>,
+}
+
+fn ci_run_dto(r: super::ci_runs::CiRun) -> CiRunDto {
+    CiRunDto {
+        id: r.id,
+        repo: r.repo,
+        workflow: r.workflow,
+        workflow_path: r.workflow_path,
+        title: r.title,
+        event: r.event,
+        branch: r.branch,
+        sha: r.sha,
+        status: r.status,
+        conclusion: r.conclusion,
+        url: r.url,
+        number: r.number,
+        created_at: r.created_at,
+        updated_at: r.updated_at,
+    }
+}
+
+/// A project's CI runs, by revision or branch, newest first.
+async fn list_ci_runs(
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(ingest): Extension<Ingest>,
+    Query(query): Query<CiRunQuery>,
+) -> ApiResult<JsonBody<CiRunListDto>> {
+    let scope = query.project_id.trim();
+    if scope.is_empty() {
+        return Err(StudioArtifactIngestError::invalid_argument()
+            .with_field_violation("project_id", "required".to_owned(), "REQUIRED")
+            .create());
+    }
+    let service = ingest.get()?;
+    let runs: Vec<super::ci_runs::CiRun> = scoped_entries(service, &ctx, "workflow_run", scope)
+        .await?
+        .iter()
+        .filter_map(|(id, v)| super::ci_runs::run_of(id, v))
+        .collect();
+    let latest = super::ci_runs::latest_completed(&runs).map(|r| r.id.clone());
+    let items: Vec<CiRunDto> =
+        super::ci_runs::filter(runs, query.revision.as_deref(), query.branch.as_deref())
+            .into_iter()
+            .map(ci_run_dto)
+            .collect();
+    Ok(Json(CiRunListDto {
+        total: u32::try_from(items.len()).unwrap_or(u32::MAX),
+        items,
+        latest_completed: latest,
+    }))
+}
+
 async fn scoped_entries(
     service: &Arc<IngestService>,
     ctx: &SecurityContext,
@@ -1481,6 +1764,63 @@ pub fn register_routes(
         .error_401(openapi)
         .error_500(openapi)
         .register(router, openapi);
+
+    let router = OperationBuilder::post("/studio-artifact-ingest/v1/projects/{project_id}/builds")
+        .operation_id("studio_artifact_ingest.report_build")
+        .summary("Record a build the IDE ran: its start, or its end")
+        .description(
+            "ADR-0045 phase 2. The IDE's Build and Run, in a desktop or a session, \
+             report a build's start (`running`) and its end (`passed`, `failed`, \
+             `cancelled`) under one `build_id`; the end lands on the start. The \
+             record is a `build` node in the project's graph, listed by \
+             `GET /nodes?type=build&scope=<project>`. A build that ended is not \
+             changed: a further report is 400 `BUILD_FINISHED`.",
+        )
+        .tag("StudioArtifactIngest")
+        .authenticated()
+        .require_license_features::<License>([])
+        .path_param("project_id", "Project tenant id")
+        .json_request::<BuildReportRequest>(openapi, "The build's start or end")
+        .handler(report_build)
+        .json_response_with_schema::<ArtifactNodeDto>(
+            openapi,
+            StatusCode::OK,
+            "The build as recorded",
+        )
+        .error_400(openapi)
+        .error_401(openapi)
+        .error_404(openapi)
+        .error_500(openapi)
+        .register(router, openapi);
+
+    let router =
+        OperationBuilder::post("/studio-artifact-ingest/v1/projects/{project_id}/builds/dispatch")
+            .operation_id("studio_artifact_ingest.dispatch_build")
+            .summary("Start the project's build workflow in CI")
+            .description(
+                "ADR-0045 phase 3. Starts a run of the project's build workflow \
+                 (`project.config` `build`), or of the workflow and repository the \
+                 request names, through the connection of that project repository \
+                 (`workflow_dispatch`). Only a connection the project's organization \
+                 owns is used (400 `CONNECTION_NOT_OWNED`); the provider's refusal is \
+                 400 `CI_REFUSED`. The run arrives with the next sync.",
+            )
+            .tag("StudioArtifactIngest")
+            .authenticated()
+            .require_license_features::<License>([])
+            .path_param("project_id", "Project tenant id")
+            .json_request::<BuildDispatchRequest>(openapi, "Which workflow, on which ref")
+            .handler(dispatch_build)
+            .json_response_with_schema::<BuildDispatchedDto>(
+                openapi,
+                StatusCode::ACCEPTED,
+                "Started",
+            )
+            .error_400(openapi)
+            .error_401(openapi)
+            .error_404(openapi)
+            .error_500(openapi)
+            .register(router, openapi);
 
     let router = OperationBuilder::post("/studio-artifact-ingest/v1/reconcile")
         .operation_id("studio_artifact_ingest.reconcile_repositories")
@@ -1572,6 +1912,30 @@ pub fn register_routes(
         .error_400(openapi)
         .error_401(openapi)
         .error_500(openapi)
+        .register(router, openapi);
+
+    let router = OperationBuilder::get("/studio-artifact-ingest/v1/runs")
+        .operation_id("studio_artifact_ingest.list_ci_runs")
+        .summary("A project's CI runs, by revision or branch: execution evidence")
+        .description(
+            "The workflow runs the last sync kept for one project (ADR-0045), newest first, \
+             narrowed to a revision (a full or short sha) or a branch: workflow, revision, \
+             branch, status, conclusion and when. `latest_completed` names the newest \
+             completed run on a mainline (main, master, trunk), else the newest completed run \
+             — what a `tests` stage gate reads (issue #783). As fresh as the last sync.",
+        )
+        .tag("StudioArtifactIngest")
+        .authenticated()
+        .require_license_features::<License>([])
+        .query_param("project_id", true, "The project")
+        .query_param("revision", false, "A full or short commit sha")
+        .query_param("branch", false, "A branch name")
+        .handler(list_ci_runs)
+        .json_response_with_schema::<CiRunListDto>(openapi, StatusCode::OK, "The runs")
+        .error_400(openapi)
+        .error_401(openapi)
+        .error_500(openapi)
+        .error_503(openapi)
         .register(router, openapi);
 
     let router = OperationBuilder::get("/studio-artifact-ingest/v1/open-pull-requests")

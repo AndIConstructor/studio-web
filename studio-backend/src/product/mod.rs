@@ -14,6 +14,7 @@
 //! `gear.gdl` says) and a project's gear repository, both through
 //! [`port`].
 
+mod explanations;
 mod gear_roots;
 mod gearbox;
 mod new_gear;
@@ -35,6 +36,10 @@ use tracing::info;
 use types_registry_sdk::{RegisterResult, TypesRegistryClient};
 
 use service::ProductService;
+
+/// The metadata row an organization's plain explanations of gears are kept
+/// in. Only this gear writes it (`studio_authz_plugin::GEAR_HELD_METADATA`).
+pub use explanations::EXPLANATIONS_METADATA_TYPE;
 
 #[toolkit::gear(
     name = "studio-product",
@@ -68,7 +73,7 @@ impl Gear for StudioProductGear {
             // first preview or components reference does not pay for a clone.
             if let Ok(rt) = tokio::runtime::Handle::try_current() {
                 rt.spawn(async move {
-                    if let Err(e) = engine.catalogue_json().await {
+                    if let Err(e) = engine.catalogue_json(None).await {
                         tracing::warn!(error = %format!("{e:#}"), "studio-product: corpus warm-up failed");
                     }
                 });
@@ -108,6 +113,12 @@ impl RestApiCapability for StudioProductGear {
         ctx.client_hub().register::<dyn port::ProjectProducts>(
             Arc::clone(&service) as Arc<dyn port::ProjectProducts>
         );
+        // Writing into a project's repository the way it takes changes, for
+        // the documents gear's domain model (docs/spec-domain-model.md).
+        ctx.client_hub()
+            .register::<dyn port::ProjectFiles>(
+                Arc::new(port::Files::new(Arc::clone(&service))) as Arc<dyn port::ProjectFiles>
+            );
         ctx.client_hub()
             .register::<dyn port::GearDeclarations>(Arc::new(port::Declarations::new(
                 Arc::clone(&service),

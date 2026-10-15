@@ -9,7 +9,9 @@ export const GEAR_REPOSITORY = "gear-repository";
 
 /** One row of the Sources page: the connection, and what the engine read. */
 export interface GearRepositoryRow {
-  connection: Connection;
+  /** The connection; null when the viewer may not read the platform's
+   *  connections and the row comes from what the engine read. */
+  connection: Connection | null;
   sourceId: string;
   /** `owner/repo`. */
   repo: string;
@@ -55,6 +57,27 @@ export function gearRepositoryRows(
       ref: c.options?.ref ?? "",
       read: read.find((s) => s.connection_id === c.id) ?? null,
     }));
+}
+
+/** A tier's gear repositories as the engine read them, for a viewer who may
+ *  not read its connections (every organization's member, for the
+ *  platform's): the same rows, read-only. A source with no tier is the
+ *  platform's (a backend from before ADR-0046 phase 3). */
+export function gearRepositoryRowsFromStatus(
+  status: GearboxStatus | null,
+  tier: "platform" | "organization" = "platform",
+): GearRepositoryRow[] {
+  return (status?.sources ?? [])
+    .filter((s) => !!s.connection_id && (s.tier ?? "platform") === tier)
+    .map((s) => ({ connection: null, sourceId: s.source_id, repo: s.repo, ref: s.git_ref, read: s }));
+}
+
+/** The organization's repository "Create a gear" writes into (ADR-0046
+ *  phase 3): the one marked `create_target`, else the first it added; its
+ *  connection id, or null with none. */
+export function createTargetOf(rows: readonly GearRepositoryRow[]): string | null {
+  const marked = rows.find((r) => r.connection?.options?.create_target === "true");
+  return (marked ?? rows.find((r) => r.connection))?.connection?.id ?? null;
 }
 
 /** While the platform has no gear repository, the engine reads the

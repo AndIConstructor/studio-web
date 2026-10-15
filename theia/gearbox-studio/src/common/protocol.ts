@@ -299,6 +299,15 @@ export interface GearboxService {
     clonePath?: string,
   ): Promise<string | undefined>;
 
+  /**
+   * Constructor Studio: [`useSharedCorpus`] for every gear repository the
+   * backend's corpus reads (ADR-0046), all or none: each becomes a source root,
+   * under its source id, only when every one is here (`fetch` false) or could
+   * be brought (`fetch` true) -- half a corpus would list gears whose hosts
+   * are missing. The directories in order, or `undefined` when one is not.
+   */
+  useSharedCorpora(origins: readonly CorpusOrigin[], fetch: boolean): Promise<string[] | undefined>;
+
   /** Evaluate a `product.gdl`. Evaluation only; nothing is joined against the
    * catalogue. */
   loadProduct(path: string): Promise<ProductLoadResult>;
@@ -717,6 +726,20 @@ export const RemoteCatalogueSource = Symbol.for("gearbox-studio.RemoteCatalogueS
  * proper, where Deploy offers the kube contexts alone.
  */
 export const DeployEnvironmentsSource = Symbol.for("gearbox-studio.DeployEnvironmentsSource");
+
+/**
+ * Constructor Studio: where Build and Run report a build's start and end
+ * (ADR-0045 phase 2), so the project's Builds tab shows what was built on a
+ * member's machine. Bound by the Studio extension, which knows the project a
+ * folder was opened for, holds the member's API token and knows whether this
+ * is a desktop or a session; absent in Gearbox Studio proper, where nothing
+ * is reported.
+ */
+export const BuildReports = Symbol.for("gearbox-studio.BuildReports");
+export interface BuildReports {
+  /** For the project `file` (a product.gdl) belongs to; resolves quietly when it is none of Studio's. */
+  report(file: string, report: import("./build-report").BuildReport): Promise<void>;
+}
 export interface DeployEnvironmentsSource {
   /** For the project `file` (a product.gdl) belongs to; undefined when it is none of Studio's, or signed out. */
   targets(file: string): Promise<DeployTargets | undefined>;
@@ -740,8 +763,12 @@ export interface RemoteCatalogue {
   /** `owner/repo@ref`, as a person reads it. */
   readonly corpus: string;
   readonly gears: readonly GearDescriptor[];
-  /** Where the corpus can be had from, when the backend says. */
+  /** Where the corpus can be had from, when the backend says: its first gear
+   *  repository. */
   readonly origin?: CorpusOrigin;
+  /** Every gear repository the corpus is read from, in the engine's order
+   *  (ADR-0046 phase 2); absent from a backend that names one. */
+  readonly origins?: readonly CorpusOrigin[];
 }
 export interface CorpusOrigin {
   /** The source id its gears name, and the directory a copy is kept under. */

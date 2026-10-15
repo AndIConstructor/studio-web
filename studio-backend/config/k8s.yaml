@@ -39,11 +39,11 @@ database:
         # therefore not "four connections to pg_main" — it is four PER GEAR, and
         # this assembly configures fourteen gear databases: 13 x 4 = 52, plus
         # the gears with their own override below, Keycloak, the bootstrap Job,
-        # the CloudNativePG manager and the reserved slots, 84 in all. A second
-        # replica needs 148, which is why `max_connections` is 150;
+        # the CloudNativePG manager and the reserved slots, 87 in all. A second
+        # replica needs 154, which is why `max_connections` is 160;
         # deploy/k8s/cloudnative-pg/README.md carries the table and the memory
         # that pays for it. Lowering this is not the way to make room (at 3 two
-        # replicas still need 118); raising it by one raises the ceiling by
+        # replicas still need 128); raising it by one raises the ceiling by
         # fourteen, so raise a single gear's own `pool` instead.
         #
         # Keep a run of comment lines under 32: the config's YAML parser
@@ -349,6 +349,15 @@ gears:
             - "$ref": "gts://gts.cf.core.am.tenant_metadata.v1~"
           x-gts-traits:
             inheritance_policy: "override_only"
+        - "$id": "gts://gts.cf.core.am.tenant_metadata.v1~cf.studio.product.gear_explanations.v1~"
+          # Gears in plain words, per organization. Written only by studio-product.
+          "$schema": "http://json-schema.org/draft-07/schema#"
+          description: "Studio gear explanations of an organization (free-form until gears issue #4)"
+          type: "object"
+          allOf:
+            - "$ref": "gts://gts.cf.core.am.tenant_metadata.v1~"
+          x-gts-traits:
+            inheritance_policy: "override_only"
         - "$id": "gts://gts.cf.core.am.tenant_metadata.v1~cf.studio.environment.list.v1~"
           # An organization's deployment environments (ADR-0043): cluster
           # connection, registry, namespace pattern, protection. Written only by
@@ -645,6 +654,38 @@ gears:
         idle_timeout: "5m"
         max_lifetime: "30m"
     config: {}
+
+  # ── usage-collector (the platform's metering store, issue #781) ──
+  # What model calls and IDE sessions use is recorded here by studio-llm-proxy
+  # and studio-session; the records live with the storage plugin below.
+  usage-collector:
+    config:
+      vendor: "constructorfabric"
+
+  # ── postgres-usage-collector-plugin (usage-collector's storage) ──
+  # The TimescaleDB plugin's code on a plain table
+  # (studio-backend/plugins/postgres-usage-collector-plugin/README.md).
+  #
+  # It keeps its own sqlx pool on `database_url` (two connections: setup
+  # holds one under a lock while it uses the other). The `database:` block
+  # names the same database so the bootstrap creates it; its pool is the
+  # toolkit's and stays at one. Without `database_url` the plugin stands
+  # down and nothing is recorded.
+  postgres-usage-collector-plugin:
+    database:
+      server: "pg_main"
+      dbname: "studio_usage"
+      pool:
+        max_conns: 1
+        min_conns: 0
+        acquire_timeout: "10s"
+        idle_timeout: "5m"
+        max_lifetime: "30m"
+    config:
+      database_url: "postgres://${STUDIO_PG_USER}:${STUDIO_PG_PASSWORD}@${STUDIO_PG_HOST}:5432/studio_usage?sslmode=require"
+      pool_size_min: 0
+      pool_size_max: 2
+      vendor: "constructorfabric"
 
   # ── studio-artifact-ingest (the artifact index) ──
   # A mirror of the artifact graph's listing fields — scope, repo, type,

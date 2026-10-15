@@ -138,6 +138,8 @@ pub struct GearRepositorySource {
     pub username: String,
     /// Empty for a public repository. Never logged or returned.
     pub token: String,
+    /// Where "Create a gear" writes in this tenant (ADR-0046 phase 3).
+    pub create_target: bool,
 }
 
 impl std::fmt::Debug for GearRepositorySource {
@@ -267,24 +269,25 @@ fn resolve_base_url(
     Ok(url.as_str().trim_end_matches('/').to_string())
 }
 
-/// Refuse to move a connection to a different address unless its token comes
-/// with the request.
-///
-/// The token is never returned by any route, but it is *used*: a sync clones
-/// from `{base_url}/{repo}.git`, and git hands the credential to whatever host
-/// that names. So a tenant member could point an organization's connection at
-/// a host of their own and read the organization's token out of their own
-/// access log.
-///
-/// The scope guard in `update` does not stop that, and should not: it protects
-/// personal connections only, because a shared connection is shared — everyone
-/// in the tenant may edit it. What must not be shared is the credential, and
-/// the credential is what moving the address gives away.
-///
-/// Requiring the token alongside the address closes it without inventing a
-/// permission. Whoever supplies the credential already holds it, so the move
-/// discloses nothing new — and rotating while relocating is what a real
-/// migration looks like anyway.
+/// Marking a gear repository where "Create a gear" writes unmarks the
+/// tenant's other gear repositories: there is one such place. `keep` is the
+/// connection being marked.
+fn single_create_target(items: &mut [Connection], keep: Uuid) {
+    use super::gear_repository::{OPTION_CREATE_TARGET, PROVIDER, is_create_target};
+    let marked = items
+        .iter()
+        .any(|c| c.id == keep && is_create_target(&c.options));
+    if !marked {
+        return;
+    }
+    for c in items
+        .iter_mut()
+        .filter(|c| c.provider == PROVIDER && c.id != keep)
+    {
+        c.options.remove(OPTION_CREATE_TARGET);
+    }
+}
+
 /// What a refused test is put down to: the credential, unless the connection
 /// may have none -- then it is the repository or the ref that was not there.
 fn refusal(driver: &dyn ConnectorDriver) -> &'static str {
@@ -320,6 +323,24 @@ fn unique_source_id(
     Ok(())
 }
 
+/// Refuse to move a connection to a different address unless its token comes
+/// with the request.
+///
+/// The token is never returned by any route, but it is *used*: a sync clones
+/// from `{base_url}/{repo}.git`, and git hands the credential to whatever host
+/// that names. So a tenant member could point an organization's connection at
+/// a host of their own and read the organization's token out of their own
+/// access log.
+///
+/// The scope guard in `update` does not stop that, and should not: it protects
+/// personal connections only, because a shared connection is shared — everyone
+/// in the tenant may edit it. What must not be shared is the credential, and
+/// the credential is what moving the address gives away.
+///
+/// Requiring the token alongside the address closes it without inventing a
+/// permission. Whoever supplies the credential already holds it, so the move
+/// discloses nothing new — and rotating while relocating is what a real
+/// migration looks like anyway.
 fn address_change_needs_token(
     new_base_url: &str,
     existing_base_url: &str,
@@ -493,6 +514,7 @@ impl ConnectorService {
                 repo: super::gear_repository::repository_of(&c.base_url)?,
                 url,
                 git_ref: c.options.get(OPTION_REF).cloned().unwrap_or_default(),
+                create_target: super::gear_repository::is_create_target(&c.options),
                 username: username.to_string(),
                 token,
             });
@@ -735,6 +757,7 @@ impl ConnectorService {
             options,
         };
         catalogue.items.push(connection.clone());
+        single_create_target(&mut catalogue.items, connection.id);
         self.store(ctx, owner_tenant, &catalogue).await?;
         Ok((connection, identity))
     }
@@ -1006,6 +1029,7 @@ impl ConnectorService {
         // notices until it matters.
         slot.account = identity.account.clone();
         let updated = slot.clone();
+        single_create_target(&mut catalogue.items, updated.id);
         self.store(ctx, owner, &catalogue).await?;
         Ok((updated, identity))
     }
@@ -1095,12 +1119,15 @@ impl ConnectorService {
     /// tenant when none is named -- and its ancestors, nearest first. One
     /// whose token the caller cannot read (somebody else's personal one, a
     /// removed secret) is skipped; it never fails the lookup.
+    ///
+    /// The key comes with the scope of the connection it was read from, so a
+    /// caller can say whose money a call spent (studio-usage, issue #781).
     pub async fn model_key_for(
         &self,
         ctx: &SecurityContext,
         workspace: Option<Uuid>,
         provider: &str,
-    ) -> Option<String> {
+    ) -> Option<ModelKey> {
         let from = workspace.unwrap_or_else(|| ctx.subject_tenant_id());
         let reachable = reachable_connections(self.am.as_ref(), ctx, from).await;
         let candidates = model_key_candidates(reachable, provider, workspace.is_some());
@@ -1426,9 +1453,17 @@ fn model_key_candidates(
     out
 }
 
+/// A model-provider key read from an AI connection, and that connection's
+/// scope (`personal` | `workspace` | `organization`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModelKey {
+    pub token: String,
+    pub scope: String,
+}
+
 /// The first candidate whose token `read` returns, non-blank. A candidate
 /// that cannot be read is skipped, not fatal.
-async fn first_readable<F, Fut>(candidates: Vec<Connection>, read: F) -> Option<String>
+async fn first_readable<F, Fut>(candidates: Vec<Connection>, read: F) -> Option<ModelKey>
 where
     F: Fn(Connection) -> Fut,
     Fut: std::future::Future<Output = anyhow::Result<String>>,
@@ -1436,7 +1471,12 @@ where
     for c in candidates {
         let (label, scope) = (c.label.clone(), c.scope.clone());
         match read(c).await {
-            Ok(token) if !token.trim().is_empty() => return Some(token.trim().to_owned()),
+            Ok(token) if !token.trim().is_empty() => {
+                return Some(ModelKey {
+                    token: token.trim().to_owned(),
+                    scope,
+                });
+            }
             Ok(_) => {}
             Err(error) => tracing::debug!(
                 connection = %label,
@@ -1830,6 +1870,29 @@ mod default_connection_tests {
     }
 
     #[test]
+    fn one_gear_repository_of_a_tenant_is_where_new_gears_go() {
+        let mut a = conn("a", "gear-repository", "organization");
+        a.options = [("create_target".to_string(), "true".to_string())].into();
+        let mut b = conn("b", "gear-repository", "organization");
+        b.options = [("create_target".to_string(), "true".to_string())].into();
+        let other = conn("gh", "github", "organization");
+        let mut items = vec![a.clone(), b.clone(), other];
+        single_create_target(&mut items, b.id);
+        assert!(!items[0].options.contains_key("create_target"));
+        assert_eq!(
+            items[1].options.get("create_target").map(String::as_str),
+            Some("true")
+        );
+        // Saving one that is not marked leaves the marked one alone.
+        let mut items2 = items.clone();
+        single_create_target(&mut items2, a.id);
+        assert_eq!(
+            items2[1].options.get("create_target").map(String::as_str),
+            Some("true")
+        );
+    }
+
+    #[test]
     fn two_gear_repositories_of_a_tenant_never_share_a_source_id() {
         let opts = |id: &str| -> BTreeMap<String, String> {
             [("source_id".to_string(), id.to_string())].into()
@@ -1922,7 +1985,13 @@ mod default_connection_tests {
                 .iter()
                 .map(|l| conn(l, "anthropic", "workspace"))
                 .collect();
-            assert_eq!(first_readable(candidates, &read).await.as_deref(), expected);
+            assert_eq!(
+                first_readable(candidates, &read)
+                    .await
+                    .map(|k| k.token)
+                    .as_deref(),
+                expected
+            );
         }
     }
 
