@@ -114,7 +114,44 @@ export interface SpecModelEntityEdit {
   relations: { verb: string; target: string }[];
 }
 
+import type { SpecModelReview } from "./review-state";
+
+/** A sentence proposed for a document, after the passage at `line` of the
+ *  revision the model read. */
+export interface SpecModelSentence {
+  path: string;
+  revision: string;
+  line: number;
+  sentence: string;
+  /** What it makes better: the pull request's title. */
+  why?: string | null;
+}
+
 /** Where a change to the documents landed. */
+/** One term of the project's glossary document. */
+export interface GlossaryDocRow {
+  term: string;
+  definition: string;
+  aliases: string[];
+  not_same_as: string[];
+  source?: string | null;
+}
+
+/** The glossary the project's documents keep, and where Studio keeps it. */
+export interface GlossaryDoc {
+  found: {
+    path: string;
+    /** The section's heading, for a glossary kept inside another document. */
+    heading?: string | null;
+    line_start: number;
+    line_end: number;
+    /** The whole document is the glossary. */
+    whole: boolean;
+    rows: GlossaryDocRow[];
+  } | null;
+  path: string;
+}
+
 export interface SpecModelWrite {
   path: string;
   branch: string;
@@ -3307,6 +3344,57 @@ export const api = {
       token,
       { method: "POST" },
     ),
+  /** Propose a sentence for one of the project's documents as a pull request:
+   *  a paragraph after the passage at `line`, on the revision the model read. */
+  /** Propose a whole document for the project's repository as a pull
+   *  request: an accepted need, a confirmed prioritisation. */
+  proposeSpecModelFile: (token: string, projectId: string, path: string, content: string, title: string) =>
+    request<SpecModelWrite>(`/studio-documents/v1/spec-model/files/proposals`, token, {
+      method: "POST",
+      body: JSON.stringify({ project_id: projectId, path, content, title }),
+    }),
+  /** The glossary the project's documents keep, read as written. */
+  glossaryDocument: (token: string, projectId: string) =>
+    request<GlossaryDoc>(`/studio-documents/v1/spec-model/glossary/document?project_id=${encodeURIComponent(projectId)}`, token),
+  /** Propose the project's glossary as docs/glossary.md; a glossary kept as
+   *  a section of another document moves there in the same pull request. */
+  proposeGlossaryDocument: (token: string, projectId: string, rows: GlossaryDocRow[]) =>
+    request<SpecModelWrite>(`/studio-documents/v1/spec-model/glossary/document/proposals`, token, {
+      method: "POST",
+      body: JSON.stringify({ project_id: projectId, rows }),
+    }),
+  /** Open an issue in the project's repository for something to decide,
+   *  assigned by GitHub login. */
+  createSpecModelIssue: (token: string, projectId: string, issue: { title: string; body: string; assignees: string[] }) =>
+    request<{ number: number; url?: string | null }>(`/studio-documents/v1/spec-model/issues`, token, {
+      method: "POST",
+      body: JSON.stringify({ project_id: projectId, ...issue }),
+    }),
+  /** Every accept or reject members gave on the facts the model read. */
+  specModelReviews: (token: string, projectId: string) =>
+    request<{ items: SpecModelReview[]; total: number }>(`/studio-documents/v1/spec-model/reviews?project_id=${encodeURIComponent(projectId)}`, token),
+  /** Accept, reject or put back a selection of facts in one action. */
+  reviewSpecModelFacts: (
+    token: string,
+    projectId: string,
+    items: { fact_key: string; state: string; path: string; revision: string; note?: string | null }[],
+  ) =>
+    request<{ items: SpecModelReview[]; total: number }>(`/studio-documents/v1/spec-model/reviews`, token, {
+      method: "POST",
+      body: JSON.stringify({ project_id: projectId, items }),
+    }),
+  /** Say two glossary entries are different things, so they are not offered
+   *  as one thing again. */
+  decideGlossaryDistinct: (token: string, projectId: string, a: string, b: string) =>
+    request<void>(`/studio-documents/v1/spec-model/glossary/distinct`, token, {
+      method: "POST",
+      body: JSON.stringify({ project_id: projectId, a, b }),
+    }),
+  proposeSpecModelSentence: (token: string, projectId: string, proposal: SpecModelSentence) =>
+    request<SpecModelWrite>(`/studio-documents/v1/spec-model/sentences/proposals?project_id=${encodeURIComponent(projectId)}`, token, {
+      method: "POST",
+      body: JSON.stringify(proposal),
+    }),
   decideSpecModelFinding: (
     token: string,
     projectId: string,

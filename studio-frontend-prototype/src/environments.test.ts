@@ -6,6 +6,8 @@ import {
   clusterConnections,
   emptyEnvironment,
   environmentProblem,
+  environmentProblems,
+  environmentsByConnection,
   namespaceFor,
   runningNow,
   slug,
@@ -68,6 +70,22 @@ describe("an environment form", () => {
     expect(environmentProblem({ ...ready, registry: "https://ghcr.io/acme" }, [])).toMatch(/scheme/);
     expect(environmentProblem({ ...ready, projects: [] }, [])).toMatch(/at least one project/);
   });
+
+  it("says everything wrong at once, by field", () => {
+    // The form a person filled in on Dev: a capital, a literal namespace, no cluster.
+    const p = environmentProblems({ ...ready, name: "Test", connection_id: "", namespace_pattern: "studio-web-dev" }, []);
+    expect(Object.keys(p).sort()).toEqual(["connection_id", "name", "namespace_pattern"]);
+    expect(p.namespace_pattern).toMatch(/\{project\}/);
+  });
+});
+
+describe("which environments use a connection", () => {
+  it("lists each connection's environments by name", () => {
+    const m = environmentsByConnection([env(), env({ id: "e2", name: "dev" }), env({ id: "e3", name: "x", connection_id: "c2" })]);
+    expect(m.get("c1")).toEqual(["prod", "dev"]);
+    expect(m.get("c2")).toEqual(["x"]);
+    expect(m.get("c3")).toBeUndefined();
+  });
 });
 
 describe("clusters an environment can name", () => {
@@ -100,5 +118,26 @@ describe("what runs where", () => {
     ];
     expect(runningNow(list).map((d) => d.id)).toEqual(["new", "other-env"]);
     expect(awaitingDecision(list).map((d) => d.id)).toEqual(["waiting"]);
+  });
+});
+
+describe("cluster cards", () => {
+  it("puts each environment and its deploys under its cluster, and keeps the unseen ones", async () => {
+    const { clusterCards } = await import("./environments");
+    const conn = (id: string, label: string) => ({ id, label, base_url: `https://${label}:6443`, provider: "kubernetes", scope: "organization" }) as never;
+    const env = (id: string, name: string, connection_id: string) => ({ id, name, connection_id }) as never;
+    const dep = (environment_id: string, requested_at: string, project_id = "p") =>
+      ({ id: `${environment_id}-${requested_at}`, environment_id, requested_at, state: "succeeded", project_id }) as never;
+    const cards = clusterCards(
+      [conn("c1", "dev-cluster"), conn("c2", "prod-cluster")],
+      [env("e1", "dev", "c1"), env("e2", "stage", "c1"), env("e3", "old", "gone")],
+      [dep("e1", "2026-10-01T00:00:00Z"), dep("e2", "2026-10-05T00:00:00Z"), dep("e3", "2026-09-01T00:00:00Z")],
+    );
+    expect(cards.map((c) => [c.label, c.environments.length, c.deployments.length, c.lastDeploy])).toEqual([
+      ["dev-cluster", 2, 2, "2026-10-05T00:00:00Z"],
+      ["prod-cluster", 0, 0, null],
+      ["A cluster this page cannot see", 1, 1, "2026-09-01T00:00:00Z"],
+    ]);
+    expect(cards[0].running).toHaveLength(2);
   });
 });

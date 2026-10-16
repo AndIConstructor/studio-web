@@ -23,7 +23,13 @@ import { estimateLabel, etaLabel, readFraction, tokensLabel, type SpecModelBuild
 import { ModelMapView, Prose, RequirementsView, ResolveView, SideLink } from "./domain-model-screens";
 import { gearRefs } from "./entity-gears";
 import type { GearDraft } from "./gear-from-entity";
+import { DataTable } from "./data-table";
 import { GlossaryScreen } from "./glossary-screen";
+import { PrioritiesScreen } from "./priorities-screen";
+import type { Obligation } from "./behaviour";
+import { BehaviourScreen, HypothesesScreen, NeedsScreen, RulesScreen } from "./discovery-screens";
+import type { EvidenceState } from "./need-view";
+import { decisionIndex, EVIDENCE_PREFIX, evidenceIndex, FactReviewContext, factKey, reviewIndex, withoutRejected, type FactReview, type SpecModelReview } from "./review-state";
 import { overlaySaved, pruneSaved, savedWrites, withSaved, type SavedEdit } from "./saved-entities";
 import { useGearCatalogue } from "./product-configurator-view";
 import {
@@ -35,11 +41,14 @@ import {
   orderRelated,
   RELATION_LABEL,
   ruleLabel,
+  subjectKey,
   type GlossaryEntry,
   type ProductFinding,
+  type RelatedRequirement,
   type RelatedRequirements,
   type RequirementTraces,
   type SpecModel,
+  type SpecModelFact,
   type SpecModelFinding,
   type SpecRequirements,
   type WorkLinks,
@@ -48,7 +57,7 @@ import {
 } from "./spec-model";
 
 /** The three questions first; the rest stays a click away under More. */
-type View = "resolve" | "map" | "reqs" | "glossary" | "work" | "product" | "elsewhere" | "coverage";
+type View = "resolve" | "map" | "reqs" | "needs" | "hypotheses" | "behaviour" | "rules" | "priorities" | "glossary" | "work" | "product" | "elsewhere" | "coverage";
 
 /** The product findings as read, or why they could not be. */
 type ProductRead = { repo: string | null; items: ProductFinding[] } | { error: string };
@@ -62,11 +71,20 @@ function message(e: unknown): string {
 export function SpecModelTab({
   token,
   projectId,
+  workspaceId,
+  only,
+  orgId,
   onOpenFile,
   onCreateGear,
 }: {
   token: string;
   projectId: string;
+  /** The project's workspace: where a pasted material is kept. */
+  workspaceId?: string;
+  /** The project's Issues tab: the same model, only what there is to decide. */
+  only?: "issues";
+  /** The project's organization: whose members an issue can be assigned to. */
+  orgId?: string;
   /** Open a document in the project's IDE session. */
   onOpenFile?: (path: string) => void;
   /** Open the project's Product tab with a gear for an entity drafted, ready to scaffold. */
@@ -75,7 +93,7 @@ export function SpecModelTab({
   const [model, setModel] = useState<SpecModel | null>(null);
   const [findings, setFindings] = useState<SpecModelFinding[]>([]);
   const [error, setError] = useState<string | null>(null);
-  const [view, setView] = useState<View>("resolve");
+  const [view, setView] = useState<View>(only === "issues" ? "resolve" : "map");
   /** The requirement followed in the Requirements view. */
   const [traced, setTraced] = useState<string | null>(null);
   const [starting, setStarting] = useState(false);
@@ -88,9 +106,17 @@ export function SpecModelTab({
   /** Entities saved this visit, laid over the model until a build reads them,
    *  so the map, the cards and the queue all show a save at once. */
   const [saved, setSaved] = useState<SavedEdit[]>([]);
+  /** Members' accept or reject on each fact: rejected readings leave the
+   *  model, accepted ones are the project's reading. */
+  const [reviews, setReviews] = useState<SpecModelReview[]>([]);
 
   const load = useCallback(async () => {
     try {
+      // A backend from before fact reviews answers 404: nothing is reviewed.
+      void api
+        .specModelReviews(token, projectId)
+        .then((r) => setReviews(r.items))
+        .catch(() => setReviews([]));
       const [m, f, g] = await Promise.all([
         api.specModel(token, projectId),
         api.specModelFindings(token, projectId),
@@ -260,39 +286,171 @@ export function SpecModelTab({
     return write;
   };
 
-  const facts = useMemo(() => overlaySaved(model?.facts ?? [], saved), [model, saved]);
+  const reviewByKey = useMemo(() => reviewIndex(reviews), [reviews]);
+  const evidence = useMemo(() => evidenceIndex(reviews), [reviews]);
+  const decisions = useMemo(() => decisionIndex(reviews), [reviews]);
+  // Stable, so the glossary document is read once per project, not per render.
+  const loadGlossaryDocument = useCallback(() => api.glossaryDocument(token, projectId), [token, projectId]);
+  // Who an issue can go to: the organization's members with a GitHub login
+  // among their confirmed or claimed accounts. Read only where issues are.
+  const [people, setPeople] = useState<{ name: string; login: string }[]>([]);
+  useEffect(() => {
+    if (!orgId || view !== "resolve") return;
+    let live = true;
+    void api
+      .orgMembers(token, orgId)
+      .then((members) =>
+        Promise.all(
+          members.slice(0, 50).map((m) =>
+            api
+              .memberIdentities(token, orgId, m.user_id)
+              .then((ids) => {
+                const gh = ids.aliases.find((a) => a.kind === "github" && a.confidence !== "suggested");
+                return gh ? { name: m.display_name || m.email || gh.external_id, login: gh.external_id } : null;
+              })
+              .catch(() => null),
+          ),
+        ),
+      )
+      .then((list) => live && setPeople(list.filter((p): p is { name: string; login: string } => !!p)))
+      .catch(() => undefined);
+    return () => {
+      live = false;
+    };
+  }, [token, orgId, view]);
+  /** Record a decision kept by key: an excluded obligation, a match across
+   *  projects. `proposed` withdraws it. */
+  const recordDecision = async (key: string, state: string, note: string | null = null, path = "") => {
+    try {
+      await api.reviewSpecModelFacts(token, projectId, [{ fact_key: key, state, path, revision: "", note }]);
+      setReviews((await api.specModelReviews(token, projectId)).items);
+    } catch (e) {
+      setError(message(e));
+    }
+  };
+  const recordEvidence = async (f: SpecModelFact, state: EvidenceState) => {
+    const revision = model?.documents.find((d) => d.path === f.source.path)?.revision ?? "";
+    try {
+      await api.reviewSpecModelFacts(token, projectId, [{ fact_key: `${EVIDENCE_PREFIX}${factKey(f)}`, state: state === "unchecked" ? "proposed" : state, path: f.source.path, revision }]);
+      setReviews((await api.specModelReviews(token, projectId)).items);
+    } catch (e) {
+      setError(message(e));
+    }
+  };
+  const allFacts = useMemo(() => overlaySaved(model?.facts ?? [], saved), [model, saved]);
+  const facts = useMemo(() => withoutRejected(allFacts, reviewByKey), [allFacts, reviewByKey]);
+  const factReview = useMemo<FactReview>(
+    () => ({
+      stateOf: (f) => reviewByKey.get(factKey(f)),
+      reviewedEarlier: (f) => {
+        const r = reviews.find((x) => x.fact_key === factKey(f));
+        const now = model?.documents.find((d) => d.path === f.source.path)?.revision;
+        return !!r && !!r.revision && !!now && r.revision !== now;
+      },
+      rejectedOf: (keys) => allFacts.filter((f) => reviewByKey.get(factKey(f)) === "rejected" && keys.includes(subjectKey(f.subject))),
+      review: async (fs, state) => {
+        const revisionOf = new Map((model?.documents ?? []).map((d) => [d.path, d.revision]));
+        const items = fs.map((f) => ({ fact_key: factKey(f), state, path: f.source.path, revision: revisionOf.get(f.source.path) ?? "" }));
+        try {
+          await api.reviewSpecModelFacts(token, projectId, items);
+          setReviews((await api.specModelReviews(token, projectId)).items);
+        } catch (e) {
+          setError(message(e));
+        }
+      },
+    }),
+    [reviewByKey, reviews, allFacts, model, token, projectId],
+  );
   const writes = useMemo(() => savedWrites(saved), [saved]);
   const entities = useMemo(() => entitiesOf(facts, glossary), [facts, glossary]);
+  // The lines a fact names are the repository's lines only for a document
+  // read at its current revision: a sentence is proposed only there.
+  const revisions = useMemo(
+    () => new Map((model?.documents ?? []).filter((d) => d.state === "extracted").map((d) => [d.path, d.revision])),
+    [model],
+  );
   // Which gear keeps each Domain entity: read when the map is first opened.
   // Without the catalogue no gear is known, so no gap is claimed either.
   const catalogue = useGearCatalogue(token, view === "map");
+
   const index = catalogue && "index" in catalogue ? catalogue.index : null;
   const gears = useMemo(() => (index ? gearRefs(index, ownGears) : null), [index, ownGears]);
   const ordered = useMemo(() => orderFindings(findings), [findings]);
-  const open = ordered.filter((f) => f.decision !== "dismissed").length;
   const line = model ? buildLine(model.build) : "";
 
+  /* Eight tabs, each one question; a tab of two views shows a segment under
+     it. The views themselves are unchanged — only where they are reached. */
+  const tabs: { id: string; label: string; why: string; count: number; views: { id: View; label: string; count: number }[] }[] = [
+    { id: "entities", label: "Entities", why: "what is this application?", count: entities.length, views: [{ id: "map", label: "Entities", count: entities.length }] },
+    {
+      id: "reqs",
+      label: "Requirements",
+      why: "where does each come from, how far did it get?",
+      count: requirements && "items" in requirements ? requirements.total : 0,
+      views: [{ id: "reqs", label: "Requirements", count: requirements && "items" in requirements ? requirements.total : 0 }],
+    },
+    {
+      id: "need",
+      label: "Need",
+      why: "who has which problem, and what is expected to help",
+      count: facts.filter((f) => f.kind === "problem" || f.kind === "outcome" || f.kind === "idea" || f.kind === "benefit").length,
+      views: [
+        { id: "needs", label: "Needs", count: facts.filter((f) => f.kind === "problem" || f.kind === "outcome" || f.kind === "idea").length },
+        { id: "hypotheses", label: "Hypotheses", count: facts.filter((f) => f.kind === "benefit").length },
+      ],
+    },
+    {
+      id: "rules",
+      label: "Rules",
+      why: "what must hold, and what behaviour the documents must answer",
+      count: facts.filter((f) => f.kind === "constraint" && reviewByKey.get(factKey(f)) === "accepted").length + facts.filter((f) => f.kind === "action").length,
+      views: [
+        { id: "rules", label: "Rules", count: facts.filter((f) => f.kind === "constraint" && reviewByKey.get(factKey(f)) === "accepted").length },
+        { id: "behaviour", label: "Behaviour", count: facts.filter((f) => f.kind === "action").length },
+      ],
+    },
+    { id: "priorities", label: "Priorities", why: "what to build first", count: 0, views: [{ id: "priorities", label: "Priorities", count: 0 }] },
+    { id: "glossary", label: "Glossary", why: "the project's words", count: glossary.length, views: [{ id: "glossary", label: "Glossary", count: glossary.length }] },
+    {
+      id: "sources",
+      label: "Sources",
+      why: "what was read, the work that names it, the code, other projects",
+      count: model?.documents.length ?? 0,
+      views: [
+        { id: "coverage", label: "Documents", count: model?.documents.length ?? 0 },
+        { id: "work", label: "Work", count: work && "items" in work ? work.total : 0 },
+        { id: "product", label: "Against the code", count: product && "items" in product ? product.items.length : 0 },
+        { id: "elsewhere", label: "Elsewhere", count: related && "items" in related ? related.total : 0 },
+      ],
+    },
+  ];
+  const tabOf = (v: View) => tabs.find((t) => t.views.some((x) => x.id === v))?.id ?? "entities";
+
   return (
+    <FactReviewContext.Provider value={factReview}>
     <>
-      <h1>Domain model</h1>
+      <h1>{only === "issues" ? "Issues" : "Domain model"}</h1>
       <p className="subtitle">
-        What this project&apos;s documents say the application is — its entities, what they hold, how
-        they relate, what must always be true — each fact with the passage it comes from. And where
-        the documents cannot all be right about it, so it is fixed before someone builds one side.
+        {only === "issues"
+          ? "Everything to decide about the project: what stops a build, what to look at, how the documentation could be better."
+          : "What the project's documents say the application is, each fact with the passage it comes from."}
       </p>
 
       <div className="sm-bar">
-        <div className="sm-views dm-views" role="tablist">
-          <ViewTab id="resolve" view={view} setView={setView} label="To resolve" count={open} why="can we build from these documents?" />
-          <ViewTab id="map" view={view} setView={setView} label="Model map" count={entities.length} why="what is this application?" />
-          <ViewTab
-            id="reqs"
-            view={view}
-            setView={setView}
-            label="Requirements"
-            count={requirements && "items" in requirements ? requirements.total : 0}
-            why="where does it come from, how far did it get?"
-          />
+        <div className="dm-tabs" role="tablist" aria-label="Domain model" hidden={only === "issues"}>
+          {tabs.map((t) => (
+            <button
+              key={t.id}
+              type="button"
+              role="tab"
+              aria-selected={tabOf(view) === t.id}
+              className={`dm-tabbtn${tabOf(view) === t.id ? " on" : ""}`}
+              onClick={() => setView(t.views[0].id)}
+              title={t.why}
+            >
+              {t.label} <span className="chip-n">{t.count}</span>
+            </button>
+          ))}
         </div>
         <div className="sm-build">
           {line && <span className={model?.build.error ? "sm-build-line sm-err" : "sm-build-line"}>{line}</span>}
@@ -322,27 +480,17 @@ export function SpecModelTab({
           </button>
         </div>
       </div>
-
-      <div className="dm-more" role="tablist" aria-label="More">
-        <span className="hint">More:</span>
-        <ViewChip id="glossary" view={view} setView={setView} label="Glossary" count={glossary.length} />
-        <ViewChip id="work" view={view} setView={setView} label="Work" count={work && "items" in work ? work.total : 0} />
-        <ViewChip
-          id="product"
-          view={view}
-          setView={setView}
-          label="Against the code"
-          count={product && "items" in product ? product.items.length : 0}
-        />
-        <ViewChip
-          id="elsewhere"
-          view={view}
-          setView={setView}
-          label="Elsewhere"
-          count={related && "items" in related ? related.total : 0}
-        />
-        <ViewChip id="coverage" view={view} setView={setView} label="Documents" count={model?.documents.length ?? 0} />
-      </div>
+      {only !== "issues" && (tabs.find((t) => t.id === tabOf(view))?.views.length ?? 0) > 1 && (
+        <div className="dm-seg" role="tablist" aria-label="Views">
+          {tabs
+            .find((t) => t.id === tabOf(view))!
+            .views.map((v) => (
+              <button key={v.id} type="button" role="tab" aria-pressed={view === v.id} onClick={() => setView(v.id)}>
+                {v.label} <span className="chip-n">{v.count}</span>
+              </button>
+            ))}
+        </div>
+      )}
 
       {error && <div className="error">{error}</div>}
       {!model && !error && <div className="empty">Loading…</div>}
@@ -363,6 +511,15 @@ export function SpecModelTab({
           onSave={saveEntity}
           onSameThing={(alias, of) => decideTerm(alias, { name: null, alias_of: of })}
           onPropose={(f) => api.proposeSpecModelFix(token, projectId, f.fingerprint)}
+          onProposeSentence={(sentence) => api.proposeSpecModelSentence(token, projectId, sentence)}
+          revisions={revisions}
+          people={people}
+          issueOf={(key) => (decisions.get(`iss:${key}`)?.state === "opened" ? decisions.get(`iss:${key}`)?.note ?? null : null)}
+          onCreateIssue={async (key, issue) => {
+            const made = await api.createSpecModelIssue(token, projectId, issue);
+            if (made.url) await recordDecision(`iss:${key}`, "opened", made.url);
+            return made;
+          }}
           onTrace={(id) => {
             setTraced(id);
             setView("reqs");
@@ -384,13 +541,91 @@ export function SpecModelTab({
       {view === "reqs" && (
         <RequirementsView read={requirements} traces={traces} work={work} selected={traced} onSelect={setTraced} onOpenFile={onOpenFile} />
       )}
-      {view === "elsewhere" && <Elsewhere read={related} onOpenFile={onOpenFile} />}
+      {model && view === "needs" && (
+        <NeedsScreen
+          facts={facts}
+          onOpenFile={onOpenFile}
+          accepted={(f) => reviewByKey.get(factKey(f)) === "accepted"}
+          onAddMaterial={
+            workspaceId
+              ? async (title, content) => {
+                  const doc = await api.createProjectDocument(token, workspaceId, projectId, {
+                    type_key: "material",
+                    title,
+                    content: `# ${title}
+
+## Source
+
+${title}
+
+## Material
+
+${content}
+`,
+                  });
+                  // Read at once, on the key of whoever added it: no separate start.
+                  await startBuild(`studio:${doc.id}`);
+                }
+              : undefined
+          }
+          onPropose={(content) => api.proposeSpecModelFile(token, projectId, "docs/discovery.md", content, "the need as accepted in Studio")}
+          requirements={
+            requirements && "items" in requirements
+              ? requirements.items.filter((r) => ["fr", "usecase", "flow"].includes((r.kind ?? "").toLowerCase()))
+              : []
+          }
+        />
+      )}
+      {model && view === "hypotheses" && (
+        <HypothesesScreen
+          facts={facts}
+          stateOf={(f) => (evidence.get(factKey(f)) as EvidenceState | undefined) ?? "unchecked"}
+          onEvidence={recordEvidence}
+          onOpenFile={onOpenFile}
+        />
+      )}
+      {model && view === "rules" && (
+        <RulesScreen facts={facts} accepted={(f) => reviewByKey.get(factKey(f)) === "accepted"} onOpenFile={onOpenFile} />
+      )}
+      {model && view === "behaviour" && (
+        <BehaviourScreen
+          facts={facts}
+          decisionOf={(key) => decisions.get(key)}
+          onExclude={(o: Obligation, reason) => recordDecision(o.key, reason === null ? "proposed" : "excluded", reason, o.from.source.path)}
+          onOpenFile={onOpenFile}
+        />
+      )}
+      {view === "priorities" && (
+        <PrioritiesScreen
+          read={requirements}
+          projectId={projectId}
+          onConfirm={(content) => api.proposeSpecModelFile(token, projectId, "docs/priorities.md", content, "the priorities as confirmed in Studio")}
+          onTrace={(id) => {
+            setTraced(id);
+            setView("reqs");
+          }}
+        />
+      )}
+      {view === "elsewhere" && (
+        <Elsewhere
+          read={related}
+          onOpenFile={onOpenFile}
+          decisionOf={(r) => decisions.get(relatedKey(r))?.state}
+          onDecide={(r, state) => recordDecision(relatedKey(r), state, null, r.defined_in.path)}
+        />
+      )}
       {model && view === "glossary" && (
         <GlossaryScreen
           entries={glossary}
           entities={entities}
           onDecide={decideTerm}
           onProposeRename={(from, to) => api.proposeGlossaryRename(token, projectId, from, to)}
+          onProposeSentence={(sentence) => api.proposeSpecModelSentence(token, projectId, sentence)}
+          onDistinct={(a, b) => api.decideGlossaryDistinct(token, projectId, a, b).catch((e: unknown) => setError(message(e)))}
+          onOpenFile={onOpenFile}
+          revisions={revisions}
+          onLoadDocument={loadGlossaryDocument}
+          onProposeDocument={(rows) => api.proposeGlossaryDocument(token, projectId, rows)}
         />
       )}
       {view === "work" && <Work read={work} onOpenFile={onOpenFile} />}
@@ -399,58 +634,11 @@ export function SpecModelTab({
         <Coverage model={model} busy={running || starting} onRebuild={(path) => void startBuild(path)} />
       )}
     </>
+    </FactReviewContext.Provider>
   );
 }
 
-function ViewTab({
-  id,
-  view,
-  setView,
-  label,
-  count,
-  why,
-}: {
-  id: View;
-  view: View;
-  setView: (v: View) => void;
-  label: string;
-  count: number;
-  /** The question the view answers. */
-  why: string;
-}) {
-  return (
-    <button role="tab" aria-selected={view === id} className={view === id ? "dm-tab on" : "dm-tab"} onClick={() => setView(id)}>
-      <b>{label}</b> <span className="chip-n">{count}</span>
-      <span className="dm-why">{why}</span>
-    </button>
-  );
-}
 
-function ViewChip({
-  id,
-  view,
-  setView,
-  label,
-  count,
-}: {
-  id: View;
-  view: View;
-  setView: (v: View) => void;
-  label: string;
-  count: number;
-}) {
-  return (
-    <button
-      role="tab"
-      aria-selected={view === id}
-      className={view === id ? "chip on" : "chip"}
-      onClick={() => setView(id)}
-    >
-      {label}
-      <span className="chip-n">{count}</span>
-    </button>
-  );
-}
 
 function AgainstTheCode({
   read,
@@ -482,29 +670,38 @@ function AgainstTheCode({
         The documents against the crates <code>{read.repo}</code> depends on and the gears it declares.
         A decision about which gear fills a capability is taken in the project&apos;s Product tab.
       </p>
-      {read.items.map((f) => (
-        <div key={f.fingerprint} className={`card sm-finding sm-${f.severity}`}>
-          <div className="card-head">
+      <div className="card">
+        <DataTable<ProductFinding>
+          list="dm-against-code"
+          urlPrefix="code."
+          rows={read.items}
+          rowKey={(f) => f.fingerprint}
+          rowLabel={(f) => f.capability}
+          pageSize={20}
+          search={{ placeholder: "Search capabilities" }}
+          searchText={(f) => [f.capability, f.message, f.gear]}
+          empty={{ title: "Nothing matches." }}
+          columns={[
+            { id: "sev", header: "Severity", cell: (f) => <span className={`sm-sev sm-sev-${f.severity}`}>{f.severity}</span> },
+            { id: "rule", header: "What", cell: (f) => ruleLabel(f.rule) },
+            { id: "cap", header: "Capability", compare: (a, b) => a.capability.localeCompare(b.capability), cell: (f) => <code>{f.capability}</code> },
+            { id: "docs", header: "Documents", num: true, cell: (f) => f.sides.length },
+          ]}
+          expand={(f) => (
             <div>
-              <span className={`sm-sev sm-sev-${f.severity}`}>{f.severity}</span>{" "}
-              <strong>{ruleLabel(f.rule)}</strong> <code>{f.capability}</code>
+              <p className="sm-message">
+                <Prose text={f.message} />
+              </p>
+              <div className={f.sides.length === 2 ? "sm-sides sm-two" : "sm-sides"}>
+                {f.sides.slice(0, 6).map((sd, k) => (
+                  <SideLink key={k} side={{ path: sd.path, quote: sd.quote }} onOpenFile={sd.kind === "file" ? onOpenFile : undefined} />
+                ))}
+                {f.sides.length > 6 && <div className="hint">and {f.sides.length - 6} more documents</div>}
+              </div>
             </div>
-          </div>
-          <p className="sm-message">
-            <Prose text={f.message} />
-          </p>
-          <div className={f.sides.length === 2 ? "sm-sides sm-two" : "sm-sides"}>
-            {f.sides.slice(0, 6).map((s, i) => (
-              <SideLink
-                key={i}
-                side={{ path: s.path, quote: s.quote }}
-                onOpenFile={s.kind === "file" ? onOpenFile : undefined}
-              />
-            ))}
-            {f.sides.length > 6 && <div className="hint">and {f.sides.length - 6} more documents</div>}
-          </div>
-        </div>
-      ))}
+          )}
+        />
+      </div>
     </div>
   );
 }
@@ -537,16 +734,31 @@ function Work({
   return (
     <>
       <p className="hint">{summary} A piece of work is linked when its title, text or commit message names the identifier.</p>
-      <ul className="rows sm-work">
-        {read.items.map((l) => (
-          <li key={l.id} className="sm-work-row">
-            <div className="sm-term-head">
-              <code>{l.id}</code>
-              <SideLink side={l.defined_in} onOpenFile={onOpenFile} />
-            </div>
+      <div className="card">
+        <DataTable<WorkLinks["items"][number]>
+          list="dm-work"
+          urlPrefix="work."
+          rows={read.items}
+          rowKey={(l) => l.id}
+          rowLabel={(l) => l.id}
+          pageSize={20}
+          search={{ placeholder: "Search identifiers and work" }}
+          searchText={(l) => [l.id, ...l.work.map((w) => w.title)]}
+          empty={{ title: "Nothing matches." }}
+          columns={[
+            { id: "id", header: "Identifier", compare: (a, b) => a.id.localeCompare(b.id), cell: (l) => <code>{l.id}</code> },
+            { id: "where", header: "Defined in", cell: (l) => <SideLink side={l.defined_in} onOpenFile={onOpenFile} /> },
+            { id: "work", header: "Work", num: true, compare: (a, b) => a.work.length - b.work.length, cell: (l) => l.work.length },
+            {
+              id: "latest",
+              header: "Named by",
+              cell: (l) => <span className="sub">{l.work.slice(0, 2).map((w) => workLabel(w)).join(", ")}{l.work.length > 2 ? " …" : ""}</span>,
+            },
+          ]}
+          expand={(l) => (
             <ul className="sm-work-items">
-              {l.work.map((w, i) => (
-                <li key={i}>
+              {l.work.map((w, k) => (
+                <li key={k}>
                   {w.url ? (
                     <a href={w.url} target="_blank" rel="noreferrer">
                       {workLabel(w)}
@@ -554,14 +766,13 @@ function Work({
                   ) : (
                     <span>{workLabel(w)}</span>
                   )}{" "}
-                  <span className="sm-work-title">{w.title}</span>{" "}
-                  {workState(w) && <span className="sm-status">{workState(w)}</span>}
+                  <span className="sm-work-title">{w.title}</span> {workState(w) && <span className="sm-status">{workState(w)}</span>}
                 </li>
               ))}
             </ul>
-          </li>
-        ))}
-      </ul>
+          )}
+        />
+      </div>
     </>
   );
 }
@@ -569,12 +780,26 @@ function Work({
 /** What other projects of the organization require that reads like this
  *  project's requirements: the same, overlapping, or the opposite. A list of
  *  candidates to read side by side; nothing is decided here. */
+/** A match across projects as its decision is kept. */
+const relatedKey = (r: RelatedRequirement) => `rel:${r.id}|${r.other_project_id}|${r.other_id}`;
+
+const MATCH_DECISIONS: { state: string; label: string; why: string }[] = [
+  { state: "reuse", label: "Reuse it", why: "The other project's functionality serves this need: use it rather than build it again" },
+  { state: "coordinate", label: "Coordinate", why: "Related work: keep the two projects in step" },
+  { state: "separate", label: "Keep separate", why: "Alike in words, different in what it does or for whom" },
+  { state: "unrelated", label: "Unrelated", why: "Not the same functionality at all" },
+];
+
 function Elsewhere({
   read,
   onOpenFile,
+  decisionOf,
+  onDecide,
 }: {
   read: RelatedRequirements | { error: string } | null;
   onOpenFile?: (path: string) => void;
+  decisionOf?: (r: RelatedRequirement) => string | undefined;
+  onDecide?: (r: RelatedRequirement, state: string) => Promise<void>;
 }) {
   if (read === null) return <div className="empty">Comparing with the organization&apos;s other projects…</div>;
   if ("error" in read) return <div className="error">{read.error}</div>;
@@ -594,33 +819,85 @@ function Elsewhere({
         {read.truncated ? " (the first 40)" : ""}, by the words two statements share. Read both before deciding
         anything: a pair here is a question, not a finding.
       </p>
-      <ul className="rows sm-work">
-        {orderRelated(read.items).map((r, i) => (
-          <li key={i} className="sm-work-row">
-            <div className="sm-term-head">
-              <span className={`sm-status sm-rel-${r.relation}`}>{RELATION_LABEL[r.relation]}</span>
-              <span className="sm-status">{Math.round(r.score * 100)}%</span>
-            </div>
-            <div className="sm-rel-pair">
-              <div>
-                <code>{r.id}</code> <SideLink side={r.defined_in} onOpenFile={onOpenFile} />
-                <div className="sm-work-title">{r.text}</div>
+      <div className="card">
+        <DataTable<RelatedRequirement>
+          list="dm-elsewhere"
+          urlPrefix="else."
+          rows={orderRelated(read.items)}
+          rowKey={(r) => relatedKey(r)}
+          rowLabel={(r) => r.id}
+          pageSize={20}
+          search={{ placeholder: "Search requirements" }}
+          searchText={(r) => [r.id, r.text, r.other_id, r.other_text, r.other_project_name]}
+          filters={[
+            {
+              id: "relation",
+              allLabel: "Every match",
+              kind: "chips",
+              options: (["opposite", "same", "overlap"] as const).map((x) => ({ value: x, label: RELATION_LABEL[x] })),
+              match: (r, v) => r.relation === v,
+            },
+            {
+              id: "project",
+              allLabel: "Every project",
+              kind: "select",
+              options: [...new Set(read.items.map((r) => r.other_project_name))].sort().map((x) => ({ value: x, label: x })),
+              match: (r, v) => r.other_project_name === v,
+            },
+          ]}
+          empty={{ title: "Nothing matches." }}
+          columns={[
+            { id: "relation", header: "Match", cell: (r) => <span className={`sm-status sm-rel-${r.relation}`}>{RELATION_LABEL[r.relation]} · {Math.round(r.score * 100)}%</span> },
+            { id: "ours", header: "Ours", cell: (r) => <span><code>{r.id}</code> <span className="sub">{r.text.slice(0, 90)}{r.text.length > 90 ? "…" : ""}</span></span> },
+            { id: "theirs", header: "Theirs", cell: (r) => <span><code>{r.other_id}</code> <span className="sub">{r.other_project_name}</span></span> },
+            {
+              id: "decision",
+              header: "Decision",
+              cell: (r) => {
+                const d = decisionOf?.(r);
+                return d ? MATCH_DECISIONS.find((m) => m.state === d)?.label ?? d : <span className="sub">—</span>;
+              },
+            },
+          ]}
+          expand={(r) => (
+            <div>
+              <div className="sm-rel-pair">
+                <div>
+                  <code>{r.id}</code> <SideLink side={r.defined_in} onOpenFile={onOpenFile} />
+                  <div className="sm-work-title">{r.text}</div>
+                </div>
+                <div>
+                  <code>{r.other_id}</code>{" "}
+                  <span className="sm-status">
+                    {r.other_workspace_name} / {r.other_project_name}
+                  </span>{" "}
+                  <span className="sm-work-title">
+                    {r.other_defined_in.path}:{r.other_defined_in.line_start}
+                  </span>
+                  <div className="sm-work-title">{r.other_text}</div>
+                </div>
               </div>
-              <div>
-                <code>{r.other_id}</code>{" "}
-                <span className="sm-status">
-                  {r.other_workspace_name} / {r.other_project_name}
-                </span>{" "}
-                <span className="sm-work-title">
-                  {r.other_defined_in.path}:{r.other_defined_in.line_start}
-                </span>
-                <div className="sm-work-title">{r.other_text}</div>
-              </div>
+              <div className="sm-req-cites">Shared: {r.shared.join(", ")}</div>
+              {onDecide && (
+                <div className="dm-actions">
+                  {MATCH_DECISIONS.map((d) => (
+                    <button
+                      key={d.state}
+                      type="button"
+                      title={d.why}
+                      className={decisionOf?.(r) === d.state ? "primary" : "ghost"}
+                      aria-pressed={decisionOf?.(r) === d.state}
+                      onClick={() => void onDecide(r, decisionOf?.(r) === d.state ? "proposed" : d.state)}
+                    >
+                      {d.label}
+                    </button>
+                  ))}
+                </div>
+              )}
             </div>
-            <div className="sm-req-cites">Shared: {r.shared.join(", ")}</div>
-          </li>
-        ))}
-      </ul>
+          )}
+        />
+      </div>
     </>
   );
 }
@@ -645,43 +922,47 @@ function Coverage({
         revision, so an unchanged document is never paid for twice. To read one document again, whatever its
         state, rebuild from it: only its facts are replaced.
       </p>
-      <table className="sm-table">
-        <thead>
-          <tr>
-            <th>Document</th>
-            <th>State</th>
-            <th>Facts</th>
-            <th>Dropped</th>
-            <th />
-          </tr>
-        </thead>
-        <tbody>
-          {model.documents.map((d) => (
-            <tr key={d.path}>
-              <td>{d.path}</td>
-              <td>
+      <div className="card">
+        <DataTable<SpecModel["documents"][number]>
+          list="dm-documents"
+          urlPrefix="doc."
+          rows={model.documents}
+          rowKey={(d) => d.path}
+          rowLabel={(d) => d.path}
+          pageSize={20}
+          search={{ placeholder: "Search documents" }}
+          searchText={(d) => [d.path]}
+          filters={[
+            {
+              id: "state",
+              allLabel: "Every state",
+              kind: "chips",
+              options: (["extracted", "stale", "failed", "pending"] as const)
+                .filter((st) => counts[st] > 0)
+                .map((st) => ({ value: st, label: st === "extracted" ? "read" : st === "pending" ? "never read" : st })),
+              match: (d, v) => d.state === v,
+            },
+          ]}
+          empty={{ title: "Nothing matches." }}
+          columns={[
+            { id: "path", header: "Document", compare: (a, b) => a.path.localeCompare(b.path), cell: (d) => <code className="dm-where">{d.path}</code> },
+            {
+              id: "state",
+              header: "State",
+              cell: (d) => (
                 <span className={`sm-state sm-state-${d.state}`} title={d.error ?? undefined}>
                   {d.state}
                 </span>
-              </td>
-              <td>{d.facts}</td>
-              <td title="Facts the model gave that the text did not bear out">{d.dropped}</td>
-              <td>
-                <button
-                  type="button"
-                  className="ghost"
-                  disabled={busy}
-                  onClick={() => onRebuild(d.path)}
-                  title="Read this document again on your own model key; only its facts are replaced"
-                  data-rebuild={d.path}
-                >
-                  Rebuild from this document
-                </button>
-              </td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
+              ),
+            },
+            { id: "facts", header: "Facts", num: true, compare: (a, b) => a.facts - b.facts, cell: (d) => d.facts },
+            { id: "dropped", header: "Dropped", num: true, compare: (a, b) => a.dropped - b.dropped, cell: (d) => d.dropped },
+          ]}
+          actions={(d) => [
+            { label: "Rebuild from this document", disabled: busy, onSelect: () => onRebuild(d.path) },
+          ]}
+        />
+      </div>
     </>
   );
 }

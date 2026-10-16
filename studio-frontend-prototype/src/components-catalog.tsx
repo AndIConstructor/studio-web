@@ -1,6 +1,5 @@
 import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ComponentRegistry } from "./component-registry";
-import { OrgGearRepositoryCard } from "./org-gear-repository-card";
 import { ApiError, api, PLATFORM_ROOT_TENANT_ID } from "./api";
 import type {
   CatalogRepoSource,
@@ -51,6 +50,7 @@ import {
   syncedSources,
 } from "./component-kinds";
 import type { KindChip } from "./component-kinds";
+import { OrgSources } from "./platform-sources";
 
 /* ============================================================================
  * Platform Gears — a schema-driven component page per Gear, in Constructor
@@ -441,6 +441,9 @@ function kitAsNode(kit: StudioKit): CatalogNode {
   };
 }
 
+/** The panes of the organization's Components page. */
+export type ComponentsPane = "registry" | "catalogue" | "repositories";
+
 export function ComponentsCatalog({
   token,
   tenantId,
@@ -450,6 +453,8 @@ export function ComponentsCatalog({
   isPlatformAdmin = false,
   tier = "organization",
   orgName,
+  initialPane = "registry",
+  onOpenRepositories,
 }: {
   token: string;
   tenantId?: string;
@@ -476,6 +481,10 @@ export function ComponentsCatalog({
   /** A component page to open on, asked for from outside the catalogue (a
    *  project's product links here). */
   focus?: { name: string; at: number } | null;
+  /** The pane to open on: an old Sources link opens Repositories. */
+  initialPane?: ComponentsPane;
+  /** Platform › Repositories, where the platform's sources and sync are. */
+  onOpenRepositories?: () => void;
 }) {
   const [gears, setGears] = useState<CatalogNode[] | null>(null);
   const [profiles, setProfiles] = useState<Record<string, Record<string, unknown>>>({});
@@ -484,9 +493,11 @@ export function ComponentsCatalog({
    *  the editor writes them — this is what the table reads. */
   const [resolved, setResolved] = useState<Record<string, ComponentValues>>({});
   const [selected, setSelected] = useSelectedComponent(focus?.name ?? null);
-  /** The catalogue (what the sources list) or the registry (what the
-   *  organization's projects declare, ADR-0041). */
-  const [pane, setPane] = useState<"catalogue" | "registry">("registry");
+  /** The registry (what the organization's projects declare, ADR-0041), the
+   *  catalogue (what its repositories hold), or the repositories themselves
+   *  (ADR-0046): one question, what our components are and where they come
+   *  from, so one page rather than a Components and a Sources section. */
+  const [pane, setPane] = useState<ComponentsPane>(initialPane === "catalogue" && tier === "organization" ? "registry" : initialPane);
   /** Which tier the catalogue shows (ADR-0042), fixed by the level the page
    *  was opened at. */
   const tierTab: TierTab = tier;
@@ -496,7 +507,6 @@ export function ComponentsCatalog({
   /** The organization's sources as the server keeps them, each marked
    *  whether the platform already reads it. */
   const [serverSources, setServerSources] = useState<CatalogRepoSource[] | null>(null);
-  const [showPlatformSources, setShowPlatformSources] = useState(false);
   useEffect(() => {
     if (focus) setSelected(focus.name);
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -517,7 +527,9 @@ export function ComponentsCatalog({
   const [busy, setBusy] = useState(false);
   const [sync, setSync] = useState("");
   const [sources, setSources] = useState<Sources>(() => loadSources());
-  const [showSources, setShowSources] = useState(false);
+  // The organization's sources as the server keeps them are read while the
+  // Repositories pane is open.
+  const showSources = pane === "repositories";
   const [showReport, setShowReport] = useState(false);
   const [connections, setConnections] = useState<Connection[]>([]);
   // Which component kind the list shows (a `component-kinds` filter value),
@@ -875,7 +887,7 @@ export function ComponentsCatalog({
 
   const facts = useMemo(() => {
     const out = new Map<string, RowFacts>();
-    for (const g of visible) {
+    for (const g of [...visible, ...levelNodes.filter((n) => !visible.includes(n))]) {
       const name = nameOf(g);
       out.set(
         g.instance_id,
@@ -891,7 +903,7 @@ export function ComponentsCatalog({
     }
     return out;
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [visible, resolved, schemas, activity, baselines]);
+  }, [visible, levelNodes, resolved, schemas, activity, baselines]);
   const columns = useMemo(() => gearColumns((g) => facts.get(g.instance_id), activityDays), [facts, activityDays]);
 
   /* The catalogue's own filters, on the list's toolbar. They live in the same
@@ -989,16 +1001,16 @@ export function ComponentsCatalog({
               </span>
               {!platformLevel && (
                 <span className="chips" role="tablist" aria-label="Components" style={{ margin: "0 0 0 12px" }}>
-                  <button type="button" role="tab" aria-selected={pane === "registry"} className={`chip ${pane === "registry" ? "on" : ""}`} onClick={() => setPane("registry")}>
-                    Registry
+                  <button type="button" role="tab" aria-selected={pane !== "repositories"} className={`chip ${pane !== "repositories" ? "on" : ""}`} onClick={() => setPane("registry")}>
+                    Components
                   </button>
-                  <button type="button" role="tab" aria-selected={pane === "catalogue"} className={`chip ${pane === "catalogue" ? "on" : ""}`} onClick={() => setPane("catalogue")}>
-                    Catalogue <span className="n">{tiers.organization}</span>
+                  <button type="button" role="tab" aria-selected={pane === "repositories"} className={`chip ${pane === "repositories" ? "on" : ""}`} onClick={() => setPane("repositories")} data-pane-repositories>
+                    Repositories
                   </button>
                 </span>
               )}
             </div>
-            <div className="tools">
+            <div className="tools" hidden={!platformLevel && pane === "repositories"}>
               <div className="seg" role="tablist" aria-label="View mode">
                 {(["list", "graph"] as const).map((v) => (
                   <button key={v} aria-pressed={viewMode === v} onClick={() => setViewMode(v)}>
@@ -1020,12 +1032,11 @@ export function ComponentsCatalog({
               {!platformLevel && (
                 <>
                   <button
-                    className={`iconbtn${showSources ? " active" : ""}`}
-                    onClick={() => setShowSources((v) => !v)}
-                    aria-expanded={showSources}
-                    title="The repositories this organization's catalogue reads, besides its projects"
+                    className={`iconbtn${pane === "repositories" ? " active" : ""}`}
+                    onClick={() => setPane("repositories")}
+                    title="Where this organization's components come from: what the catalogue lists and what products are built from"
                   >
-                    Our sources{filledFrom ? ` · ${filledFrom}` : sourceSummary ? ` · ${sourceSummary}` : ""}
+                    Repositories{filledFrom ? ` · ${filledFrom}` : sourceSummary ? ` · ${sourceSummary}` : ""}
                   </button>
                   <button className="iconbtn" onClick={() => setShowReport(true)}>
                     Roadmap report
@@ -1037,12 +1048,11 @@ export function ComponentsCatalog({
               )}
               {platformLevel && isPlatformAdmin && (
                 <button
-                  className={`iconbtn${showPlatformSources ? " active" : " primary"}`}
-                  onClick={() => setShowPlatformSources((v) => !v)}
-                  aria-expanded={showPlatformSources}
-                  title="What the platform's components are read from. Only a platform administrator changes it."
+                  className="iconbtn primary"
+                  onClick={() => onOpenRepositories?.()}
+                  title="What the platform's components come from: what the catalogue lists and what products are built from"
                 >
-                  Platform sources &amp; sync
+                  Repositories &amp; sync
                 </button>
               )}
             </div>
@@ -1050,9 +1060,6 @@ export function ComponentsCatalog({
 
           {showReport && <RoadmapReportDialog token={token} org={tenantId} onClose={() => setShowReport(false)} />}
 
-          {platformLevel && isPlatformAdmin && showPlatformSources && (
-            <PlatformSourcesPanel token={token} onSynced={() => void reload()} />
-          )}
 
           {!platformLevel && serverSources && shadowedSources(serverSources).length > 0 && (
             <div className="gcat-hint" data-shadowed-sources>
@@ -1067,16 +1074,6 @@ export function ComponentsCatalog({
             </div>
           )}
 
-          {!platformLevel && showSources && (
-            <SourcesPanel
-              sources={sources}
-              setSrc={setSrc}
-              setRepo={setRepo}
-              connections={connections}
-              tenantId={tenantId}
-            />
-          )}
-
           {platformLevel ? (
             <p className="gcat-sub" data-level-note>
               <strong>The common set every organization builds on.</strong> Gears, tools and SDKs from the
@@ -1087,14 +1084,19 @@ export function ComponentsCatalog({
             </p>
           ) : (
             <>
-              <p className="gcat-sub" data-level-note>
-                <strong>Built by this organization.</strong> Every component its projects declare, the code
-                that could become one, and the gears it keeps in its own gear repository. Only this
-                organization's members see them; publishing one gives it to the platform. The common set is
-                one level up, under <em>Platform</em> — a product draws on both.
-              </p>
-              <OrgGearRepositoryCard token={token} tenantId={tenantId} connections={connections} />
-              {shadowedNote(shadowed) && <p className="gcat-hint" data-shadowed>{shadowedNote(shadowed)}</p>}
+              {/* The Repositories pane is about where components come from,
+                  and its list creates and picks the repository new gears go
+                  to: the note on whose they are and the shadowed hint belong
+                  to the list of components. */}
+              {pane !== "repositories" && (
+                <>
+                  <p className="gcat-sub" data-level-note>
+                    <strong>Built by this organization</strong> and seen only by its members; publishing one gives it to
+                    the platform, whose common set is one level up, under <em>Platform</em>.
+                  </p>
+                  {shadowedNote(shadowed) && <p className="gcat-hint" data-shadowed>{shadowedNote(shadowed)}</p>}
+                </>
+              )}
             </>
           )}
 
@@ -1109,12 +1111,37 @@ export function ComponentsCatalog({
           {/* A catalogue that never loaded says so in the list, with Retry. */}
           {err && (viewMode === "graph" || gears !== null) && <p className="gcat-err">{err}</p>}
 
-          {!platformLevel && pane === "registry" ? (
+          {!platformLevel && pane === "repositories" ? (
+            <OrgSources
+              token={token}
+              orgId={tenantId}
+              embedded
+              catalogueSettings={
+                <>
+                  <SourcesPanel
+                    sources={sources}
+                    setSrc={setSrc}
+                    setRepo={setRepo}
+                    connections={connections}
+                    tenantId={tenantId}
+                  />
+                  <div className="editrow">
+                    <button className="iconbtn primary" disabled={busy} onClick={() => void runSync()}>
+                      {syncing ? "Syncing…" : "Sync the catalogue"}
+                    </button>
+                    {sync && <span className="gcat-hint">{sync}</span>}
+                  </div>
+                </>
+              }
+            />
+          ) : !platformLevel && viewMode !== "graph" ? (
             <ComponentRegistry
               token={token}
               projects={projects}
               isPlatformAdmin={isPlatformAdmin}
-              onOpenComponent={(name) => { setPane("catalogue"); setSelected(name); }}
+              onOpenComponent={(name) => setSelected(name)}
+              catalogue={levelNodes.filter((g) => componentTypes === null || componentTypes.has(g.type_id))}
+              catalogueCell={(id, node) => columns.find((c) => c.id === id)?.cell(node) ?? null}
             />
           ) : viewMode === "graph" ? (
             <>
@@ -1307,7 +1334,7 @@ function KindPicker({
 /** The platform's catalogue sources (ADR-0042), for a platform administrator:
  *  the repositories and the crates.io keyword every organization's catalogue
  *  reads, saved in the platform's tenant, and a sync of them. */
-function PlatformSourcesPanel({ token, onSynced }: { token: string; onSynced: () => void }) {
+export function PlatformSourcesPanel({ token, onSynced }: { token: string; onSynced: () => void }) {
   const [items, setItems] = useState<CatalogRepoSource[] | null>(null);
   const [keyword, setKeyword] = useState("");
   const [connections, setConnections] = useState<Connection[]>([]);

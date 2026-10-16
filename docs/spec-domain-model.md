@@ -309,8 +309,13 @@ Under `/studio-documents/v1`, beside the gear's other routes:
 | `GET` | `/spec-model/findings?project_id=` | The findings with their sides, fix and decision, filterable by `rule` and `status` |
 | `POST` | `/spec-model/findings/{fingerprint}/decision` | ✓ or ✗ on a finding; `201` with the decision |
 | `GET` | `/spec-model/glossary?project_id=` | The project's glossary: one entry per subject, its name and its aliases ([the project's words](project-and-product.md#the-projects-words)) |
+| `GET` | `/spec-model/reviews?project_id=` | Every accept or reject members gave on the facts the model read, by the key the tab gives a fact (kind, subject, aspect and the folded quote, hashed) |
+| `POST` | `/spec-model/reviews` | Accept, reject, or put back as `proposed`, a selection of up to 500 facts in one action. A rejected reading leaves the model and is not proposed again while its passage says the same |
+| `POST` | `/spec-model/files/proposals` | A whole Markdown document under `docs/` as a pull request: the need a member accepted (`docs/discovery.md`), a confirmed prioritisation (`docs/priorities.md`); `201` with the pull request |
+| `POST` | `/spec-model/glossary/distinct` | Two entries are different things: kept on both as `distinct_from`, so they are not offered as one thing again; `204` |
 | `POST` | `/spec-model/glossary/decisions` | Name an entry, or make it an alias of another; `201` with the decision |
 | `POST` | `/spec-model/glossary/proposals?project_id=` | Rename `from` to `to` in the documents' prose (whole words, first letter's case kept; code, links and front matter untouched) as one pull request; `201` with the files and the pull request, `400` when no document uses `from` |
+| `POST` | `/spec-model/sentences/proposals?project_id=` | Add one sentence to one of the project's documents, as a paragraph after the block line `line` is in, on the `revision` the model read, as a pull request: how the Domain model tab states a relation no document states and how the Glossary tells two words apart; `201` with the pull request, `400` when the file is not documentation, changed since it was read, or the line is blank or code |
 | `GET` | `/spec-model/work?project_id=` | The identifiers the documents define with a label, with the synced issues, pull requests and commits that name them ([the links](project-and-product.md#the-links)) |
 | `GET` | `/spec-model/requirements?project_id=` | Every labelled requirement with its statement and the basis its block states ([below](#requirements-and-their-basis)) |
 | `GET` | `/spec-model/decisions?project_id=` | Every ✓/✗ recorded on the project's findings, the model's and the Spec Quality detectors' alike |
@@ -395,10 +400,29 @@ the most facts about it, from the repository history, bots left out.
   (`confirmed` or `dismissed`), `decided_by`, `decided_at`, `revisions`.
 - `studio_spec_model_terms`: `project_id`, `term_key` (a subject folded),
   `name` (the chosen name, or null), `alias_of` (another entry's key, or
-  null), `decided_by`, `decided_at`; unique on the first two.
+  null), `distinct_from` (the keys of entries a member said are different
+  things, as a JSON array), `decided_by`, `decided_at`; unique on the first
+  two.
+- `studio_spec_model_reviews`: `project_id`, `fact_key`, `state` (`accepted`
+  or `rejected`), `path` and `revision` where it was read, `decided_by`,
+  `decided_at`; unique on the first two.
 
 The assembled model is not stored: it is computed from the extractions of the
-documents' current revisions, which is cheap and never stale.
+documents' current revisions, which is cheap and never stale. Members' reviews
+lie over it: a rejected reading is left out, an accepted one is the project's
+reading, everything else is what the model proposes.
+
+## What stops a build
+
+Only what a rule established or a person confirmed: a dangling reference, a
+possible conflict a member said is a real problem, an open question. A
+contradiction the judge reads from facts nobody confirmed is a *possible
+conflict* — a concern to look at, not a verdict — until a member decides. An
+assumption waiting for its check, and a requirement that names no source, are
+listed to look at and stop nothing: a hypothesis is checked later, and a
+citation says where a requirement comes from, not that it is proven. A trace
+from a requirement to the code or a test is a name found there, never a claim
+that it is covered.
 
 ## The Domain model tab
 
@@ -420,6 +444,42 @@ A project tab beside Specs and Components in the prototype
   how many were dropped.
 
 The Build button sits above all three and says what a running build is doing.
+
+## The need, hypotheses, behaviour and priorities
+
+Read off the same facts, for the PM workflow the PRDs *Describe the need*,
+*Validate product hypotheses*, *Define the domain model and behaviour* and
+*Prioritise functionality* describe. The extractor (version 2) also reads
+`role`, `action`, `problem`, `outcome`, `idea`, `benefit` and `scenario`; the
+last five describe the need, not a thing the application keeps, and stay off
+the model map.
+
+- **Materials.** A pasted interview, request or report is a Studio document of
+  the built-in `material` type (Source, Material). A project's Studio-held
+  documents are read beside its repository files, under `studio:<id>`, and a
+  material is read as soon as it is added, on the key of whoever added it.
+- **Needs** groups problems, outcomes, ideas and scenarios by role and shows
+  the gaps — a problem nothing proposes to solve, an idea that names no
+  problem — without filling them in. What a member accepted is proposed as
+  `docs/discovery.md`.
+- **Hypotheses**: each expected benefit is a claim (solution, for whom,
+  effect), with a proposed check among the five methods (problem evidence,
+  expected benefit, time/TCO, demand, existing capability) and one of four
+  states — not checked, supports, contradicts, insufficient — kept as a
+  review keyed `ev:`. Accepting the wording is not validating it, and an
+  unchecked hypothesis stops nothing.
+- **Behaviour**: for each action a role takes on a thing and each state the
+  thing goes through, whether it may happen then. A passage that names both
+  answers it; otherwise it is asked, or excluded with a reason kept as a
+  review keyed `ob:`.
+- **Priorities**: ICE, the mean of Impact, Confidence and Ease, each 1–10;
+  Ease from person-weeks by the PRD's bands, Confidence first proposed from a
+  requirement's basis (an assumption 1, a citation 3, no basis unknown). Every
+  value shows its origin, an unknown leaves the score incomplete, a tie stays a
+  tie, and a prerequisite comes before what needs it while a cycle is shown.
+  A confirmed order is proposed as `docs/priorities.md`.
+- **Elsewhere**: a pair with another project's requirement is decided —
+  reuse, coordinate, keep separate, unrelated — and kept, keyed `rel:`.
 
 ## Calibration
 

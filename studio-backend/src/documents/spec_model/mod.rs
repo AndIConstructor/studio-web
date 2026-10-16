@@ -14,6 +14,7 @@ pub(crate) mod domain_doc;
 pub(crate) mod extract;
 pub(crate) mod finding;
 pub(crate) mod glossary;
+pub(crate) mod glossary_doc;
 pub(crate) mod index;
 pub(crate) mod judge;
 pub(crate) mod questions;
@@ -110,6 +111,17 @@ pub struct Coverage {
     pub error: Option<String>,
 }
 
+/// Whether a path is a template or an example rather than documentation — a
+/// `templates` or `examples` directory, a `template.md`, or anything under a
+/// tool's `.cf-studio` directory wherever it sits: never read into the model,
+/// nor into what the product needs.
+pub fn is_template_path(path: &str) -> bool {
+    path.split('/')
+        .any(|seg| seg == "templates" || seg == "examples" || seg == ".cf-studio")
+        || path.ends_with("/template.md")
+        || path == "template.md"
+}
+
 /// One kept extraction, as the model view reads it.
 pub struct Kept<'a> {
     pub path: &'a str,
@@ -157,7 +169,22 @@ pub fn current(documents: &[SourceText], kept: &[Kept<'_>]) -> (Vec<extract::Fac
                 )
             }
             None if rows.is_empty() => ("pending", 0, 0, None),
-            None => ("stale", 0, 0, None),
+            // The same text read by an earlier extractor: its facts stand
+            // until a build reads it again, so a new extractor does not empty
+            // every model at once. Another revision's facts never do — their
+            // lines are not this text's.
+            None => match rows
+                .iter()
+                .find(|k| k.revision == revision && k.error.is_none())
+            {
+                Some(k) => {
+                    let got: Vec<extract::Fact> = serde_json::from_str(k.facts).unwrap_or_default();
+                    let n = got.len();
+                    facts.extend(got);
+                    ("stale", n, usize::try_from(k.dropped).unwrap_or(0), None)
+                }
+                None => ("stale", 0, 0, None),
+            },
         };
         coverage.push(Coverage {
             path: doc.path.clone(),
@@ -248,4 +275,73 @@ pub fn revisions(documents: &[SourceText]) -> BTreeMap<String, String> {
         .iter()
         .map(|d| (d.path.clone(), extract::revision(&d.text)))
         .collect()
+}
+
+#[cfg(test)]
+mod current_tests {
+    use super::*;
+
+    fn doc(path: &str, text: &str) -> SourceText {
+        SourceText {
+            path: path.to_owned(),
+            text: text.to_owned(),
+            doc_type: Some("prd".to_owned()),
+            node: String::new(),
+            binding: None,
+        }
+    }
+
+    const FACTS: &str = r#"[{"kind":"entity","subject":"Invoice","text":"An invoice.","status":"active","path":"docs/a.md","line_start":1,"line_end":1,"quote":"An invoice"}]"#;
+
+    #[test]
+    fn an_earlier_extractor_keeps_its_facts_until_the_text_is_read_again() {
+        let d = doc("docs/a.md", "An invoice.\n");
+        let revision = extract::revision(&d.text);
+        let kept = [Kept {
+            path: "docs/a.md",
+            revision: &revision,
+            extractor_version: "0",
+            facts: FACTS,
+            dropped: 0,
+            error: None,
+        }];
+        let (facts, coverage) = current(std::slice::from_ref(&d), &kept);
+        assert_eq!(facts.len(), 1, "the earlier reading still shows");
+        assert_eq!(
+            coverage[0].state, "stale",
+            "and the next build reads it again"
+        );
+        assert_eq!(to_read(&coverage), vec!["docs/a.md"]);
+    }
+
+    #[test]
+    fn a_template_is_not_documentation() {
+        assert!(is_template_path(
+            "studio-backend/src/documents/templates/prd.md"
+        ));
+        assert!(is_template_path("kits/sdlc/template.md"));
+        assert!(!is_template_path("docs/prd/constructor-studio.md"));
+        assert!(!is_template_path("docs/templates-guide.md"));
+        assert!(is_template_path(
+            "studio-frontend/.cf-studio/config/kits/sdlc/artifacts/PRD/examples/example.md"
+        ));
+        assert!(is_template_path("docs/examples/flow.md"));
+        assert!(!is_template_path("docs/example-driven-design.md"));
+    }
+
+    #[test]
+    fn another_revision_gives_no_facts() {
+        let d = doc("docs/a.md", "An invoice, changed.\n");
+        let kept = [Kept {
+            path: "docs/a.md",
+            revision: "older",
+            extractor_version: extract::EXTRACTOR_VERSION,
+            facts: FACTS,
+            dropped: 0,
+            error: None,
+        }];
+        let (facts, coverage) = current(std::slice::from_ref(&d), &kept);
+        assert!(facts.is_empty(), "its lines are not this text's");
+        assert_eq!(coverage[0].state, "stale");
+    }
 }

@@ -2397,6 +2397,24 @@ pub struct SpecModelEntityRequest {
     pub relations: Vec<SpecModelRelationInput>,
 }
 
+/// A sentence the Domain model tab proposes for a document, after the passage
+/// the model read a fact from: the relation an entity has no document stating.
+#[derive(Debug)]
+#[toolkit_macros::api_dto(request)]
+pub struct SpecModelSentenceRequest {
+    /// The document, from the repository's root: one of the project's
+    /// documentation, never another file.
+    pub path: String,
+    /// The revision the model read, so the line still means the same passage.
+    pub revision: String,
+    /// The passage's last line, 1-based; the sentence goes after its block.
+    pub line: u32,
+    pub sentence: String,
+    /// What the change makes better, for the pull request's title.
+    #[serde(default)]
+    pub why: Option<String>,
+}
+
 /// Where a change to the documents landed.
 #[derive(Debug)]
 #[toolkit_macros::api_dto(response)]
@@ -2447,6 +2465,55 @@ pub struct SpecModelDecisionListDto {
     pub total: u32,
 }
 
+/// One term of the project's glossary document.
+#[derive(Debug)]
+#[toolkit_macros::api_dto(request, response)]
+pub struct GlossaryDocRowDto {
+    pub term: String,
+    pub definition: String,
+    /// Other names that mean the same.
+    #[serde(default)]
+    pub aliases: Vec<String>,
+    /// Terms that look alike and are something else.
+    #[serde(default)]
+    pub not_same_as: Vec<String>,
+    /// Where the definition was read: `path:line`.
+    #[serde(default)]
+    pub source: Option<String>,
+}
+
+/// The glossary the project's documents keep.
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+pub struct GlossaryDocFoundDto {
+    pub path: String,
+    /// The section's heading, for a glossary kept inside another document.
+    pub heading: Option<String>,
+    pub line_start: u32,
+    pub line_end: u32,
+    /// The whole document is the glossary.
+    pub whole: bool,
+    pub rows: Vec<GlossaryDocRowDto>,
+}
+
+/// Where the project's glossary is, and where Studio keeps it.
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+pub struct GlossaryDocDto {
+    /// The glossary the documents keep, if any.
+    pub found: Option<GlossaryDocFoundDto>,
+    /// Where Studio writes it: `docs/glossary.md`.
+    pub path: String,
+}
+
+/// The glossary to propose, row by row in its order.
+#[derive(Debug)]
+#[toolkit_macros::api_dto(request)]
+pub struct GlossaryDocRequest {
+    pub project_id: String,
+    pub rows: Vec<GlossaryDocRowDto>,
+}
+
 /// One name merged into a glossary entry.
 #[derive(Debug)]
 #[toolkit_macros::api_dto(response)]
@@ -2470,6 +2537,9 @@ pub struct GlossaryEntryDto {
     pub aliases: Vec<GlossaryAliasDto>,
     pub facts: u32,
     pub documents: u32,
+    /// The keys of the entries a member said are different things from this
+    /// one: not to be offered as one thing again.
+    pub distinct_from: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -2493,6 +2563,99 @@ pub struct GlossaryDecisionRequest {
     /// The `key` of the entry this one is another name of; `null` keeps it an
     /// entry of its own.
     pub alias_of: Option<String>,
+}
+
+/// A member's accept or reject on one fact the model read.
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+pub struct SpecModelReviewDto {
+    /// The fact as the tab keys it.
+    pub fact_key: String,
+    /// `accepted` or `rejected`.
+    pub state: String,
+    pub path: String,
+    pub revision: String,
+    pub note: Option<String>,
+    pub decided_by: String,
+    pub decided_at: String,
+}
+
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+pub struct SpecModelReviewListDto {
+    pub items: Vec<SpecModelReviewDto>,
+    pub total: u32,
+}
+
+/// One fact to accept, reject, or put back as proposed.
+#[derive(Debug)]
+#[toolkit_macros::api_dto(request)]
+pub struct SpecModelReviewInput {
+    pub fact_key: String,
+    /// `accepted`, `rejected`, or `proposed` to withdraw a review; for a
+    /// hypothesis (key `ev:…`), what checking found: `supports`,
+    /// `contradicts` or `insufficient`.
+    pub state: String,
+    /// Where the fact was read, and at which revision.
+    #[serde(default)]
+    pub path: String,
+    #[serde(default)]
+    pub revision: String,
+    /// Why, when it needs saying: an excluded obligation's reason.
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
+/// An issue to open in the project's repository from something to decide.
+#[derive(Debug)]
+#[toolkit_macros::api_dto(request)]
+pub struct SpecModelIssueRequest {
+    pub project_id: String,
+    pub title: String,
+    pub body: String,
+    /// The host accounts to assign it to (GitHub logins).
+    #[serde(default)]
+    pub assignees: Vec<String>,
+}
+
+/// The issue opened.
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+pub struct SpecModelIssueDto {
+    pub number: i64,
+    pub url: Option<String>,
+}
+
+/// A whole document Studio proposes for the repository: an accepted need,
+/// a confirmed prioritisation.
+#[derive(Debug)]
+#[toolkit_macros::api_dto(request)]
+pub struct SpecModelFileProposalRequest {
+    pub project_id: String,
+    /// Where it goes: a Markdown file under `docs/`.
+    pub path: String,
+    pub content: String,
+    /// The pull request's title.
+    pub title: String,
+}
+
+/// A selection of facts reviewed in one action.
+#[derive(Debug)]
+#[toolkit_macros::api_dto(request)]
+pub struct SpecModelReviewRequest {
+    pub project_id: String,
+    pub items: Vec<SpecModelReviewInput>,
+}
+
+/// Two glossary entries a member says are different things.
+#[derive(Debug)]
+#[toolkit_macros::api_dto(request)]
+pub struct GlossaryDistinctRequest {
+    pub project_id: String,
+    /// One entry's `key`.
+    pub a: String,
+    /// The other's.
+    pub b: String,
 }
 
 /// A glossary rename to carry into the documents: the name they use and the
@@ -3288,10 +3451,18 @@ async fn get_glossary(
         .glossary_choices(workspace_id, project_id)
         .await
         .map_err(internal)?;
+    let apart: std::collections::HashMap<String, Vec<String>> = service
+        .spec_terms(workspace_id, project_id)
+        .await
+        .map_err(internal)?
+        .into_iter()
+        .map(|t| (t.term_key, super::service::distinct_keys(&t.distinct_from)))
+        .collect();
     let count = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
     let items: Vec<GlossaryEntryDto> = super::spec_model::glossary::entries(&facts, &choices)
         .into_iter()
         .map(|e| GlossaryEntryDto {
+            distinct_from: apart.get(&e.key).cloned().unwrap_or_default(),
             key: e.key,
             name: e.name,
             chosen: e.chosen,
@@ -5210,6 +5381,427 @@ async fn list_related_requirements(
 const GLOSSARY_TEXT_MAX: usize = 200;
 
 /// Record a member's decision on one glossary entry.
+fn spec_review_dto(r: super::entity::spec_review::Model) -> SpecModelReviewDto {
+    SpecModelReviewDto {
+        fact_key: r.fact_key,
+        state: r.state,
+        path: r.path,
+        revision: r.revision,
+        note: r.note,
+        decided_by: r.decided_by.to_string(),
+        decided_at: rfc3339(r.decided_at),
+    }
+}
+
+/// Every accept or reject members gave on the facts the model read.
+async fn list_spec_model_reviews(
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(service): Extension<Arc<DocumentsService>>,
+    Query(query): Query<SpecScopeQuery>,
+) -> ApiResult<JsonBody<SpecModelReviewListDto>> {
+    let project_id = parse_project_id(&query.project_id)?;
+    let workspace_id = parent_workspace(&service, &ctx, project_id).await?;
+    let items: Vec<SpecModelReviewDto> = service
+        .spec_reviews(workspace_id, project_id)
+        .await
+        .map_err(internal)?
+        .into_iter()
+        .map(spec_review_dto)
+        .collect();
+    Ok(Json(SpecModelReviewListDto {
+        total: u32::try_from(items.len()).unwrap_or(u32::MAX),
+        items,
+    }))
+}
+
+/// Open an issue in the project's repository for something to decide — a
+/// problem in the documents, a gap in the model — assigned to people by
+/// their host accounts.
+async fn create_spec_model_issue(
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(service): Extension<Arc<DocumentsService>>,
+    Extension(quality): Extension<Quality>,
+    Json(req): Json<SpecModelIssueRequest>,
+) -> ApiResult<(StatusCode, JsonBody<SpecModelIssueDto>)> {
+    let project_id = parse_project_id(&req.project_id)?;
+    let _ = parent_workspace(&service, &ctx, project_id).await?;
+    let refuse = |why: &str| {
+        DocumentsError::invalid_argument()
+            .with_constraint(why)
+            .create()
+    };
+    let title = req.title.trim();
+    if title.is_empty() || title.len() > 256 {
+        return Err(refuse("an issue needs a title of at most 256 bytes"));
+    }
+    if req.body.len() > 64 * 1024 {
+        return Err(refuse("the description must be at most 64 KiB"));
+    }
+    let valid_login = |l: &String| {
+        !l.is_empty() && l.len() <= 39 && l.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+    };
+    if req.assignees.len() > 10 || !req.assignees.iter().all(valid_login) {
+        return Err(refuse("assignees are at most ten GitHub logins"));
+    }
+    let files = project_files(&quality)?;
+    let (number, url) = files
+        .create_issue(
+            &ctx,
+            &project_id.to_string(),
+            title,
+            &req.body,
+            &req.assignees,
+        )
+        .await
+        .map_err(invalid_or_internal)?;
+    Ok((StatusCode::CREATED, Json(SpecModelIssueDto { number, url })))
+}
+
+/// Whether a review state belongs to what its key names: a fact, a
+/// hypothesis (`ev:`), a behaviour obligation (`ob:`) or a match across
+/// projects (`rel:`). `proposed` withdraws any of them.
+fn review_state_fits(key: &str, state: &str) -> bool {
+    if state == "proposed" {
+        return true;
+    }
+    if key.starts_with("ev:") {
+        matches!(state, "supports" | "contradicts" | "insufficient")
+    } else if key.starts_with("ob:") {
+        state == "excluded"
+    } else if key.starts_with("rel:") {
+        matches!(state, "reuse" | "coordinate" | "separate" | "unrelated")
+    } else if key.starts_with("iss:") {
+        state == "opened"
+    } else {
+        matches!(state, "accepted" | "rejected")
+    }
+}
+
+/// Propose a whole document for the project's repository, as a pull request:
+/// what a member accepted in Studio — the need, a prioritisation — kept as a
+/// document beside the others, versioned by the repository.
+async fn create_spec_model_file_proposal(
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(service): Extension<Arc<DocumentsService>>,
+    Extension(quality): Extension<Quality>,
+    Json(req): Json<SpecModelFileProposalRequest>,
+) -> ApiResult<(StatusCode, JsonBody<SpecModelWriteDto>)> {
+    let project_id = parse_project_id(&req.project_id)?;
+    let _ = parent_workspace(&service, &ctx, project_id).await?;
+    let refuse = |why: &str| {
+        DocumentsError::invalid_argument()
+            .with_constraint(why)
+            .create()
+    };
+    let path = req.path.trim();
+    let safe = path.starts_with("docs/")
+        && path.ends_with(".md")
+        && path.len() <= 200
+        && !path.contains("..")
+        && path
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "/-_.".contains(c));
+    if !safe {
+        return Err(refuse(
+            "the path must be a Markdown file under docs/, in plain letters, digits, - _ . and /",
+        ));
+    }
+    if req.content.trim().is_empty() || req.content.len() > 512 * 1024 {
+        return Err(refuse("the content must be a document of at most 512 KiB"));
+    }
+    let title: String = req.title.trim().chars().take(70).collect();
+    if title.is_empty() {
+        return Err(refuse("a title says what the pull request proposes"));
+    }
+    let files = project_files(&quality)?;
+    let project = project_id.to_string();
+    let branch = format!(
+        "docs/{}",
+        &super::spec_model::extract::revision(&req.content)[..12]
+    );
+    let written = files
+        .write(
+            &ctx,
+            &project,
+            &branch,
+            &[crate::product::port::DeclarationFile { path: path.to_owned(), content: req.content.clone() }],
+            &crate::product::port::PullRequestText {
+                message: format!("docs: {title}"),
+                title: format!("Docs: {title}"),
+                body: format!("{title}\n\nWritten to `{path}` from the Domain model tab, as a proposal to review."),
+            },
+            true,
+        )
+        .await
+        .map_err(invalid_or_internal)?;
+    Ok((
+        StatusCode::CREATED,
+        Json(SpecModelWriteDto {
+            path: path.to_owned(),
+            branch: written.branch,
+            commit_sha: written.commit_sha,
+            pr_url: written.pr_url,
+        }),
+    ))
+}
+
+fn glossary_row_dto(r: super::spec_model::glossary_doc::Row) -> GlossaryDocRowDto {
+    GlossaryDocRowDto {
+        term: r.term,
+        definition: r.definition,
+        aliases: r.aliases,
+        not_same_as: r.not_same_as,
+        source: r.source,
+    }
+}
+
+/// The glossary the project's documents keep — `docs/glossary.md`, or a
+/// glossary section inside another document — read as written.
+async fn get_glossary_document(
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(service): Extension<Arc<DocumentsService>>,
+    Extension(quality): Extension<Quality>,
+    Query(query): Query<SpecScopeQuery>,
+) -> ApiResult<JsonBody<GlossaryDocDto>> {
+    use super::spec_model::glossary_doc::{GLOSSARY_DOC_PATH, find};
+    let project_id = parse_project_id(&query.project_id)?;
+    let workspace_id = parent_workspace(&service, &ctx, project_id).await?;
+    let reader = quality.reader()?;
+    let sources = service
+        .spec_model_sources(&ctx, workspace_id, project_id, reader.as_ref())
+        .await
+        .map_err(internal)?;
+    let line = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
+    let found = find(
+        sources
+            .documents
+            .iter()
+            .map(|d| (d.path.as_str(), d.text.as_str())),
+    )
+    .map(|f| GlossaryDocFoundDto {
+        path: f.path,
+        heading: f.heading,
+        line_start: line(f.line_start),
+        line_end: line(f.line_end),
+        whole: f.whole,
+        rows: f.rows.into_iter().map(glossary_row_dto).collect(),
+    });
+    Ok(Json(GlossaryDocDto {
+        found,
+        path: GLOSSARY_DOC_PATH.to_owned(),
+    }))
+}
+
+/// Most rows one glossary holds.
+const GLOSSARY_DOC_ROWS_MAX: usize = 1000;
+
+/// Propose the project's glossary as `docs/glossary.md` in one pull request.
+/// A glossary kept as a section of another document moves: the same pull
+/// request leaves a link where the section's table was.
+async fn create_glossary_document_proposal(
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(service): Extension<Arc<DocumentsService>>,
+    Extension(quality): Extension<Quality>,
+    Json(req): Json<GlossaryDocRequest>,
+) -> ApiResult<(StatusCode, JsonBody<SpecModelWriteDto>)> {
+    use super::spec_model::glossary_doc::{GLOSSARY_DOC_PATH, Row, find, render, replace_section};
+    let project_id = parse_project_id(&req.project_id)?;
+    let workspace_id = parent_workspace(&service, &ctx, project_id).await?;
+    let refuse = |why: &str| {
+        DocumentsError::invalid_argument()
+            .with_constraint(why)
+            .create()
+    };
+    if req.rows.is_empty() || req.rows.len() > GLOSSARY_DOC_ROWS_MAX {
+        return Err(refuse("a glossary holds between one and a thousand terms"));
+    }
+    let short = |s: &str| s.len() <= GLOSSARY_TEXT_MAX;
+    if !req.rows.iter().all(|r| {
+        !r.term.trim().is_empty()
+            && short(&r.term)
+            && r.definition.len() <= 4096
+            && r.aliases.iter().chain(&r.not_same_as).all(|a| short(a))
+            && r.source.as_deref().is_none_or(short)
+    }) {
+        return Err(refuse(
+            "every row needs a term; terms, names and sources are at most 200 bytes, a definition 4 KiB",
+        ));
+    }
+    let rows: Vec<Row> = req
+        .rows
+        .iter()
+        .map(|r| Row {
+            term: r.term.trim().to_owned(),
+            definition: r.definition.trim().to_owned(),
+            aliases: r.aliases.clone(),
+            not_same_as: r.not_same_as.clone(),
+            source: r.source.clone(),
+        })
+        .collect();
+    let reader = quality.reader()?;
+    let sources = service
+        .spec_model_sources(&ctx, workspace_id, project_id, reader.as_ref())
+        .await
+        .map_err(internal)?;
+    let found = find(
+        sources
+            .documents
+            .iter()
+            .map(|d| (d.path.as_str(), d.text.as_str())),
+    );
+    let content = render(&rows);
+    let mut files_out = vec![crate::product::port::DeclarationFile {
+        path: GLOSSARY_DOC_PATH.to_owned(),
+        content: content.clone(),
+    }];
+    let moved = found.as_ref().filter(|f| !f.whole).and_then(|f| {
+        let text = sources.documents.iter().find(|d| d.path == f.path)?;
+        Some((f.path.clone(), replace_section(&text.text, f)))
+    });
+    if let Some((path, content)) = &moved {
+        files_out.push(crate::product::port::DeclarationFile {
+            path: path.clone(),
+            content: content.clone(),
+        });
+    }
+    let what = match (&found, &moved) {
+        (Some(f), Some(_)) => format!(
+            "The glossary moves out of `{}` ({}) into `{GLOSSARY_DOC_PATH}`, where every document can link a term;              the section keeps its heading and links there.",
+            f.path,
+            f.heading.as_deref().unwrap_or("its glossary section"),
+        ),
+        (Some(_), None) => {
+            format!("`{GLOSSARY_DOC_PATH}` put in order and filled from what the documents name.")
+        }
+        _ => format!(
+            "The project had no glossary: `{GLOSSARY_DOC_PATH}`, from what its documents name."
+        ),
+    };
+    let files = project_files(&quality)?;
+    let branch = format!(
+        "docs/glossary-{}",
+        &super::spec_model::extract::revision(&content)[..12]
+    );
+    let written = files
+        .write(
+            &ctx,
+            &project_id.to_string(),
+            &branch,
+            &files_out,
+            &crate::product::port::PullRequestText {
+                message: "docs: the project's glossary".to_owned(),
+                title: "Docs: the project's glossary".to_owned(),
+                body: format!(
+                    "{what}\n\n{} terms, each with what it means, the other names it goes by and the terms it is not. \
+                     Proposed from the Glossary tab of Constructor Studio, to review.",
+                    rows.len()
+                ),
+            },
+            true,
+        )
+        .await
+        .map_err(invalid_or_internal)?;
+    Ok((
+        StatusCode::CREATED,
+        Json(SpecModelWriteDto {
+            path: GLOSSARY_DOC_PATH.to_owned(),
+            branch: written.branch,
+            commit_sha: written.commit_sha,
+            pr_url: written.pr_url,
+        }),
+    ))
+}
+
+/// The most facts one review action takes: a selection, not the model.
+const SPEC_REVIEW_BATCH_MAX: usize = 500;
+
+/// Accept, reject or put back a selection of facts in one action.
+async fn review_spec_model_facts(
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(service): Extension<Arc<DocumentsService>>,
+    Json(body): Json<SpecModelReviewRequest>,
+) -> ApiResult<JsonBody<SpecModelReviewListDto>> {
+    let project_id = parse_project_id(&body.project_id)?;
+    let workspace_id = parent_workspace(&service, &ctx, project_id).await?;
+    let invalid = |field: &str, why: &str| {
+        DocumentsError::invalid_argument()
+            .with_field_violation(field, why.to_owned(), "INVALID")
+            .create()
+    };
+    if body.items.is_empty() || body.items.len() > SPEC_REVIEW_BATCH_MAX {
+        return Err(invalid("items", "must hold between 1 and 500 facts"));
+    }
+    let mut items = Vec::with_capacity(body.items.len());
+    for i in body.items {
+        let key = i.fact_key.trim();
+        if key.is_empty() || key.len() > 128 {
+            return Err(invalid(
+                "fact_key",
+                "must be a fact's key of at most 128 bytes",
+            ));
+        }
+        if !review_state_fits(key, &i.state) {
+            return Err(invalid(
+                "state",
+                "must be accepted, rejected or proposed; for a hypothesis (ev:) supports, contradicts or \
+                 insufficient; for an obligation (ob:) excluded; for a match across projects (rel:) \
+                 reuse, coordinate, separate or unrelated",
+            ));
+        }
+        if i.note.as_ref().is_some_and(|n| n.len() > 2000) {
+            return Err(invalid("note", "must be at most 2000 bytes"));
+        }
+        if i.path.len() > 1024 || i.revision.len() > 128 {
+            return Err(invalid("path", "must be a document path and its revision"));
+        }
+        items.push((key.to_owned(), i.state, i.path, i.revision, i.note));
+    }
+    let saved: Vec<SpecModelReviewDto> = service
+        .put_spec_reviews(&ctx, workspace_id, project_id, items)
+        .await
+        .map_err(internal)?
+        .into_iter()
+        .map(spec_review_dto)
+        .collect();
+    Ok(Json(SpecModelReviewListDto {
+        total: u32::try_from(saved.len()).unwrap_or(u32::MAX),
+        items: saved,
+    }))
+}
+
+/// Record that two glossary entries are different things, so the pair is not
+/// offered as one thing again.
+async fn decide_glossary_distinct(
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(service): Extension<Arc<DocumentsService>>,
+    Json(body): Json<GlossaryDistinctRequest>,
+) -> ApiResult<StatusCode> {
+    let project_id = parse_project_id(&body.project_id)?;
+    let workspace_id = parent_workspace(&service, &ctx, project_id).await?;
+    let (a, b) = (body.a.trim(), body.b.trim());
+    for (field, key) in [("a", a), ("b", b)] {
+        if key.is_empty() || key.len() > GLOSSARY_TEXT_MAX {
+            return Err(DocumentsError::invalid_argument()
+                .with_field_violation(
+                    field,
+                    "must be a glossary entry's key".to_owned(),
+                    "INVALID",
+                )
+                .create());
+        }
+    }
+    if a == b {
+        return Err(DocumentsError::invalid_argument()
+            .with_field_violation("b", "must name another entry".to_owned(), "INVALID")
+            .create());
+    }
+    service
+        .put_spec_terms_distinct(&ctx, workspace_id, project_id, a, b)
+        .await
+        .map_err(internal)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn decide_glossary_entry(
     Extension(ctx): Extension<SecurityContext>,
     Extension(service): Extension<Arc<DocumentsService>>,
@@ -5693,6 +6285,100 @@ async fn create_spec_model_finding_proposal(
         StatusCode::CREATED,
         Json(SpecModelWriteDto {
             path: edit.path,
+            branch: written.branch,
+            commit_sha: written.commit_sha,
+            pr_url: written.pr_url,
+        }),
+    ))
+}
+
+/// Propose a sentence for one of the project's documents as a pull request:
+/// a paragraph of its own after the passage the model read, on the revision
+/// it read. What the Domain model tab offers for an entity no document
+/// relates to anything.
+async fn create_spec_model_sentence_proposal(
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(service): Extension<Arc<DocumentsService>>,
+    Extension(quality): Extension<Quality>,
+    Query(query): Query<SpecScopeQuery>,
+    Json(req): Json<SpecModelSentenceRequest>,
+) -> ApiResult<(StatusCode, JsonBody<SpecModelWriteDto>)> {
+    let project_id = parse_project_id(&query.project_id)?;
+    let workspace_id = parent_workspace(&service, &ctx, project_id).await?;
+    let refuse = |why: &str| {
+        DocumentsError::invalid_argument()
+            .with_constraint(why)
+            .create()
+    };
+    let reader = quality.reader()?;
+    let sources = service
+        .spec_model_sources(&ctx, workspace_id, project_id, reader.as_ref())
+        .await
+        .map_err(internal)?;
+    if !sources.documents.iter().any(|d| d.path == req.path) {
+        return Err(refuse(
+            "not one of the project's documents: only its documentation is proposed to",
+        ));
+    }
+    let files = project_files(&quality)?;
+    let project = project_id.to_string();
+    let text = files
+        .read(&ctx, &project, &req.path)
+        .await
+        .map_err(invalid_or_internal)?
+        .ok_or_else(|| {
+            DocumentsError::not_found("the document is not in the repository")
+                .with_resource(req.path.clone())
+                .create()
+        })?;
+    if super::spec_model::extract::revision(&text) != req.revision {
+        return Err(refuse(
+            "the document changed since the model read it: build the model again",
+        ));
+    }
+    let line = usize::try_from(req.line).unwrap_or(usize::MAX);
+    let changed = super::spec_model::domain_doc::insert_after(&text, line, &req.sentence)
+        .ok_or_else(|| refuse("no passage at that line to add a sentence after, or it is code"))?;
+    let sentence = req
+        .sentence
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let title: String = req
+        .why
+        .as_deref()
+        .map(str::trim)
+        .filter(|w| !w.is_empty())
+        .unwrap_or(&sentence)
+        .chars()
+        .take(70)
+        .collect();
+    let branch = format!(
+        "docs/{}",
+        &super::spec_model::extract::revision(&changed)[..12]
+    );
+    let written = files
+        .write(
+            &ctx,
+            &project,
+            &branch,
+            &[crate::product::port::DeclarationFile { path: req.path.clone(), content: changed }],
+            &crate::product::port::PullRequestText {
+                message: format!("docs: {title}"),
+                title: format!("Docs: {title}"),
+                body: format!(
+                    "{title}\n\nAdded to `{}` after line {line}:\n\n> {sentence}\n\nProposed from the Domain model tab.",
+                    req.path
+                ),
+            },
+            true,
+        )
+        .await
+        .map_err(invalid_or_internal)?;
+    Ok((
+        StatusCode::CREATED,
+        Json(SpecModelWriteDto {
+            path: req.path,
             branch: written.branch,
             commit_sha: written.commit_sha,
             pr_url: written.pr_url,
@@ -7304,6 +7990,29 @@ pub fn register_routes(
             .error_500(openapi)
             .register(router, openapi);
 
+    router = OperationBuilder::post("/studio-documents/v1/spec-model/sentences/proposals")
+        .operation_id("studio_documents.create_spec_model_sentence_proposal")
+        .summary("Propose a sentence for one of the project's documents as a pull request")
+        .description(
+            "A paragraph of its own after the block the given line sits in, on a `docs/…` branch \
+             with a pull request — a proposal, never a commit onto the document's branch. The Domain \
+             model tab uses it to state a relation no document states. 400 when the file is not one \
+             of the project's documents, it changed since the model read it, or the line is blank \
+             or code; 404 when it is not in the repository.",
+        )
+        .tag("StudioDocuments")
+        .authenticated()
+        .require_license_features::<License>([])
+        .query_param("project_id", true, "The project the document is in")
+        .json_request::<SpecModelSentenceRequest>(openapi, "The sentence and where it goes")
+        .handler(create_spec_model_sentence_proposal)
+        .json_response_with_schema::<SpecModelWriteDto>(openapi, StatusCode::CREATED, "The pull request")
+        .error_400(openapi)
+        .error_401(openapi)
+        .error_404(openapi)
+        .error_500(openapi)
+        .register(router, openapi);
+
     router = OperationBuilder::get("/studio-documents/v1/spec-model/glossary")
         .operation_id("studio_documents.get_spec_model_glossary")
         .summary("The project's glossary: what its documents name, and by which names")
@@ -7327,6 +8036,153 @@ pub fn register_routes(
         .error_404(openapi)
         .error_500(openapi)
         .error_503(openapi)
+        .register(router, openapi);
+
+    router = OperationBuilder::post("/studio-documents/v1/spec-model/issues")
+        .operation_id("studio_documents.create_spec_model_issue")
+        .summary("Open an issue in the project's repository for something to decide")
+        .description(
+            "A problem in the documents or a gap in the model, opened as an issue in the project's \
+             repository and assigned to people by their GitHub logins; the repository's sync then \
+             brings it back as work like any other issue.",
+        )
+        .tag("StudioDocuments")
+        .authenticated()
+        .require_license_features::<License>([])
+        .json_request::<SpecModelIssueRequest>(openapi, "The project, the issue and who it is for")
+        .handler(create_spec_model_issue)
+        .json_response_with_schema::<SpecModelIssueDto>(openapi, StatusCode::CREATED, "The issue")
+        .error_400(openapi)
+        .error_401(openapi)
+        .error_404(openapi)
+        .error_500(openapi)
+        .register(router, openapi);
+
+    router = OperationBuilder::get("/studio-documents/v1/spec-model/glossary/document")
+        .operation_id("studio_documents.get_spec_model_glossary_document")
+        .summary("The glossary the project's documents keep, read as written")
+        .description(
+            "`docs/glossary.md` when the repository has it, else the glossary section with a term \
+             table inside another document (a PRD's glossary), with its rows; `found` is null when \
+             the documents keep none.",
+        )
+        .tag("StudioDocuments")
+        .authenticated()
+        .require_license_features::<License>([])
+        .query_param("project_id", true, "The project whose glossary to find")
+        .handler(get_glossary_document)
+        .json_response_with_schema::<GlossaryDocDto>(
+            openapi,
+            StatusCode::OK,
+            "Where the glossary is",
+        )
+        .error_400(openapi)
+        .error_401(openapi)
+        .error_404(openapi)
+        .error_500(openapi)
+        .error_503(openapi)
+        .register(router, openapi);
+
+    router = OperationBuilder::post("/studio-documents/v1/spec-model/glossary/document/proposals")
+        .operation_id("studio_documents.create_spec_model_glossary_document_proposal")
+        .summary("Propose the project's glossary as docs/glossary.md")
+        .description(
+            "The rows written as `docs/glossary.md`, one table row per term with an anchor other \
+             documents link to, in a pull request. A glossary kept as a section of another document \
+             moves in the same pull request: the section keeps its heading and links to the file.",
+        )
+        .tag("StudioDocuments")
+        .authenticated()
+        .require_license_features::<License>([])
+        .json_request::<GlossaryDocRequest>(openapi, "The project and the glossary's rows")
+        .handler(create_glossary_document_proposal)
+        .json_response_with_schema::<SpecModelWriteDto>(openapi, StatusCode::CREATED, "The pull request")
+        .error_400(openapi)
+        .error_401(openapi)
+        .error_404(openapi)
+        .error_500(openapi)
+        .error_503(openapi)
+        .register(router, openapi);
+
+    router = OperationBuilder::post("/studio-documents/v1/spec-model/files/proposals")
+        .operation_id("studio_documents.create_spec_model_file_proposal")
+        .summary("Propose a whole document for the project's repository as a pull request")
+        .description(
+            "What a member accepted in Studio — the need, a prioritisation — written to a Markdown \
+             file under `docs/` on a `docs/…` branch with a pull request: a proposal, never a commit \
+             onto the repository's branch. 400 for any other path or an empty document.",
+        )
+        .tag("StudioDocuments")
+        .authenticated()
+        .require_license_features::<License>([])
+        .json_request::<SpecModelFileProposalRequest>(openapi, "The document and where it goes")
+        .handler(create_spec_model_file_proposal)
+        .json_response_with_schema::<SpecModelWriteDto>(openapi, StatusCode::CREATED, "The pull request")
+        .error_400(openapi)
+        .error_401(openapi)
+        .error_404(openapi)
+        .error_500(openapi)
+        .register(router, openapi);
+
+    router = OperationBuilder::get("/studio-documents/v1/spec-model/reviews")
+        .operation_id("studio_documents.list_spec_model_reviews")
+        .summary("Every accept or reject members gave on the facts the model read")
+        .description(
+            "What the model proposes is the project's reading only once a member accepts it; a \
+             rejected reading is not proposed again while its passage says the same.",
+        )
+        .tag("StudioDocuments")
+        .authenticated()
+        .require_license_features::<License>([])
+        .query_param("project_id", true, "The project")
+        .handler(list_spec_model_reviews)
+        .json_response_with_schema::<SpecModelReviewListDto>(openapi, StatusCode::OK, "The reviews")
+        .error_400(openapi)
+        .error_401(openapi)
+        .error_404(openapi)
+        .error_500(openapi)
+        .register(router, openapi);
+
+    router = OperationBuilder::post("/studio-documents/v1/spec-model/reviews")
+        .operation_id("studio_documents.decide_spec_model_fact_reviews")
+        .summary("Accept, reject or put back a selection of facts in one action")
+        .description(
+            "Each item is a fact's key with `accepted`, `rejected`, or `proposed` to withdraw an \
+             earlier review, and where it was read. At most 500 in one call.",
+        )
+        .tag("StudioDocuments")
+        .authenticated()
+        .require_license_features::<License>([])
+        .json_request::<SpecModelReviewRequest>(openapi, "The project and the facts")
+        .handler(review_spec_model_facts)
+        .json_response_with_schema::<SpecModelReviewListDto>(
+            openapi,
+            StatusCode::OK,
+            "What was recorded",
+        )
+        .error_400(openapi)
+        .error_401(openapi)
+        .error_404(openapi)
+        .error_500(openapi)
+        .register(router, openapi);
+
+    router = OperationBuilder::post("/studio-documents/v1/spec-model/glossary/distinct")
+        .operation_id("studio_documents.decide_spec_model_glossary_distinct")
+        .summary("Say two glossary entries are different things")
+        .description(
+            "Kept on both entries as `distinct_from`, so the glossary does not offer them as one \
+             thing again. Each entry's name and alias decision stay as they are.",
+        )
+        .tag("StudioDocuments")
+        .authenticated()
+        .require_license_features::<License>([])
+        .json_request::<GlossaryDistinctRequest>(openapi, "The project and the two entries")
+        .handler(decide_glossary_distinct)
+        .no_content_response(StatusCode::NO_CONTENT, "Recorded")
+        .error_400(openapi)
+        .error_401(openapi)
+        .error_404(openapi)
+        .error_500(openapi)
         .register(router, openapi);
 
     router = OperationBuilder::post("/studio-documents/v1/spec-model/glossary/decisions")

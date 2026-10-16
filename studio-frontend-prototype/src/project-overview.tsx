@@ -78,10 +78,13 @@ import { ProjectPath } from "./project-path-view";
  * Reintroducing it as a section means reintroducing that column. */
 export type ProjTab =
   | "overview"
+  | "issues"
   | "specs"
   | "model"
   | "components"
+  | "parts"
   | "builds"
+  | "deploys"
   | "kits"
   | "artifacts"
   | "sources"

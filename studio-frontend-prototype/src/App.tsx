@@ -5,11 +5,12 @@ import { VIEW_PATHS, pathToPlace, placeToPath, type KnownPlaces } from "./place-
 import { URL_CHANGE_EVENT } from "./list-state";
 import type { FormEvent, ReactNode } from "react";
 import { env as runtimeEnv, idpConsoleUrl } from "./env";
-import { errText, matches } from "./format";
+import { errText, matches, relTime } from "./format";
 // Screens that arrive when somebody asks for them — see ./lazy-screens for
 // what is split and what deliberately is not.
 import {
   ComponentsCatalog,
+  PlatformSourcesPanel,
   ReportsScreen,
   DocumentTypesTab,
   DocumentsTab,
@@ -58,6 +59,7 @@ import {
   type ShareMode,
 } from "./project-sources";
 import { ProjectOverview, type ProjTab } from "./project-overview";
+import { ProjectComponentsInventory } from "./project-components-view";
 import { makeZip } from "./zip";
 import { SpecModelTab } from "./spec-model-tab";
 import { ProjectBuilds } from "./builds-tab";
@@ -116,6 +118,10 @@ const PREF_LANGUAGE = "app.language";
  *  The rail holds only what they pinned; every level's own sections are the
  *  band above the work area, so hiding it loses no destination. */
 const PREF_RAIL = "app.rail";
+/** The order a person keeps a project's / a workspace's sections in, the same
+ *  for every project (section-band.tsx). */
+const PREF_PROJECT_TAB_ORDER = "project.tabs.order";
+const PREF_WORKSPACE_TAB_ORDER = "workspace.tabs.order";
 import { ActivityView } from "./activity-view";
 import { PresenceNotes, WhoIsOnline, usePresence } from "./presence";
 import { followRun } from "./studio-events";
@@ -126,8 +132,13 @@ import { productIdFrom } from "./product";
 import { PortalNavProvider, type PortalNav } from "./portal-nav";
 import { OrgDashboard } from "./org-dashboard";
 import { OrgEnvironments } from "./environments-screen";
+import { ProjectDeploys } from "./project-deploys-tab";
+import { KubeconfigField } from "./kubeconfig-field";
+import { kubeconfigServer } from "./kubeconfig";
+import { environmentsByConnection } from "./environments";
+import { GEAR_REPOSITORY } from "./gear-repositories";
 import { OrgCosts } from "./costs-screen";
-import { OrgSources, PlatformSources } from "./platform-sources";
+import { PlatformSources } from "./platform-sources";
 import { PublicationRequests } from "./publication-requests";
 import { MyIdentitiesCard, MyPersonCard, PersonPhoto } from "./people-profile";
 import { orgPeople } from "./org-people";
@@ -145,6 +156,7 @@ import {
   SlidersIcon,
   SparkleIcon,
 } from "./icons";
+import { OrderedSections } from "./section-band";
 import { isPinned, loadPins, pinKey, savePins, togglePin, type Pin } from "./pins";
 import {
   clampStep,
@@ -634,6 +646,13 @@ function NavIcon({ name }: { name: string }) {
         <path d="m9 12 2 2 4-4" />
       </>
     ),
+    alert: (
+      <>
+        <circle cx="12" cy="12" r="9" />
+        <path d="M12 7.5v5.5" />
+        <path d="M12 16.5h.01" />
+      </>
+    ),
     org: (
       <>
         <rect x="4" y="3" width="16" height="18" rx="1" />
@@ -738,8 +757,9 @@ const LEVEL_NAV: Record<"platform" | "organization", { id: View; icon: string; l
   platform: [
     // The common set every organization builds on (ADR-0042).
     { id: "platform", icon: "layers", label: "Components" },
-    // The repositories those components come from (ADR-0046).
-    { id: "platform-sources", icon: "plug", label: "Sources" },
+    // Where those components come from: what the catalogue lists (ADR-0042)
+    // and what products are built from (ADR-0046), one row per repository.
+    { id: "platform-sources", icon: "plug", label: "Repositories" },
     // What organizations ask the platform to take, answered by a curator.
     { id: "publications", icon: "package", label: "Publication requests" },
     // How the deployment itself is doing.
@@ -755,10 +775,9 @@ const LEVEL_NAV: Record<"platform" | "organization", { id: View; icon: string; l
     { id: "environments", icon: "layers", label: "Environments" },
     // What its model calls and IDE sessions cost, and the prices (issue #781).
     { id: "costs", icon: "coins", label: "Costs" },
-    // What its projects build: the registry, candidates, its gear repository.
+    // What its projects build: the registry, the catalogue, and the gear
+    // repositories it comes from (ADR-0046) -- one page, one question.
     { id: "gears", icon: "package", label: "Components" },
-    // Its own gear repositories, read after the platform's (ADR-0046).
-    { id: "org-sources", icon: "plug", label: "Sources" },
     // Every report the Studio draws, configured once for the organization.
     { id: "reports", icon: "activity", label: "Reports" },
     // Its studio-tasks runs and studio-scheduler schedules.
@@ -2390,19 +2409,13 @@ function Shell({ token, me, onLogout }: { token: string; me: Me; onLogout: () =>
           and would each cost a line in a 240px column. */}
       {projectOpen && (
         <nav className="project-sections" aria-label="Project sections">
-          {PROJECT_TABS.map((t) => (
-            <button
-              key={t.id}
-              className={`psection${projectTab === t.id ? " on" : ""}`}
-              aria-current={projectTab === t.id ? "page" : undefined}
-              onClick={() => setProjectTab(t.id)}
-            >
-              <span className="ico" aria-hidden>
-                <NavIcon name={t.icon} />
-              </span>
-              {t.label}
-            </button>
-          ))}
+          <OrderedSections
+            prefKey={PREF_PROJECT_TAB_ORDER}
+            tabs={PROJECT_TABS}
+            active={projectTab}
+            onOpen={setProjectTab}
+            icon={(name) => <NavIcon name={name} />}
+          />
           {/* Pinning a project section belongs on the section, not in the rail:
               the rail cannot know which project is open, and a picker listing
               every project x every section is a list nobody reads. */}
@@ -2441,20 +2454,13 @@ function Shell({ token, me, onLogout }: { token: string; me: Me; onLogout: () =>
           switch — the level above should not invent its own navigation. */}
       {workspaceOpen && (
         <nav className="project-sections" aria-label="Workspace sections">
-          {WORKSPACE_TABS.map((t) => (
-            <button
-              key={t.id}
-              className={`psection${workspaceTab === t.id ? " on" : ""}`}
-              aria-current={workspaceTab === t.id ? "page" : undefined}
-              title={t.hint}
-              onClick={() => setWorkspaceTab(t.id)}
-            >
-              <span className="ico" aria-hidden>
-                <NavIcon name={t.icon} />
-              </span>
-              {t.label}
-            </button>
-          ))}
+          <OrderedSections
+            prefKey={PREF_WORKSPACE_TAB_ORDER}
+            tabs={WORKSPACE_TABS}
+            active={workspaceTab}
+            onOpen={setWorkspaceTab}
+            icon={(name) => <NavIcon name={name} />}
+          />
         </nav>
       )}
       {/* Spaces host: all session iframes stay mounted; only the active one
@@ -2702,8 +2708,13 @@ function Shell({ token, me, onLogout }: { token: string; me: Me; onLogout: () =>
           />
         )}
         {view === "publications" && <PublicationRequests token={token} orgId={orgAsSpace?.id} />}
-        {view === "platform-sources" && <PlatformSources token={token} isPlatformAdmin={showPlatform} />}
-        {view === "org-sources" && <OrgSources token={token} orgId={orgAsSpace?.id} />}
+        {view === "platform-sources" && (
+          <PlatformSources
+            token={token}
+            isPlatformAdmin={showPlatform}
+            catalogueSettings={<PlatformSourcesPanel token={token} onSynced={() => undefined} />}
+          />
+        )}
         {view === "costs" && orgAsSpace && (
           <OrgCosts
             key={orgAsSpace.id}
@@ -2773,8 +2784,12 @@ function Shell({ token, me, onLogout }: { token: string; me: Me; onLogout: () =>
             projects={workspaces.filter((w) => w.orgId === orgAsSpace?.id).map((w) => ({ id: w.id, name: w.name }))}
           />
         )}
-        {(view === "gears" || view === "platform") && (
+        {(view === "gears" || view === "platform" || view === "org-sources") && (
           <ComponentsCatalog
+            // Organization › Sources moved into Components: an address kept
+            // from before opens the Repositories pane.
+            initialPane={view === "org-sources" ? "repositories" : undefined}
+            onOpenRepositories={() => setView("platform-sources")}
             // Remounted when the organization resolves: the registry and the
             // catalogue read it once, and a page opened straight from its
             // address mounts before the organization is known.
@@ -5230,6 +5245,10 @@ const PROJECT_TABS: { id: ProjTab; icon: string; label: string }[] = [
   // In the order the work happens, which is not the order the sections were
   // added. Icons are the lucide names the shipped project-sidebar picks.
   { id: "overview", icon: "home", label: "Overview" },
+  // Everything to decide about the project in one place: what stops a build,
+  // what to look at, how the documentation could be better. A question about
+  // the whole project, so a tab of the project, not of one of its sections.
+  { id: "issues", icon: "alert", label: "Issues" },
   // Specs first, because everything after it is downstream of a document: the
   // components a product is composed from are matched against what its specs
   // declare, and the artifacts are what came out. Reading the row left to right
@@ -5251,6 +5270,11 @@ const PROJECT_TABS: { id: ProjTab; icon: string; label: string }[] = [
   // this tab makes of them is the product. The organization and the platform
   // keep "Components" for what they hold. The id stays, so links still open it.
   { id: "components", icon: "package", label: "Product" },
+  // What the project is made of: the platform's and the organization's
+  // components it takes, its own gears, its code that could become one, the
+  // services that are not gears, and the gears its documents ask for that
+  // nobody wrote. After Product, which composes some of them into the product.
+  { id: "parts", icon: "grid", label: "Components" },
   // Kits are how the project works (workflows, conventions pinned to a Git
   // version), not what it is made of, so they stopped sharing a page with the
   // specs-to-product journey.
@@ -5258,6 +5282,11 @@ const PROJECT_TABS: { id: ProjTab; icon: string; label: string }[] = [
   // the tab that says what it is made of, before where it runs. The portal
   // does not build; CI and the IDE do.
   { id: "builds", icon: "activity", label: "Builds" },
+  // Where the product runs (ADR-0043): the organization's environments this
+  // project may deploy to, its namespace in each, its bindings and deploys.
+  // After Builds, because a deploy takes what a build made. It was a block at
+  // the bottom of the Product card, under the configuration.
+  { id: "deploys", icon: "layers", label: "Deploys" },
   { id: "kits", icon: "grid", label: "Kits" },
   { id: "artifacts", icon: "file", label: "Artifacts" },
   // Sources sits after them because it is where they come from: a sync run
@@ -5608,8 +5637,14 @@ function ProjectScreen({
             onPendingGearTaken={() => setPendingGear(null)}
           />
         )}
+        {tab === "parts" && (
+          <ProjectComponentsInventory token={token} projectId={proj.id} workspaceId={workspace.id} onOpenProduct={() => setTab("components")} />
+        )}
         {tab === "builds" && (
           <ProjectBuilds token={token} projectId={proj.id} onOpenStudio={() => onOpenStudio(proj)} />
+        )}
+        {tab === "deploys" && (
+          <ProjectDeploys token={token} projectId={proj.id} onOpenStudio={() => onOpenStudio(proj)} />
         )}
         {tab === "kits" && (
           <ProjectKits
@@ -5636,10 +5671,21 @@ function ProjectScreen({
             />
           </>
         )}
+        {tab === "issues" && (
+          <SpecModelTab
+            token={token}
+            projectId={proj.id}
+            workspaceId={workspace.id}
+            only="issues"
+            orgId={proj.orgId}
+            onOpenFile={(path) => void studio?.openFile(proj, path)}
+          />
+        )}
         {tab === "model" && (
           <SpecModelTab
             token={token}
             projectId={proj.id}
+            workspaceId={workspace.id}
             onOpenFile={(path) => void studio?.openFile(proj, path)}
             onCreateGear={(draft) => {
               setPendingGear(draft);
@@ -7020,11 +7066,26 @@ function SecretsView({
 /* ── Connectors (aggregate of workspace sources) ── */
 
 /** Provider groups in the picker. Keys match ConnectorDriver::category(). */
+/** What a scope goes without when it has no connection of a kind. */
+const MISSING_MEANS: Record<string, string> = {
+  source_code: "no repository can be attached or synced",
+  ai: "the IDE agents and chat run only on personal keys",
+  notification: "Studio cannot tell anyone what happened",
+  cluster: "no environment can deploy anywhere",
+};
+
+/** How long a connection's answer to a test is trusted before it is asked
+ *  again: the page opens often, the providers should not be asked as often. */
+const HEALTH_TTL_MS = 5 * 60_000;
+
+/** Each connection's last answer, kept across visits to the page. */
+const healthCache = new Map<string, { state: "ok" | "bad"; text: string; at: number }>();
+
 const CATEGORIES: { key: string; title: string; blurb: string }[] = [
   {
     key: "source_code",
     title: "Source code",
-    blurb: "Browse repositories and attach them to this project.",
+    blurb: "Repositories Studio reads: browse them and attach them to projects.",
   },
   {
     key: "ai",
@@ -8196,10 +8257,27 @@ function ConnectorsView({
   const [disabled, setDisabled] = useState<string | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [note, setNote] = useState<string | null>(null);
+  /** The provider picker: closed (null), open on every kind (""), or open on
+   *  one kind the "Not connected yet" line asked for. */
+  const [adding, setAdding] = useState<string | null>(null);
   // Bumped when a repo is attached/detached anywhere on the tab, so the sources
   // panel and the connector browser's "attached" flags stay in sync.
   const [sourcesTick, setSourcesTick] = useState(0);
   const bumpSources = () => setSourcesTick((t) => t + 1);
+  // Which environments deploy with each cluster, for the Used by column. Only
+  // the organization's page has them; a failure leaves the column quiet.
+  const [envUses, setEnvUses] = useState<Map<string, string[]>>(new Map());
+  useEffect(() => {
+    if (ws.id !== ws.orgId) return;
+    let live = true;
+    api
+      .environments(token, ws.id)
+      .then((r) => live && setEnvUses(environmentsByConnection(r.items)))
+      .catch(() => undefined);
+    return () => {
+      live = false;
+    };
+  }, [token, ws.id, ws.orgId]);
 
   const reload = useCallback(async () => {
     if (!ws) return;
@@ -8231,7 +8309,7 @@ function ConnectorsView({
 
   return (
     <>
-      <h1>Connectors</h1>
+      <h1>Connections</h1>
       <p className="subtitle">
         How repositories and model credentials enter <b>{ws.name}</b>: its own connections plus
         those shared with every project. Configure one once, then pick
@@ -8248,16 +8326,18 @@ function ConnectorsView({
         </div>
       )}
 
-      {/* Connectors + the repository browser live here (the Sources tab). The
-          attached-sources list itself now lives on the Nested projects tab,
-          next to the projects those sources feed. */}
-      {!disabled && (
+      {/* What is connected comes first; the provider picker opens as a block
+          above the list only when someone adds one. */}
+      {!disabled && adding !== null && (
         <AddConnector
           token={token}
           workspace={ws}
           providers={providers ?? []}
+          category={adding || undefined}
+          onClose={() => setAdding(null)}
           onAdded={(t) => {
             setNote(`Connected as ${t.account}${t.display_name ? ` (${t.display_name})` : ""}.`);
+            setAdding(null);
             void reload();
           }}
         />
@@ -8271,9 +8351,12 @@ function ConnectorsView({
           connections={connections ?? []}
           loading={connections === null}
           sourcesTick={sourcesTick}
+          envUses={envUses}
           onSourcesChanged={bumpSources}
           onChanged={() => void reload()}
           onNote={setNote}
+          onAdd={(category) => setAdding(category ?? "")}
+          adding={adding !== null}
         />
       )}
 
@@ -8292,14 +8375,20 @@ function AddConnector({
   token,
   workspace,
   providers,
+  category,
+  onClose,
   onAdded,
 }: {
   token: string;
   workspace: Workspace;
   providers: ConnectorProvider[];
+  /** Open on one kind, from the "Not connected yet" line. */
+  category?: string;
+  onClose: () => void;
   onAdded: (t: { account: string; display_name?: string }) => void;
 }) {
   const [picked, setPicked] = useState<ConnectorProvider | null>(null);
+  const [find, setFind] = useState("");
   const [label, setLabel] = useState("");
   const [baseUrl, setBaseUrl] = useState("");
   const [pat, setPat] = useState("");
@@ -8309,7 +8398,11 @@ function AddConnector({
   // first "Test & save" fail on a write they aren't allowed — the connector
   // never landed. Org-shared stays one explicit choice away for the case where
   // one PAT really is an organization asset shared across every project.
-  const [reach, setReach] = useState<Reach>("workspace");
+  // On the organization's own page there is no project to keep it to: the
+  // choice is the organization or yourself, and the organization is the default.
+  const atOrg = workspace.id === workspace.orgId;
+  const defaultReach: Reach = atOrg ? "organization" : "workspace";
+  const [reach, setReach] = useState<Reach>(defaultReach);
   const [busy, setBusy] = useState<"probe" | "save" | null>(null);
   const [result, setResult] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -8320,7 +8413,7 @@ function AddConnector({
     setBaseUrl("");
     setPat("");
     setReveal(false);
-    setReach("workspace");
+    setReach(defaultReach);
     setResult(null);
     setError(null);
   };
@@ -8335,38 +8428,48 @@ function AddConnector({
   }
 
   if (!picked) {
+    const q = find.trim().toLowerCase();
+    const where = workspace.id === workspace.orgId ? workspace.name : `${workspace.name}`;
     return (
-      <div className="card">
-        <h2>Add connector</h2>
-        <p className="hint">Connect this project to an external tool or service.</p>
-        {CATEGORIES.map(({ key, title, blurb }) => {
-          const group = providers.filter((p) => p.category === key);
+      <div className="card conn-picker" data-connection-picker>
+        <div className="conn-picker-head">
+          <h2>Add a connection to {where}</h2>
+          <input type="search" placeholder="Find a provider" value={find} onChange={(e) => setFind(e.target.value)} aria-label="Find a provider" />
+          <button type="button" className="ghost" onClick={onClose}>
+            Close
+          </button>
+        </div>
+        {CATEGORIES.filter(({ key }) => !category || key === category).map(({ key, title, blurb }) => {
+          const group = providers.filter(
+            (p) => p.category === key && (!q || `${p.display_name} ${p.provider} ${title}`.toLowerCase().includes(q)),
+          );
           if (group.length === 0) return null;
           return (
-            <div key={key}>
+            <section key={key} className="conn-picker-group">
               <h3 className="group">{title}</h3>
               <p className="hint">{blurb}</p>
-              <ul className="rows">
+              <div className="conn-picker-tiles">
                 {group.map((p) => (
-                  <li key={p.provider}>
+                  <button
+                    key={p.provider}
+                    type="button"
+                    className="conn-picker-tile"
+                    title={p.default_base_url}
+                    onClick={() => {
+                      setPicked(p);
+                      // An environment takes only a cluster the organization
+                      // holds, so a cluster starts organization-wide.
+                      if (p.provider === "kubernetes") setReach("organization");
+                    }}
+                  >
                     <span className="conn-logo-slot" aria-hidden>
                       <ConnectorLogo provider={p.provider} label={p.display_name} />
                     </span>
-                    <div className="grow">
-                      <div className="name">{p.display_name}</div>
-                      <div className="sub">
-                        {title.toLowerCase()} · {p.default_base_url}
-                      </div>
-                    </div>
-                    {/* Proof this is plugin-backed: the driver's GTS instance id. */}
-                    <span className="sub" title={p.instance_id}>
-                      {p.instance_id.split("~").filter(Boolean).slice(-1)[0]}
-                    </span>
-                    <button onClick={() => setPicked(p)}>Connect</button>
-                  </li>
+                    <span className="name">{p.display_name}</span>
+                  </button>
                 ))}
-              </ul>
-            </div>
+              </div>
+            </section>
           );
         })}
       </div>
@@ -8407,8 +8510,8 @@ function AddConnector({
   };
 
   return (
-    <div className="card">
-      <h2>Add connector</h2>
+    <div className="card conn-picker">
+      <h2>Connect {picked.display_name}</h2>
       <ul className="rows">
         <li>
           <span className="conn-logo-slot" aria-hidden>
@@ -8426,8 +8529,10 @@ function AddConnector({
 
       <label>Available to</label>
       <select value={reach} onChange={(e) => setReach(e.target.value as Reach)}>
-        <option value="workspace">{workspace.name} — this project only</option>
-        <option value="organization">Shared — inherited by every project</option>
+        {!atOrg && <option value="workspace">{workspace.name} — this project only</option>}
+        <option value="organization">
+          {atOrg ? `Everyone in ${workspace.name} — every project` : "Shared — inherited by every project"}
+        </option>
         <option value="personal">Only me — private to my account</option>
       </select>
       <p className="hint">
@@ -8471,16 +8576,32 @@ function AddConnector({
       )}
 
       <label>{picked.credential_label}</label>
-      <div className="row">
-        <input
-          className="grow"
-          type={reveal ? "text" : "password"}
-          placeholder={picked.credential_hint}
+      {picked.provider === "kubernetes" ? (
+        <KubeconfigField
           value={pat}
-          onChange={(e) => setPat(e.target.value)}
+          reveal={reveal}
+          onReveal={() => setReveal((v) => !v)}
+          placeholder={picked.credential_hint}
+          onChange={(text) => {
+            setPat(text);
+            // The kubeconfig names its API server; the connection's address
+            // must be that server, so take it unless one is typed already.
+            const server = kubeconfigServer(text);
+            if (server && !baseUrl.trim()) setBaseUrl(server);
+          }}
         />
-        <button onClick={() => setReveal((v) => !v)}>{reveal ? "Hide" : "Show"}</button>
-      </div>
+      ) : (
+        <div className="row">
+          <input
+            className="grow"
+            type={reveal ? "text" : "password"}
+            placeholder={picked.credential_hint}
+            value={pat}
+            onChange={(e) => setPat(e.target.value)}
+          />
+          <button onClick={() => setReveal((v) => !v)}>{reveal ? "Hide" : "Show"}</button>
+        </div>
+      )}
       <p className="hint">
         Stored in credstore under a per-connection reference. Never logged, never returned by the
         API.
@@ -8491,6 +8612,9 @@ function AddConnector({
 
       <div className="row">
         <button onClick={reset}>← Back</button>
+        <button className="ghost" onClick={onClose}>
+          Close
+        </button>
         <span className="grow" />
         <button disabled={!pat.trim() || busy !== null} onClick={() => void submit("probe")}>
           {busy === "probe" ? "Testing…" : "Test connection"}
@@ -8517,23 +8641,41 @@ function ConnectionList({
   connections,
   loading,
   sourcesTick,
+  envUses,
   onSourcesChanged,
   onChanged,
   onNote,
+  onAdd,
+  adding,
 }: {
   token: string;
   workspace: Workspace;
   providers: ConnectorProvider[];
   connections: Connection[];
   loading: boolean;
+  /** Open the provider picker, on one kind or on all. */
+  onAdd: (category?: string) => void;
+  /** Whether the picker is open above. */
+  adding: boolean;
   sourcesTick: number;
+  /** Environments by the cluster connection they deploy with. */
+  envUses: Map<string, string[]>;
   onSourcesChanged: () => void;
   onChanged: () => void;
   onNote: (s: string) => void;
 }) {
   const [open, setOpen] = useState<string | null>(null);
   const [editing, setEditing] = useState<string | null>(null);
-  const [health, setHealth] = useState<Record<string, "ok" | "bad" | "testing">>({});
+  // Each connection's last answer: from the cache when it is fresh, else asked
+  // once when the list shows. A forced test always asks.
+  const [health, setHealth] = useState<Record<string, { state: "ok" | "bad" | "testing"; text: string; at: number }>>(() =>
+    Object.fromEntries([...healthCache.entries()]),
+  );
+  const [, tick] = useState(0);
+  useEffect(() => {
+    const t = setInterval(() => tick((n) => n + 1), 30_000);
+    return () => clearInterval(t);
+  }, []);
 
   const nameOf = (p: string) => providers.find((x) => x.provider === p)?.display_name ?? p;
   const categoryOf = (p: string) => providers.find((x) => x.provider === p)?.category;
@@ -8543,19 +8685,38 @@ function ConnectionList({
   const inheritedOf = (c: Connection) => c.owner_tenant_id !== workspace.id;
   const browsable = (c: Connection) => categoryOf(c.provider) === "source_code";
 
-  const test = (c: Connection) => {
-    setHealth((h) => ({ ...h, [c.id]: "testing" }));
-    void api
-      .testConnection(token, c.id, workspace.id)
-      .then((t) => {
-        setHealth((h) => ({ ...h, [c.id]: "ok" }));
-        onNote(`${c.label}: valid — ${t.account}`);
-      })
-      .catch((e) => {
-        setHealth((h) => ({ ...h, [c.id]: "bad" }));
-        onNote(`${c.label}: ${errText(e)}`);
-      });
-  };
+  const test = useCallback(
+    (c: Connection) => {
+      setHealth((h) => ({ ...h, [c.id]: { state: "testing", text: h[c.id]?.text ?? "Checking…", at: h[c.id]?.at ?? Date.now() } }));
+      void api
+        .testConnection(token, c.id, workspace.id)
+        .then((t) => {
+          const v = { state: "ok" as const, text: t.display_name ? `${t.account} (${t.display_name})` : t.account, at: Date.now() };
+          healthCache.set(c.id, v);
+          setHealth((h) => ({ ...h, [c.id]: v }));
+        })
+        .catch((e) => {
+          const v = { state: "bad" as const, text: errText(e), at: Date.now() };
+          healthCache.set(c.id, v);
+          setHealth((h) => ({ ...h, [c.id]: v }));
+        });
+    },
+    [token, workspace.id],
+  );
+  // Ask what has no fresh answer, once per list of connections.
+  const ids = connections.map((c) => c.id).join(",");
+  useEffect(() => {
+    const now = Date.now();
+    for (const c of connections) {
+      const known = healthCache.get(c.id);
+      if (!known || now - known.at > HEALTH_TTL_MS) test(c);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [ids, test]);
+  const defaultUrl = (p: string) => providers.find((x) => x.provider === p)?.default_base_url ?? "";
+  const missing = CATEGORIES.filter(
+    ({ key }) => providers.some((p) => p.category === key) && !connections.some((c) => categoryOf(c.provider) === key),
+  );
 
   const providersPresent = [...new Set(connections.map((c) => c.provider))];
   const categoriesPresent = CATEGORIES.filter(({ key }) => connections.some((c) => categoryOf(c.provider) === key));
@@ -8592,45 +8753,74 @@ function ConnectionList({
             match: (c, v) => c.provider === v,
           },
         ]}
-        empty={{ title: "Nothing connected for this project yet.", body: "Add a connector below." }}
+        primary={
+          <button type="button" className="primary" disabled={adding} onClick={() => onAdd()}>
+            + Add connection
+          </button>
+        }
+        empty={{ title: `Nothing connected to ${workspace.name} yet.`, body: "“+ Add connection” starts with a provider." }}
         columns={[
           {
-            id: "connector",
-            header: "Connector",
+            id: "connection",
+            header: "Connection",
             className: "acell-lead",
-            compare: (a, b) => nameOf(a.provider).localeCompare(nameOf(b.provider)),
+            compare: (a, b) => a.label.localeCompare(b.label),
             cell: (c) => (
               <>
                 <span className="conn-logo-slot" aria-hidden>
                   <ConnectorLogo provider={c.provider} label={nameOf(c.provider)} />
                 </span>
-                {nameOf(c.provider)}
+                <span>
+                  <span className="conn-name">
+                    <span className={`conn-dot conn-dot-${health[c.id]?.state ?? "testing"}`} aria-hidden />
+                    {c.label}
+                  </span>
+                  <span className="sub conn-sub">
+                    {nameOf(c.provider)}
+                    {c.base_url && c.base_url.replace(/\/$/, "") !== defaultUrl(c.provider).replace(/\/$/, "")
+                      ? ` · ${c.base_url.replace(/^https?:\/\//, "")}`
+                      : ""}
+                  </span>
+                </span>
               </>
             ),
           },
-          { id: "kind", header: "Kind", cell: (c) => <span className="sub">{categoryTitle(c.provider)}</span> },
-          { id: "account", header: "Account", cell: (c) => c.account || <span className="ing-dash">—</span> },
-          { id: "label", header: "Label", compare: (a, b) => a.label.localeCompare(b.label), cell: (c) => c.label },
           {
-            id: "url",
-            header: "URL",
-            className: "conn-url",
-            cell: (c) => <span title={c.base_url}>{c.base_url}</span>,
+            id: "kind",
+            header: "Kind",
+            compare: (a, b) => categoryTitle(a.provider).localeCompare(categoryTitle(b.provider)),
+            cell: (c) => <span className="sub">{categoryTitle(c.provider)}</span>,
           },
           {
-            id: "health",
-            header: "Health",
+            id: "answers",
+            header: "Answers",
             cell: (c) => {
               const h = health[c.id];
               return (
-                <span
-                  className={`badge ${h === "ok" ? "ok" : h === "bad" ? "danger" : ""}`}
-                  title={h ? undefined : "Health is not cached — Test checks it now"}
-                >
-                  {h === "ok" ? "healthy" : h === "bad" ? "failing" : h === "testing" ? "testing…" : "not checked"}
+                <span className={`conn-answer ${h?.state ?? "testing"}`} title={h?.text}>
+                  {h ? h.text.replace(` (${c.base_url})`, "").replace(` (${c.base_url.replace(/\/$/, "")})`, "") : "Checking…"}
+                  {h && h.state !== "testing" && <span className="sub"> · checked {relTime(new Date(h.at).toISOString())}</span>}
                 </span>
               );
             },
+          },
+          {
+            // What reads this connection, so nobody removes a cluster an
+            // environment deploys with without seeing it.
+            id: "used",
+            header: "Used by",
+            cell: (c) =>
+              c.provider === "kubernetes" ? (
+                envUses.get(c.id)?.length ? (
+                  <span className="sub">environments: {envUses.get(c.id)?.join(", ")}</span>
+                ) : (
+                  <span className="sub">no environment yet</span>
+                )
+              ) : c.provider === GEAR_REPOSITORY ? (
+                <span className="sub">Components › Repositories</span>
+              ) : (
+                <span className="ing-dash">—</span>
+              ),
           },
           {
             id: "scope",
@@ -8642,12 +8832,8 @@ function ConnectionList({
             ),
           },
         ]}
-        inline={(c) => (
-          <button type="button" className="ghost" disabled={health[c.id] === "testing"} onClick={() => test(c)}>
-            Test
-          </button>
-        )}
         actions={(c) => [
+          { label: health[c.id]?.state === "testing" ? "Checking…" : "Test again", disabled: health[c.id]?.state === "testing", onSelect: () => test(c) },
           {
             label: editing === c.id ? "Close editor" : "Edit",
             // Inherited connections are edited where they are defined.
@@ -8695,11 +8881,8 @@ function ConnectionList({
                 if (changed) {
                   // A rotated credential invalidates the cached health badge:
                   // it was computed for the old token.
-                  setHealth((h) => {
-                    const next = { ...h };
-                    delete next[c.id];
-                    return next;
-                  });
+                  healthCache.delete(c.id);
+                  test(c);
                   onChanged();
                 }
               }}
@@ -8716,6 +8899,19 @@ function ConnectionList({
           ) : null
         }
       />
+      {!loading && missing.length > 0 && (
+        <div className="conn-missing" data-connections-missing>
+          <span className="sub">Not connected yet:</span>
+          {missing.map((m) => (
+            <span key={m.key} className="conn-missing-item">
+              <b>{m.title}</b> <span className="sub">— {MISSING_MEANS[m.key] ?? "nothing uses it yet"}</span>{" "}
+              <button type="button" className="dm-link" onClick={() => onAdd(m.key)}>
+                Add
+              </button>
+            </span>
+          ))}
+        </div>
+      )}
     </div>
   );
 }

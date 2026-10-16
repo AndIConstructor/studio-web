@@ -25,20 +25,29 @@ import {
   type Tenant,
 } from "./api";
 import {
+  DEFAULT_NAMESPACE_PATTERN,
+  type ClusterCard,
+  type EnvironmentField,
   STATE_LABELS,
   awaitingDecision,
+  clusterCards,
   clusterConnections,
   emptyEnvironment,
   environmentInput,
-  environmentProblem,
+  environmentProblems,
   namespaceFor,
-  runningNow,
   shortCommit,
   stateTone,
 } from "./environments";
+import { DataTable } from "./data-table";
 import { errText, relTime } from "./format";
+import { AddCluster } from "./kubeconfig-field";
+import { Tile } from "./view-mode";
 
 const PROJECT_TYPE = /tenant\.project\.v1/;
+
+/** The cluster select's "connect a new one" entry. */
+const NEW_CLUSTER = "__new_cluster__";
 
 function StateBadge({ d }: { d: Deployment }) {
   return (
@@ -133,21 +142,45 @@ function EnvironmentForm({
   projects,
   onDone,
   onCancel,
+  onClusterAdded,
+  initialCluster,
 }: {
   token: string;
   org: string;
+  /** The cluster a new environment starts on: the one selected above. */
+  initialCluster?: string;
   editing: DeployEnvironment | null;
   others: DeployEnvironment[];
   clusters: Connection[];
   projects: Tenant[];
   onDone: () => void;
   onCancel: () => void;
+  onClusterAdded: (c: Connection) => void;
 }) {
-  const [input, setInput] = useState<DeployEnvironmentInput>(() => (editing ? environmentInput(editing) : emptyEnvironment()));
+  const [input, setInput] = useState<DeployEnvironmentInput>(() =>
+    editing
+      ? environmentInput(editing)
+      : { ...emptyEnvironment(), connection_id: initialCluster || (clusters.length === 1 ? clusters[0].id : "") },
+  );
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const problem = environmentProblem(input, others, editing?.id);
-  const set = <K extends keyof DeployEnvironmentInput>(k: K, v: DeployEnvironmentInput[K]) => setInput((i) => ({ ...i, [k]: v }));
+  const [connecting, setConnecting] = useState(false);
+  // A field says what is wrong once it was touched, or once Add was pressed:
+  // a fresh form is not a list of complaints.
+  const [touched, setTouched] = useState<Set<EnvironmentField>>(new Set());
+  const [tried, setTried] = useState(false);
+  const problems = environmentProblems(input, others, editing?.id);
+  const problem = Object.values(problems)[0] ?? null;
+  const shown = (f: EnvironmentField) => ((tried || touched.has(f)) && problems[f]) || null;
+  const touch = (f: EnvironmentField) => setTouched((t) => (t.has(f) ? t : new Set(t).add(f)));
+  const set = <K extends keyof DeployEnvironmentInput>(k: K, v: DeployEnvironmentInput[K]) => {
+    setInput((i) => ({ ...i, [k]: v }));
+    if (k !== "description" && k !== "database" && k !== "protected") touch(k as EnvironmentField);
+  };
+  const patternIsDefault = (input.namespace_pattern ?? "").trim() === "" || input.namespace_pattern === DEFAULT_NAMESPACE_PATTERN;
+  const examples = (projects.length > 0 ? projects.slice(0, 3).map((p) => p.name) : ["Studio Web"]).map((p) =>
+    namespaceFor(input.namespace_pattern ?? "", p, input.name || "dev"),
+  );
   const save = async () => {
     setBusy(true);
     setError(null);
@@ -168,13 +201,21 @@ function EnvironmentForm({
       data-environment-form
       onSubmit={(e) => {
         e.preventDefault();
+        setTried(true);
         if (!problem) void save();
       }}
     >
       <h3>{editing ? `Change ${editing.name}` : "Add an environment"}</h3>
       <label className="field">
         Name
-        <input value={input.name} onChange={(e) => set("name", e.target.value)} placeholder="prod" aria-label="Name" />
+        <input
+          value={input.name}
+          onChange={(e) => set("name", e.target.value)}
+          placeholder="dev, stage or prod"
+          aria-label="Name"
+          aria-invalid={shown("name") ? true : undefined}
+        />
+        {shown("name") && <span className="env-field-error">{shown("name")}</span>}
       </label>
       <label className="field">
         Description
@@ -182,41 +223,76 @@ function EnvironmentForm({
       </label>
       <label className="field">
         Cluster
-        <select value={input.connection_id} onChange={(e) => set("connection_id", e.target.value)} aria-label="Cluster">
-          <option value="">{clusters.length === 0 ? "No Kubernetes connection yet" : "Choose a Kubernetes connection"}</option>
+        <select
+          value={connecting ? NEW_CLUSTER : input.connection_id}
+          onChange={(e) => {
+            if (e.target.value === NEW_CLUSTER) {
+              setConnecting(true);
+              return;
+            }
+            setConnecting(false);
+            set("connection_id", e.target.value);
+          }}
+          aria-label="Cluster"
+          aria-invalid={shown("connection_id") ? true : undefined}
+        >
+          <option value="">{clusters.length === 0 ? "No cluster connected yet" : "Choose a cluster"}</option>
           {clusters.map((c) => (
             <option key={c.id} value={c.id}>
               {c.label} — {c.base_url}
             </option>
           ))}
+          <option value={NEW_CLUSTER}>+ Connect a cluster…</option>
         </select>
+        {!connecting && shown("connection_id") && <span className="env-field-error">{shown("connection_id")}</span>}
       </label>
-      {clusters.length === 0 && (
-        <p className="hint">
-          Add a Kubernetes cluster under Connections first, for the organization: its API server and a service-account token
-          (or a kubeconfig with the cluster&apos;s CA). The server alone uses it.
-        </p>
+      {connecting && (
+        <AddCluster
+          token={token}
+          org={org}
+          onCancel={() => setConnecting(false)}
+          onAdded={(c) => {
+            setConnecting(false);
+            onClusterAdded(c);
+            set("connection_id", c.id);
+          }}
+        />
       )}
       <label className="field">
         Image registry
-        <input value={input.registry} onChange={(e) => set("registry", e.target.value)} placeholder="ghcr.io/acme" />
-      </label>
-      <label className="field">
-        Namespace pattern
         <input
-          value={input.namespace_pattern ?? ""}
-          onChange={(e) => set("namespace_pattern", e.target.value)}
-          placeholder="{project}-{environment}"
+          value={input.registry}
+          onChange={(e) => set("registry", e.target.value)}
+          placeholder="ghcr.io/acme — where the product's images are pulled from"
+          aria-invalid={shown("registry") ? true : undefined}
         />
-        <span className="hint">
-          e.g. <code>{namespaceFor(input.namespace_pattern ?? "", "Studio Web", input.name || "prod")}</code>
-        </span>
+        {shown("registry") && <span className="env-field-error">{shown("registry")}</span>}
       </label>
+      <details className="env-advanced" open={!patternIsDefault || !!shown("namespace_pattern")}>
+        <summary>
+          Namespaces: <code>{examples.join(", ")}</code>
+          <span className="sub"> · one per project</span>
+        </summary>
+        <label className="field">
+          Namespace pattern
+          <input
+            value={input.namespace_pattern ?? ""}
+            onChange={(e) => set("namespace_pattern", e.target.value)}
+            placeholder={DEFAULT_NAMESPACE_PATTERN}
+            aria-invalid={shown("namespace_pattern") ? true : undefined}
+          />
+          <span className="hint">
+            A pattern, not a name: <code>{"{project}"}</code> becomes each project&apos;s name and <code>{"{environment}"}</code>{" "}
+            this environment&apos;s.
+          </span>
+          {shown("namespace_pattern") && <span className="env-field-error">{shown("namespace_pattern")}</span>}
+        </label>
+      </details>
       <label className="field">
         Database
         <select value={input.database} onChange={(e) => set("database", e.target.value as "none" | "shared")}>
           <option value="none">None: the product brings its own</option>
-          <option value="shared">The environment&apos;s shared Postgres (recorded; handed on once the chart asks)</option>
+          <option value="shared">The environment&apos;s shared Postgres — recorded only, not handed to the chart yet</option>
         </select>
       </label>
       <label className="env-check">
@@ -249,10 +325,10 @@ function EnvironmentForm({
           ))}
         </ul>
       )}
-      {problem && <p className="hint">{problem}</p>}
+      {shown("projects") && <span className="env-field-error">{shown("projects")}</span>}
       {error && <div className="error">{error}</div>}
       <div className="env-actions">
-        <button type="submit" className="primary" disabled={busy || problem !== null}>
+        <button type="submit" className="primary" disabled={busy || connecting}>
           {editing ? "Save" : "Add"}
         </button>
         <button type="button" onClick={onCancel}>
@@ -276,6 +352,26 @@ export function OrgEnvironments({ token, org, workspaceIds }: { token: string; o
   const [busy, setBusy] = useState<string | null>(null);
   const [declining, setDeclining] = useState<string | null>(null);
   const [reason, setReason] = useState("");
+  const [connectingCluster, setConnectingCluster] = useState(false);
+  /** The cluster whose environments and deploys are shown below the cards. */
+  const [selected, setSelected] = useState<string | null>(null);
+  /** Each cluster's answer to a test, asked when the page opens. */
+  const [health, setHealth] = useState<Record<string, { state: "checking" | "ok" | "bad"; text: string; at: number }>>({});
+  // What a Test answered, kept at the row it was asked from.
+  const [answers, setAnswers] = useState<Record<string, { ok: boolean; text: string }>>({});
+  const ask = async (key: string, run: () => Promise<string>) => {
+    setBusy(key);
+    try {
+      const text = await run();
+      setAnswers((a) => ({ ...a, [key]: { ok: true, text } }));
+    } catch (e) {
+      setAnswers((a) => ({ ...a, [key]: { ok: false, text: errText(e) } }));
+    } finally {
+      setBusy(null);
+    }
+  };
+  const Answer = ({ id }: { id: string }) =>
+    answers[id] ? <div className={`sub env-answer ${answers[id].ok ? "env-answer-ok" : "error"}`}>{answers[id].text}</div> : null;
 
   const load = useCallback(() => {
     let live = true;
@@ -314,7 +410,25 @@ export function OrgEnvironments({ token, org, workspaceIds }: { token: string; o
   }, [token, workspaceIds]);
 
   const clusters = useMemo(() => clusterConnections(connections), [connections]);
-  const connectionLabel = (id: string) => connections.find((c) => c.id === id)?.label ?? "a connection this page cannot see";
+  const cards = useMemo(() => clusterCards(clusters, environments ?? [], deployments), [clusters, environments, deployments]);
+  const current: ClusterCard | null = cards.find((c) => c.id === selected) ?? cards[0] ?? null;
+  const check = useCallback(
+    (id: string) => {
+      setHealth((h) => ({ ...h, [id]: { state: "checking", text: "Checking…", at: Date.now() } }));
+      api
+        .testConnection(token, id, org.id)
+        .then((t) => setHealth((h) => ({ ...h, [id]: { state: "ok", text: t.account, at: Date.now() } })))
+        .catch((e) => setHealth((h) => ({ ...h, [id]: { state: "bad", text: errText(e), at: Date.now() } })));
+    },
+    [token, org.id],
+  );
+  // Every cluster is asked once when the page opens, so the cards say at a
+  // glance which answer and which do not.
+  const clusterIds = clusters.map((c) => c.id).join(",");
+  useEffect(() => {
+    for (const c of clusters) check(c.id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [clusterIds, check]);
   const projectName = (id: string) => projects.find((p) => p.id === id)?.name ?? id.slice(0, 8);
 
   const act = async (key: string, run: () => Promise<string>) => {
@@ -332,7 +446,6 @@ export function OrgEnvironments({ token, org, workspaceIds }: { token: string; o
   };
 
   const waiting = awaitingDecision(deployments);
-  const running = runningNow(deployments);
 
   return (
     <div className="envs" data-org-environments>
@@ -401,117 +514,266 @@ export function OrgEnvironments({ token, org, workspaceIds }: { token: string; o
         </section>
       )}
 
-      <section className="card">
-        <div className="card-head">
-          <h3>Environments</h3>
-          {mayManage && editing === null && (
-            <button type="button" className="primary" onClick={() => setEditing("new")} data-environment-add>
-              Add an environment
-            </button>
+      <div className="card" data-clusters>
+        <DataTable<ClusterCard>
+          list="clusters"
+          title="Clusters"
+          rows={environments === null ? null : cards}
+          rowKey={(c) => c.id || "unseen"}
+          rowLabel={(c) => c.label}
+          onOpen={(c) => setSelected(c.id)}
+          search={{ placeholder: "Search clusters" }}
+          searchText={(c) => [c.label, c.baseUrl, ...c.environments.map((e) => e.name)]}
+          defaultView="table"
+          primary={
+            mayManage ? (
+              <button type="button" className="primary" onClick={() => setConnectingCluster(true)} data-cluster-add>
+                Connect a cluster
+              </button>
+            ) : undefined
+          }
+          empty={{ title: "No cluster connected yet.", body: "Connect one to add the environments products run in." }}
+          columns={[
+            {
+              id: "cluster",
+              header: "Cluster",
+              compare: (a, b) => a.label.localeCompare(b.label),
+              cell: (c) => (
+                <div className={`env-cluster-cell${current?.id === c.id ? " on" : ""}`}>
+                  <span className={`env-dot env-dot-${c.id ? (health[c.id]?.state ?? "checking") : "bad"}`} aria-hidden />
+                  <div>
+                    <div className="pname">{c.label}</div>
+                    <div className="sub">{c.baseUrl ? c.baseUrl.replace(/^https?:\/\//, "") : "its connection is out of reach"}</div>
+                  </div>
+                </div>
+              ),
+            },
+            {
+              id: "health",
+              header: "Answers",
+              cell: (c) => (
+                <span className={`env-cluster-health ${c.id ? (health[c.id]?.state ?? "") : "bad"}`}>
+                  {c.id ? (health[c.id]?.text ?? "Checking…") : "—"}
+                </span>
+              ),
+            },
+            {
+              id: "environments",
+              header: "Environments",
+              compare: (a, b) => a.environments.length - b.environments.length,
+              cell: (c) =>
+                c.environments.length === 0 ? (
+                  <span className="sub">none yet</span>
+                ) : (
+                  <span className="env-cluster-envs">
+                    {c.environments.map((e) => (
+                      <span key={e.id} className={`env-chip${e.protected ? " protected" : ""}`} title={e.protected ? "Protected: a deploy waits for approval" : undefined}>
+                        {e.protected ? "🔒 " : ""}
+                        {e.name}
+                      </span>
+                    ))}
+                  </span>
+                ),
+            },
+            { id: "running", header: "Running", num: true, compare: (a, b) => a.running.length - b.running.length, cell: (c) => c.running.length },
+            {
+              id: "deployed",
+              header: "Last deploy",
+              compare: (a, b) => (a.lastDeploy ?? "").localeCompare(b.lastDeploy ?? ""),
+              cell: (c) => (c.lastDeploy ? relTime(c.lastDeploy) : <span className="sub">never</span>),
+            },
+          ]}
+          actions={(c) => (c.id ? [{ label: "Test again", onSelect: () => check(c.id) }] : [])}
+          tile={(c, open) => (
+            <Tile
+              tone={current?.id === c.id ? "env-tile-on" : undefined}
+              icon={<span className={`env-dot env-dot-${c.id ? (health[c.id]?.state ?? "checking") : "bad"}`} aria-hidden />}
+              title={c.label}
+              subtitle={
+                <span className={`env-cluster-health ${c.id ? (health[c.id]?.state ?? "") : "bad"}`}>
+                  {c.id ? (health[c.id]?.text ?? "Checking…") : "its connection is out of reach"}
+                </span>
+              }
+              onClick={open}
+              stats={[
+                { label: "envs", value: c.environments.length },
+                { label: "running", value: c.running.length },
+                { label: "deployed", value: c.lastDeploy ? relTime(c.lastDeploy) : "never" },
+              ]}
+              footer={
+                c.environments.length ? (
+                  <span className="env-cluster-envs">
+                    {c.environments.map((e) => (
+                      <span key={e.id} className={`env-chip${e.protected ? " protected" : ""}`}>
+                        {e.protected ? "🔒 " : ""}
+                        {e.name}
+                      </span>
+                    ))}
+                  </span>
+                ) : undefined
+              }
+            />
           )}
-        </div>
-        {editing !== null && (
-          <EnvironmentForm
+        />
+      </div>
+      {connectingCluster && (
+        <section className="card">
+          <AddCluster
             token={token}
             org={org.id}
-            editing={editing === "new" ? null : editing}
-            others={environments ?? []}
-            clusters={clusters}
-            projects={projects}
-            onCancel={() => setEditing(null)}
-            onDone={() => {
-              setEditing(null);
+            onCancel={() => setConnectingCluster(false)}
+            onAdded={(c) => {
+              setConnectingCluster(false);
+              setNotice(`Connected ${c.label}.`);
+              setSelected(c.id);
               load();
             }}
           />
-        )}
-        {environments === null ? (
-          <p className="hint">Loading…</p>
-        ) : environments.length === 0 ? (
-          <p className="empty">
-            No environments yet.{" "}
-            {mayManage ? "Add one for each place products run: dev, stage, prod." : "An organization administrator adds them."}
-          </p>
-        ) : (
-          <ul className="env-list">
-            {environments.map((e) => (
-              <li key={e.id} data-environment={e.name}>
-                <div className="env-head">
-                  <b>{e.name}</b>
-                  {e.protected && <span className="badge">protected</span>}
-                  {e.database === "shared" && <span className="badge">shared database</span>}
-                  <span className="sub">
-                    {connectionLabel(e.connection_id)} · {e.registry ? <code>{e.registry}</code> : "images as generated"} ·{" "}
-                    <code>{e.namespace_pattern}</code> ·{" "}
-                    {e.projects ? `${e.projects.length} project(s): ${e.projects.map(projectName).join(", ")}` : "every project"}
-                  </span>
-                </div>
-                {e.description && <div className="sub">{e.description}</div>}
-                {mayManage && (
-                  <div className="env-actions">
-                    <button
-                      type="button"
-                      className="ghost"
-                      disabled={busy === e.id}
-                      onClick={() => void act(e.id, async () => (await api.testEnvironment(token, org.id, e.id)).message)}
-                    >
-                      Test
-                    </button>
-                    <button type="button" className="ghost" onClick={() => setEditing(e)}>
-                      Change
-                    </button>
-                    <button
-                      type="button"
-                      className="ghost danger"
-                      disabled={busy === e.id}
-                      onClick={() => {
-                        if (!window.confirm(`Remove ${e.name}? What runs in the cluster stays there.`)) return;
-                        void act(e.id, async () => {
+        </section>
+      )}
+      {cards.length === 0 && !connectingCluster && (
+        <p className="empty">No cluster connected yet. Connect one to add the environments products run in.</p>
+      )}
+
+      {current && (
+        <section className="card env-detail" data-cluster-detail={current.label}>
+          <div className="card-head">
+            <div>
+              <h3>{current.label}</h3>
+              {current.baseUrl && <code className="sub">{current.baseUrl}</code>}
+            </div>
+            <div className="env-actions">
+              {current.id && (
+                <button type="button" className="ghost" disabled={health[current.id]?.state === "checking"} onClick={() => check(current.id)}>
+                  {health[current.id]?.state === "checking" ? "Asking…" : "Test again"}
+                </button>
+              )}
+              {mayManage && editing === null && current.id && (
+                <button type="button" className="primary" onClick={() => setEditing("new")} data-environment-add>
+                  Add an environment here
+                </button>
+              )}
+            </div>
+          </div>
+
+          <h4 className="env-sub">Environments on it</h4>
+          {editing !== null && (
+            <EnvironmentForm
+              token={token}
+              org={org.id}
+              editing={editing === "new" ? null : editing}
+              others={environments ?? []}
+              clusters={clusters}
+              projects={projects}
+              initialCluster={current.id}
+              onCancel={() => setEditing(null)}
+              onDone={() => {
+                setEditing(null);
+                load();
+              }}
+              onClusterAdded={(c) => setConnections((cs) => [...cs, c])}
+            />
+          )}
+          <DataTable<DeployEnvironment>
+            list="cluster-environments"
+            rows={environments === null ? null : current.environments}
+            rowKey={(e) => e.id}
+            rowLabel={(e) => e.name}
+            empty={{
+              title: "No environment on this cluster yet.",
+              body: mayManage ? "Add dev, stage or prod here." : "An organization administrator adds them.",
+            }}
+            columns={[
+              {
+                id: "name",
+                header: "Environment",
+                compare: (a, b) => a.name.localeCompare(b.name),
+                cell: (e) => (
+                  <div data-environment={e.name}>
+                    <div className="env-head">
+                      <b>{e.name}</b>
+                      {e.protected && <span className="badge">protected</span>}
+                      {e.database === "shared" && <span className="badge">shared database</span>}
+                    </div>
+                    {e.description && <div className="sub">{e.description}</div>}
+                    <Answer id={e.id} />
+                  </div>
+                ),
+              },
+              { id: "images", header: "Images", cell: (e) => (e.registry ? <code>{e.registry}</code> : <span className="sub">where the chart says</span>) },
+              {
+                id: "namespaces",
+                header: "Namespaces",
+                cell: (e) => (
+                  <>
+                    <code>{namespaceFor(e.namespace_pattern, projects[0]?.name ?? "Studio Web", e.name)}</code>
+                    {projects.length > 1 ? " …" : ""}
+                  </>
+                ),
+              },
+              {
+                id: "projects",
+                header: "Projects",
+                cell: (e) => (e.projects ? (e.projects.length ? e.projects.map(projectName).join(", ") : "none yet") : "every project"),
+              },
+              {
+                id: "running",
+                header: "Running",
+                cell: (e) => {
+                  const here = current.running.filter((d) => d.environment_id === e.id);
+                  return here.length ? here.map((d) => d.project_name).join(", ") : <span className="sub">nothing yet</span>;
+                },
+              },
+            ]}
+            actions={(e) =>
+              mayManage
+                ? [
+                    { label: busy === e.id ? "Asking…" : "Test", disabled: busy === e.id, onSelect: () => ask(e.id, async () => (await api.testEnvironment(token, org.id, e.id)).message) },
+                    { label: "Change", onSelect: () => setEditing(e) },
+                    {
+                      label: "Remove",
+                      danger: { title: `Remove ${e.name}?`, body: "What runs in the cluster stays there.", confirmLabel: "Remove" },
+                      onSelect: () =>
+                        act(e.id, async () => {
                           await api.deleteEnvironment(token, org.id, e.id);
                           return `Removed ${e.name}.`;
-                        });
-                      }}
-                    >
-                      Remove
-                    </button>
-                  </div>
-                )}
-              </li>
-            ))}
-          </ul>
-        )}
-      </section>
+                        }),
+                    },
+                  ]
+                : []
+            }
+          />
 
-      <section className="card" data-running-now>
-        <h3>What runs where</h3>
-        {running.length === 0 ? (
-          <p className="empty">Nothing deployed yet.</p>
-        ) : (
-          <ul className="env-list">
-            {running.map((d) => (
-              <li key={d.id}>
-                <DeploymentLine d={d} showProject />
-                <StatusButton token={token} org={org.id} d={d} />
-              </li>
-            ))}
-          </ul>
-        )}
-      </section>
+          <h4 className="env-sub" data-running-now>
+            What runs here
+          </h4>
+          {current.running.length === 0 ? (
+            <p className="empty">Nothing deployed to this cluster yet. A deploy is asked for from the desktop, after Generate.</p>
+          ) : (
+            <ul className="env-list">
+              {current.running.map((d) => (
+                <li key={d.id}>
+                  <DeploymentLine d={d} showProject />
+                  <StatusButton token={token} org={org.id} d={d} />
+                </li>
+              ))}
+            </ul>
+          )}
 
-      <section className="card">
-        <h3>Deployments</h3>
-        {deployments.length === 0 ? (
-          <p className="empty">No deploys yet. A deploy is asked for from the desktop, after Generate.</p>
-        ) : (
-          <ul className="env-list">
-            {deployments.map((d) => (
-              <li key={d.id}>
-                <DeploymentLine d={d} showProject />
-              </li>
-            ))}
-          </ul>
-        )}
-      </section>
+          <h4 className="env-sub">Deploys to it</h4>
+          {current.deployments.length === 0 ? (
+            <p className="empty">None yet.</p>
+          ) : (
+            <ul className="env-list">
+              {current.deployments.slice(0, 20).map((d) => (
+                <li key={d.id}>
+                  <DeploymentLine d={d} showProject />
+                </li>
+              ))}
+            </ul>
+          )}
+        </section>
+      )}
     </div>
   );
 }
@@ -639,6 +901,37 @@ function sortBindings(b: EnvironmentBinding[]): EnvironmentBinding[] {
 }
 
 const ENV_CSS = `
+.envs .env-clusters { display:grid; grid-template-columns:repeat(auto-fill, minmax(260px, 1fr)); gap:12px; margin:12px 0; }
+.envs .env-cluster { display:flex; flex-direction:column; align-items:flex-start; gap:6px; padding:14px 16px; border:1px solid var(--border); border-radius:var(--radius-lg, 12px); background:var(--card); color:var(--foreground); text-align:left; cursor:pointer; font:inherit; transition:border-color .15s, box-shadow .15s, transform .15s; }
+.envs .env-cluster:hover { border-color:color-mix(in srgb, var(--primary) 45%, var(--border)); transform:translateY(-1px); }
+.envs .env-cluster.on { border-color:var(--primary); box-shadow:0 0 0 1px var(--primary) inset, 0 4px 14px color-mix(in srgb, var(--primary) 14%, transparent); }
+.envs .env-cluster.unseen { border-style:dashed; }
+.envs .env-cluster-top { display:flex; align-items:center; gap:8px; font-size:15px; }
+.envs .env-cluster-url { font-size:12px; color:var(--muted-foreground); }
+.envs .env-cluster-health { font-size:12.5px; color:var(--muted-foreground); }
+.envs .env-cluster-health.ok { color:#15803d; }
+.envs .env-cluster-health.bad { color:var(--destructive, #dc2626); }
+.envs .env-cluster-stats { display:flex; flex-wrap:wrap; gap:4px 12px; font-size:12.5px; color:var(--muted-foreground); }
+.envs .env-cluster-stats b { color:var(--foreground); font-size:14px; }
+.envs .env-cluster-envs { display:flex; flex-wrap:wrap; gap:4px; }
+.envs .env-chip { font-size:11.5px; padding:1px 8px; border-radius:999px; background:var(--accent); }
+.envs .env-chip.protected { background:color-mix(in srgb, #d97706 16%, transparent); }
+.envs .env-cluster-add { justify-content:center; border-style:dashed; color:var(--primary); min-height:120px; }
+.envs .env-dot { width:9px; height:9px; border-radius:50%; background:var(--muted-foreground); flex:none; }
+.envs .env-dot-ok { background:#16a34a; box-shadow:0 0 0 3px color-mix(in srgb, #16a34a 22%, transparent); }
+.envs .env-dot-bad { background:#dc2626; box-shadow:0 0 0 3px color-mix(in srgb, #dc2626 22%, transparent); }
+.envs .env-dot-checking { background:#d97706; animation:env-pulse 1s ease-in-out infinite; }
+@keyframes env-pulse { 50% { opacity:.35; } }
+.envs .env-cluster-cell { display:flex; align-items:center; gap:10px; }
+.envs .env-cluster-cell.on .pname { color:var(--primary); }
+.vtile.env-tile-on { border-color:var(--primary); box-shadow:0 0 0 1px var(--primary) inset; }
+.envs .env-detail .card-head { display:flex; justify-content:space-between; align-items:flex-start; gap:12px; }
+.envs .env-sub { margin:16px 0 6px; font-size:12px; letter-spacing:.06em; text-transform:uppercase; color:var(--muted-foreground); }
+.envs .env-grid { list-style:none; padding:0; margin:0; display:grid; grid-template-columns:repeat(auto-fill, minmax(300px, 1fr)); gap:10px; }
+.envs .env-card { border:1px solid var(--border); border-radius:var(--radius-md, 8px); padding:12px; display:flex; flex-direction:column; gap:6px; }
+.envs .env-facts { display:grid; grid-template-columns:auto 1fr; gap:3px 10px; margin:0; font-size:12.5px; }
+.envs .env-facts dt { color:var(--muted-foreground); }
+.envs .env-facts dd { margin:0; overflow-wrap:anywhere; }
 .envs .env-list { list-style:none; padding:0; margin:8px 0 0; display:grid; gap:10px; }
 .envs .env-head, .envs .env-deployment { display:flex; gap:8px; align-items:baseline; flex-wrap:wrap; }
 .envs .sub { color:var(--muted-foreground); font-size:12px; }
@@ -654,5 +947,11 @@ const ENV_CSS = `
 .envs .env-workloads { list-style:none; padding:0; margin:6px 0 0; display:grid; gap:4px; font-size:13px; }
 .envs .env-status { margin-top:6px; }
 .envs .env-binding select { min-width:160px; }
+.envs .env-field-error { color:var(--destructive, #dc2626); font-size:12px; }
+.envs [aria-invalid] { border-color:var(--destructive, #dc2626); }
+.envs .env-answer { margin-top:4px; }
+.envs .env-answer-ok { color:#15803d; }
+.envs .env-advanced summary { cursor:pointer; font-size:13px; }
+.envs .env-advanced[open] summary { margin-bottom:8px; }
 .env-project { margin-top:12px; }
 `;
