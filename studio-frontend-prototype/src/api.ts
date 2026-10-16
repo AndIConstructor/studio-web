@@ -1385,6 +1385,57 @@ export interface Connection {
 
 /* ── studio-environments: where an organization's products run (ADR-0043) ── */
 
+/** A model's price per million tokens of each kind (studio-usage, issue #781). */
+export interface ModelPrice {
+  provider: string;
+  /** As the provider names it; a trailing `*` matches every model that starts with the rest. */
+  model: string;
+  input_per_mtok: number;
+  output_per_mtok: number;
+  cache_read_per_mtok: number;
+  cache_write_per_mtok: number;
+}
+
+/** What an IDE session's pod costs per hour of what it requested. */
+export interface SessionPrice {
+  cpu_core_hour: number;
+  memory_gib_hour: number;
+}
+
+export interface PriceList {
+  currency: string;
+  models: ModelPrice[];
+  session?: SessionPrice | null;
+  may_manage: boolean;
+  may_view_costs: boolean;
+}
+
+export type CostGroup = "person" | "project" | "model" | "source" | "payer";
+
+export interface CostRow {
+  /** A person's id, a tenant's id, `provider/model` or `ide-session`, `llm` / `session`, a payer. */
+  key: string;
+  label?: string | null;
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_tokens: number;
+  cache_write_tokens: number;
+  session_seconds: number;
+  cost: number;
+  unpriced: boolean;
+}
+
+export interface CostReport {
+  currency: string;
+  from: string;
+  to: string;
+  group_by: CostGroup;
+  include_personal: boolean;
+  total: number;
+  rows: CostRow[];
+  unpriced: string[];
+}
+
 /** One place an organization's products run: a cluster reached through a
  *  `kubernetes` connection, a registry, a namespace per project. */
 export interface DeployEnvironment {
@@ -3804,6 +3855,38 @@ export const api = {
     }
   },
 
+  /* ── studio-usage (issue #781) ── */
+
+  /** The organization's price list, and what the caller may do with it and its costs. */
+  prices: (token: string, org: string) =>
+    request<PriceList>(`/studio-usage/v1/prices?organization_id=${encodeURIComponent(org)}`, token),
+  /** Replace the price list (`cost.manage`). */
+  updatePrices: (
+    token: string,
+    org: string,
+    body: { currency?: string; models: ModelPrice[]; session?: SessionPrice | null },
+  ) =>
+    request<PriceList>(`/studio-usage/v1/prices?organization_id=${encodeURIComponent(org)}`, token, {
+      method: "PUT",
+      body: JSON.stringify(body),
+    }),
+  /** What the organization's model calls and IDE sessions cost over `[from, to)` (`cost.view`). */
+  costs: (
+    token: string,
+    org: string,
+    q: { from: string; to: string; group_by: CostGroup; include_personal: boolean },
+  ) =>
+    request<CostReport>(
+      `/studio-usage/v1/costs?${new URLSearchParams({
+        organization_id: org,
+        from: q.from,
+        to: q.to,
+        group_by: q.group_by,
+        include_personal: String(q.include_personal),
+      })}`,
+      token,
+    ),
+
   /* ── studio-environments (ADR-0043) ── */
 
   /** The organization's deployment environments, and whether the caller may change them. */
@@ -4593,7 +4676,7 @@ export const api = {
    *  the one named, on a ref or the repository's branch. */
   dispatchBuild: (token: string, projectId: string, body: { repo?: string; workflow?: string; ref?: string }) =>
     request<{ repo: string; workflow: string; ref: string }>(
-      `/studio-artifact-ingest/v1/projects/${encodeURIComponent(projectId)}/builds/dispatch`,
+      `/studio-artifact-ingest/v1/builds/dispatch?project_id=${encodeURIComponent(projectId)}`,
       token,
       { method: "POST", body: JSON.stringify(body) },
     ),

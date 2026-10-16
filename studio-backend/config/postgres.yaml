@@ -269,6 +269,17 @@ gears:
             - "$ref": "gts://gts.cf.core.am.tenant_metadata.v1~"
           x-gts-traits:
             inheritance_policy: "override_only"
+        - "$id": "gts://gts.cf.core.am.tenant_metadata.v1~cf.studio.usage.prices.v1~"
+          # An organization's price list for model tokens and IDE sessions
+          # (issue #781). Written only by studio-usage (the PDP refuses anybody
+          # else's write), on the organization; not inherited.
+          "$schema": "http://json-schema.org/draft-07/schema#"
+          description: "Studio price list of an organization (free-form until gears issue #4)"
+          type: "object"
+          allOf:
+            - "$ref": "gts://gts.cf.core.am.tenant_metadata.v1~"
+          x-gts-traits:
+            inheritance_policy: "override_only"
         - "$id": "gts://gts.cf.core.am.tenant_metadata.v1~cf.studio.environment.list.v1~"
           # An organization's deployment environments (ADR-0043): cluster
           # connection, registry, namespace pattern, protection. Written only by
