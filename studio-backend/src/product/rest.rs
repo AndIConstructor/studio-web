@@ -21,7 +21,7 @@ use toolkit_canonical_errors::resource_error;
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
-use super::gearbox::{CORPUS_SOURCE_ID, Gearbox, PROFILES, PreviewInput, Scope};
+use super::gearbox::{CORPUS_SOURCE_ID, GearRoot, Gearbox, PROFILES, PreviewInput, Scope};
 use super::service::ProductService;
 use crate::catalog_graph::gts::GtsNode;
 use crate::org_scope::OrgCtx;
@@ -211,6 +211,9 @@ pub struct ScaffoldRequest {
     /// For a `plugin` whose host declares more than one extension point: which
     /// one, by its GTS spec id, from `GET /gearbox/extension-points`.
     pub plugin_spec: Option<String>,
+    /// The subsystem the gear belongs to (`bss`, `gen-ai`), written into its
+    /// `gear.gdl` and `gear.toml`; omitted is `platform`. Ignored with `files`.
+    pub category: Option<String>,
     /// Capability keys the gear provides, written into its `gear.toml`, so the
     /// gear declares them once the catalogue syncs it (`auth`, `storage`).
     /// Ignored with `files`.
@@ -247,6 +250,12 @@ pub struct GearboxCatalogueDto {
     /// and must not clone it a second time as a corpus.
     #[serde(default)]
     pub project_sources: Vec<String>,
+    /// Whose each of `project_sources` is: the projects whose product file
+    /// was read from the repository and branch the root is in, by source id.
+    /// Several when projects share a repository. A screen about one project
+    /// calls only its own roots' gears "this project's".
+    #[serde(default)]
+    pub project_source_owners: std::collections::BTreeMap<String, Vec<String>>,
     /// `gearbox catalogue --format json` verbatim: `gears` by id, each a
     /// `GearDescriptor`, plus `contracts`, `sources` and `diagnostics`.
     pub catalogue: Value,
@@ -759,6 +768,7 @@ fn new_gear_of(body: &ScaffoldRequest) -> super::port::NewGear {
         gear_kind: body.gear_kind.clone(),
         plugin_host: body.plugin_host.clone(),
         plugin_spec: body.plugin_spec.clone(),
+        category: body.category.clone(),
         capabilities: body.capabilities.clone().unwrap_or_default(),
         open_pr: body.open_pr.unwrap_or(false),
         dry_run: body.dry_run.unwrap_or(false),
@@ -901,11 +911,14 @@ async fn get_project_product(
     // A project whose repository keeps its own product.gdl is that product:
     // its gears are what the file names, whatever was picked here. Read with
     // the organization's roots, so asking for the scope reads it when due.
-    let _ = product.scope(&ctx, project_id, false).await;
-    let file = product
-        .gearbox
-        .as_ref()
-        .and_then(|g| g.project_file(project_id));
+    let scope = product.scope(&ctx, project_id, false).await;
+    let file = file_in_scope(
+        product
+            .gearbox
+            .as_ref()
+            .and_then(|g| g.project_file(project_id)),
+        scope,
+    );
     let node = match file {
         Some(file) => Some(from_product_file(node, &project_id.to_string(), &file)),
         None => node,
@@ -914,6 +927,18 @@ async fn get_project_product(
         nodes: to_dtos(node.into_iter().collect()),
         truncated: false,
     }))
+}
+
+/// The cached product file, only for a caller whose context resolved the
+/// project's organization to the one the file was read for. The cache is
+/// keyed by project alone and shared by every request, so a caller who cannot
+/// reach the project (its scope is `None`, or another organization) must not
+/// get its repository, branch and gears out of it.
+fn file_in_scope(
+    file: Option<super::gearbox::ProjectFile>,
+    scope: super::gearbox::Scope,
+) -> Option<super::gearbox::ProjectFile> {
+    file.filter(|f| scope == Some(f.organization))
 }
 
 /// The product record as the project's own `product.gdl` says it: its gears,
@@ -1196,7 +1221,14 @@ async fn gearbox_catalogue(
         .await
         .into_iter()
         .partition(|r| r.root.subdir.is_some());
-    let project_sources = project_roots.into_iter().map(|r| r.root.id).collect();
+    let project_roots: Vec<GearRoot> = project_roots.into_iter().map(|r| r.root).collect();
+    let project_source_owners = project_source_owners(
+        &project_roots,
+        &scope
+            .map(|org| gearbox.project_files_of(org))
+            .unwrap_or_default(),
+    );
+    let project_sources = project_roots.into_iter().map(|r| r.id).collect();
     let roots = corpus_roots
         .into_iter()
         .map(|r| catalogue_root(scope, r))
@@ -1211,8 +1243,29 @@ async fn gearbox_catalogue(
         corpus_needs_token,
         roots,
         project_sources,
+        project_source_owners,
         catalogue: Value::clone(&raw),
     }))
+}
+
+/// For each project root, the projects whose product file was read from the
+/// same repository and branch: the root is a directory that file names.
+fn project_source_owners(
+    roots: &[GearRoot],
+    files: &[(Uuid, super::gearbox::ProjectFile)],
+) -> std::collections::BTreeMap<String, Vec<String>> {
+    roots
+        .iter()
+        .map(|r| {
+            let mut owners: Vec<String> = files
+                .iter()
+                .filter(|(_, f)| f.repo == r.source.repo && f.branch == r.source.git_ref)
+                .map(|(p, _)| p.to_string())
+                .collect();
+            owners.sort();
+            (r.id.clone(), owners)
+        })
+        .collect()
 }
 
 /// One root as an IDE brings it in: where to clone it from, at which commit,
@@ -1577,6 +1630,10 @@ async fn preview_product(
         .map_err(|e| CanonicalError::internal(format!("{e:#}")).create())?;
     let product_path = product_path_for(record.as_ref().map(|n| &n.value), &body.product_id);
     let scope = product.scope(&ctx, project_id, false).await;
+    let repo = product
+        .service
+        .write_repo(&ctx, &project_id.to_string())
+        .await;
     let preview = gearbox
         .preview(
             scope,
@@ -1587,6 +1644,7 @@ async fn preview_product(
                 gears: body.gears.clone(),
                 profile: profile.clone(),
                 config: config.clone(),
+                repo,
             },
         )
         .await
@@ -2374,8 +2432,85 @@ mod save_mode_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::product_path_for;
+    use super::{file_in_scope, product_path_for, project_source_owners};
     use serde_json::json;
+
+    #[test]
+    fn a_project_root_is_owned_by_the_projects_whose_file_it_was_read_beside() {
+        use super::super::gearbox::{CorpusSource, GearRoot, ProjectFile};
+        let root = |id: &str, repo: &str| GearRoot {
+            id: id.into(),
+            source: CorpusSource {
+                label: repo.into(),
+                key: repo.into(),
+                repo: repo.into(),
+                url: format!("https://example.test/{repo}.git"),
+                username: String::new(),
+                token: String::new(),
+                git_ref: "main".into(),
+            },
+            connection_id: None,
+            organization: true,
+            subdir: Some(id.into()),
+        };
+        let file = |repo: &str, branch: &str| ProjectFile {
+            organization: uuid::Uuid::nil(),
+            repo: repo.into(),
+            branch: branch.into(),
+            path: "product.gdl".into(),
+            commit: None,
+            gears: Vec::new(),
+        };
+        let (a, b, c) = (
+            uuid::Uuid::from_u128(1),
+            uuid::Uuid::from_u128(2),
+            uuid::Uuid::from_u128(3),
+        );
+        let owners = project_source_owners(
+            &[
+                root("shop-backend", "acme/shop"),
+                root("crm-backend", "acme/crm"),
+            ],
+            &[
+                (a, file("acme/shop", "main")),
+                (b, file("acme/crm", "main")),
+                (c, file("acme/crm", "release")),
+            ],
+        );
+        assert_eq!(owners["shop-backend"], vec![a.to_string()]);
+        assert_eq!(
+            owners["crm-backend"],
+            vec![b.to_string()],
+            "another branch of the same repository is another project's file"
+        );
+    }
+
+    #[test]
+    fn a_cached_product_file_reaches_only_its_own_organization() {
+        let org = uuid::Uuid::new_v4();
+        let file = super::super::gearbox::ProjectFile {
+            organization: org,
+            repo: "acme/shop".into(),
+            branch: "main".into(),
+            path: "product.gdl".into(),
+            commit: None,
+            gears: vec!["credstore".into()],
+        };
+        assert_eq!(
+            file_in_scope(Some(file.clone()), Some(org)),
+            Some(file.clone())
+        );
+        assert_eq!(
+            file_in_scope(Some(file.clone()), None),
+            None,
+            "a caller who could not resolve the project's organization"
+        );
+        assert_eq!(
+            file_in_scope(Some(file), Some(uuid::Uuid::new_v4())),
+            None,
+            "another organization"
+        );
+    }
 
     #[test]
     fn a_new_product_goes_under_products_and_a_written_one_stays_where_it_is() {

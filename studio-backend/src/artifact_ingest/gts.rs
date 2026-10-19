@@ -11,8 +11,8 @@ use uuid::Uuid;
 use super::comment_threads::{ThreadCounts, Waiting};
 use super::graph::{GtsEdge, GtsNode};
 use crate::connectors::sdk::{
-    PullRequestThreads, RemoteComment, RemoteCommit, RemoteFile, RemoteIssue, RemotePullRequest,
-    RemoteWorkflowRun,
+    PullRequestThreads, RemoteBuildArtifact, RemoteComment, RemoteCommit, RemoteFile, RemoteIssue,
+    RemotePullRequest, RemoteRelease, RemoteWorkflowJob, RemoteWorkflowRun,
 };
 
 /// Fixed namespace for uuid5 instance ids (studio artifact graph).
@@ -33,10 +33,21 @@ pub const COMMIT_TYPE: &str = "gts.cf.studio.artifact.commit.v1~";
 /// A CI run in a repository: one run of one workflow on one commit
 /// (ADR-0045). A build of the project's product, when its workflow builds it.
 pub const WORKFLOW_RUN_TYPE: &str = "gts.cf.studio.artifact.workflow_run.v1~";
+/// One job of a CI run's latest attempt: which part of the run failed, and at
+/// which step. Beside the run rather than inside it, so a sync that re-reads
+/// the run without its jobs does not wipe them.
+pub const WORKFLOW_JOB_TYPE: &str = "gts.cf.studio.artifact.workflow_job.v1~";
 /// A build of the project's product that the IDE ran -- in a member's desktop
 /// or in a session -- and reported (ADR-0045 phase 2): what was built, where,
 /// and with what result. Written by the report, never edited once finished.
 pub const BUILD_TYPE: &str = "gts.cf.studio.artifact.build.v1~";
+/// A file a CI run uploaded and the provider keeps for a while: what a build
+/// produced. Only its description is here; the bytes stay with the provider
+/// and are downloaded through a link it signs.
+pub const BUILD_ARTIFACT_TYPE: &str = "gts.cf.studio.artifact.build_artifact.v1~";
+/// A release of a repository: a tag, its notes' title and the files attached
+/// to it (`assets` in the payload).
+pub const RELEASE_TYPE: &str = "gts.cf.studio.artifact.release.v1~";
 /// What search sees of a file's text: a bounded excerpt, beside the file
 /// rather than inside it.
 ///
@@ -53,7 +64,7 @@ pub const FILE_CONTENT_TYPE: &str = "gts.cf.studio.artifact.file_content.v1~";
 pub const MAPPING_DECISION_TYPE: &str = "gts.cf.studio.artifact.mapping_decision.v1~";
 
 /// Every artifact node type, for registering and enumerating.
-pub const ALL_NODE_TYPES: [&str; 12] = [
+pub const ALL_NODE_TYPES: [&str; 15] = [
     REPO_TYPE,
     ISSUE_TYPE,
     PULL_REQUEST_TYPE,
@@ -65,7 +76,10 @@ pub const ALL_NODE_TYPES: [&str; 12] = [
     FILE_CONTENT_TYPE,
     MAPPING_DECISION_TYPE,
     WORKFLOW_RUN_TYPE,
+    WORKFLOW_JOB_TYPE,
     BUILD_TYPE,
+    BUILD_ARTIFACT_TYPE,
+    RELEASE_TYPE,
 ];
 
 /// The node types the artifact listing returns by default — the four
@@ -190,7 +204,7 @@ pub fn our_type_from_graph(graph_type: &str) -> Option<&'static str> {
 }
 
 /// The node types, with a title and a description each.
-const NODE_TYPE_DOCS: [(&str, &str, &str); 12] = [
+const NODE_TYPE_DOCS: [(&str, &str, &str); 15] = [
     (
         REPO_TYPE,
         "Repository",
@@ -247,9 +261,24 @@ const NODE_TYPE_DOCS: [(&str, &str, &str); 12] = [
         "A CI run of one workflow on one commit, pulled from the connector API.",
     ),
     (
+        WORKFLOW_JOB_TYPE,
+        "WorkflowJob",
+        "One job of a CI run's latest attempt and the step it failed at, pulled from the connector API.",
+    ),
+    (
         BUILD_TYPE,
         "Build",
         "A build of the project's product that the IDE ran and reported.",
+    ),
+    (
+        BUILD_ARTIFACT_TYPE,
+        "BuildArtifact",
+        "A file a CI run uploaded and the provider keeps, pulled from the connector API.",
+    ),
+    (
+        RELEASE_TYPE,
+        "Release",
+        "A release of a repository and the files attached to it, pulled from the connector API.",
     ),
 ];
 
@@ -882,7 +911,7 @@ pub fn workflow_run_node(
     let id = r.id.to_string();
     GtsNode {
         type_id: WORKFLOW_RUN_TYPE,
-        instance_id: anon_id(&[scope_key, connector_id, repo_full_path, "workflow_run", &id]),
+        instance_id: workflow_run_instance_id(scope_key, connector_id, repo_full_path, r.id),
         value: json!({
             "repo": repo_id,
             "external_id": id,
@@ -902,6 +931,139 @@ pub fn workflow_run_node(
             "created_at": r.created_at,
             "started_at": r.started_at,
             "updated_at": r.updated_at,
+        }),
+    }
+}
+
+/// The id the sync gives a CI run's node: what an artifact names as its run.
+pub fn workflow_run_instance_id(
+    scope_key: &str,
+    connector_id: &str,
+    repo_full_path: &str,
+    run_id: i64,
+) -> String {
+    anon_id(&[
+        scope_key,
+        connector_id,
+        repo_full_path,
+        "workflow_run",
+        &run_id.to_string(),
+    ])
+}
+
+/// A CI artifact's node, keyed by the provider's artifact id. `run` is the
+/// node id of the run that kept it, so the listing hangs artifacts under
+/// their build; `repo_full_path` is what a download is asked through.
+pub fn build_artifact_node(
+    scope_key: &str,
+    repo_id: &str,
+    connector_id: &str,
+    repo_full_path: &str,
+    a: RemoteBuildArtifact,
+) -> GtsNode {
+    let id = a.id.to_string();
+    let run = a
+        .run_id
+        .map(|r| workflow_run_instance_id(scope_key, connector_id, repo_full_path, r));
+    GtsNode {
+        type_id: BUILD_ARTIFACT_TYPE,
+        instance_id: anon_id(&[
+            scope_key,
+            connector_id,
+            repo_full_path,
+            "build_artifact",
+            &id,
+        ]),
+        value: json!({
+            "repo": repo_id,
+            "repo_full_path": repo_full_path,
+            "external_id": id,
+            "title": a.name,
+            "size_in_bytes": a.size_in_bytes,
+            "expired": a.expired,
+            "run": run,
+            "run_external_id": a.run_id.map(|r| r.to_string()),
+            "branch": a.branch,
+            "sha": a.sha,
+            "updated_at": a.created_at.clone(),
+            "created_at": a.created_at,
+            "expires_at": a.expires_at,
+        }),
+    }
+}
+
+/// A release's node, keyed by the provider's release id, with its assets in
+/// the payload: they are only ever read with the release.
+pub fn release_node(
+    scope_key: &str,
+    repo_id: &str,
+    connector_id: &str,
+    repo_full_path: &str,
+    r: RemoteRelease,
+) -> GtsNode {
+    let id = r.id.to_string();
+    let title = r.name.clone().unwrap_or_else(|| r.tag.clone());
+    let assets: Vec<Value> = r
+        .assets
+        .into_iter()
+        .map(|a| {
+            json!({
+                "id": a.id.to_string(),
+                "name": a.name,
+                "size": a.size,
+                "content_type": a.content_type,
+                "download_count": a.download_count,
+            })
+        })
+        .collect();
+    GtsNode {
+        type_id: RELEASE_TYPE,
+        instance_id: anon_id(&[scope_key, connector_id, repo_full_path, "release", &id]),
+        value: json!({
+            "repo": repo_id,
+            "repo_full_path": repo_full_path,
+            "external_id": id,
+            "title": title,
+            "tag": r.tag,
+            "draft": r.draft,
+            "prerelease": r.prerelease,
+            "url": r.url,
+            "assets": assets,
+            "updated_at": r.published_at.clone().or_else(|| r.created_at.clone()),
+            "created_at": r.created_at,
+            "published_at": r.published_at,
+        }),
+    }
+}
+
+/// A CI job's node, keyed by the provider's job id; `run` names the run's
+/// node, and `attempt` the run attempt the job belongs to, so a re-run is
+/// read again.
+pub fn workflow_job_node(
+    scope_key: &str,
+    repo_id: &str,
+    connector_id: &str,
+    repo_full_path: &str,
+    run_node: &str,
+    attempt: Option<i64>,
+    j: RemoteWorkflowJob,
+) -> GtsNode {
+    let id = j.id.to_string();
+    GtsNode {
+        type_id: WORKFLOW_JOB_TYPE,
+        instance_id: anon_id(&[scope_key, connector_id, repo_full_path, "workflow_job", &id]),
+        value: json!({
+            "repo": repo_id,
+            "run": run_node,
+            "attempt": attempt,
+            "external_id": id,
+            "title": j.name,
+            "status": j.status,
+            "conclusion": j.conclusion,
+            "failed_step": j.failed_step,
+            "started_at": j.started_at,
+            "completed_at": j.completed_at,
+            "url": j.url,
         }),
     }
 }
@@ -1442,6 +1604,99 @@ mod listable_type_tests {
         assert_eq!(a.value["short_sha"], "abcdef1");
         assert_eq!(a.value["repo"], "repo-id");
         assert_eq!(a.value["conclusion"], "failure");
+    }
+
+    #[test]
+    fn a_build_artifact_names_its_run_by_the_runs_own_node_id() {
+        assert_eq!(
+            resolve_listable_types(Some("build_artifact")),
+            vec![BUILD_ARTIFACT_TYPE]
+        );
+        let run = workflow_run_node(
+            "t",
+            "repo-id",
+            "c",
+            "o/r",
+            RemoteWorkflowRun {
+                id: 7,
+                sha: "abc".into(),
+                ..Default::default()
+            },
+        );
+        let artifact = build_artifact_node(
+            "t",
+            "repo-id",
+            "c",
+            "o/r",
+            RemoteBuildArtifact {
+                id: 70,
+                name: "dist".into(),
+                run_id: Some(7),
+                ..Default::default()
+            },
+        );
+        assert_eq!(artifact.type_id, BUILD_ARTIFACT_TYPE);
+        assert_eq!(artifact.value["run"], run.instance_id.as_str());
+        assert_eq!(artifact.value["title"], "dist");
+        assert_eq!(artifact.value["repo_full_path"], "o/r");
+        let orphan = build_artifact_node(
+            "t",
+            "repo-id",
+            "c",
+            "o/r",
+            RemoteBuildArtifact {
+                id: 71,
+                ..Default::default()
+            },
+        );
+        assert!(orphan.value["run"].is_null());
+    }
+
+    #[test]
+    fn a_release_is_titled_by_its_name_else_its_tag_and_carries_its_assets() {
+        let r = |name: Option<&str>| RemoteRelease {
+            id: 3,
+            tag: "v1.0.0".into(),
+            name: name.map(str::to_string),
+            assets: vec![crate::connectors::sdk::RemoteReleaseAsset {
+                id: 30,
+                name: "app.zip".into(),
+                size: Some(10),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let named = release_node("t", "repo-id", "c", "o/r", r(Some("First")));
+        let bare = release_node("t", "repo-id", "c", "o/r", r(None));
+        assert_eq!(named.type_id, RELEASE_TYPE);
+        assert_eq!(named.value["title"], "First");
+        assert_eq!(bare.value["title"], "v1.0.0");
+        assert_eq!(named.instance_id, bare.instance_id);
+        assert_eq!(named.value["assets"][0]["id"], "30");
+        assert_eq!(named.value["assets"][0]["name"], "app.zip");
+    }
+
+    #[test]
+    fn a_workflow_job_names_its_run_and_attempt_and_is_keyed_by_job() {
+        assert_eq!(
+            resolve_listable_types(Some("workflow_job")),
+            vec![WORKFLOW_JOB_TYPE]
+        );
+        let job = |id| RemoteWorkflowJob {
+            id,
+            name: "test-backend".into(),
+            conclusion: Some("failure".into()),
+            failed_step: Some("cargo test".into()),
+            ..Default::default()
+        };
+        let a = workflow_job_node("t", "repo-id", "c", "o/r", "run-node", Some(2), job(9));
+        let b = workflow_job_node("t", "repo-id", "c", "o/r", "run-node", Some(2), job(10));
+        assert_ne!(a.instance_id, b.instance_id, "one node per job");
+        assert_eq!(a.type_id, WORKFLOW_JOB_TYPE);
+        assert_eq!(a.value["run"], "run-node");
+        assert_eq!(a.value["attempt"], 2);
+        assert_eq!(a.value["title"], "test-backend");
+        assert_eq!(a.value["failed_step"], "cargo test");
     }
 
     #[test]

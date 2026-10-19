@@ -25,6 +25,7 @@ mod ingest_task;
 pub mod sdk;
 pub(crate) use ingest_task::{IngestPayload, TASK_TYPE as INGEST_TASK_TYPE};
 mod migrations;
+mod outputs; // what the builds produced: CI artifacts and releases
 pub mod port;
 mod pull_request_waits;
 mod rest;
@@ -282,6 +283,9 @@ impl RestApiCapability for StudioArtifactIngestGear {
             // CI runs and review waits, for the stage gates (#782).
             ctx.client_hub()
                 .register::<dyn port::DeliveryEvidence>(service.clone());
+            // Open pull requests and who they wait on, for the organization's overview.
+            ctx.client_hub()
+                .register::<dyn port::OpenPullRequests>(service.clone());
             // The ingested files, for the gear that decides what each one is.
             ctx.client_hub()
                 .register::<dyn port::ArtifactFiles>(service.clone());

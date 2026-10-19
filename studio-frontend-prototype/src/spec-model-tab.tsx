@@ -22,13 +22,14 @@ import { api, type Candidate, type SpecModelEntityEdit } from "./api";
 import { estimateLabel, etaLabel, readFraction, tokensLabel, type SpecModelBuildEstimate } from "./build-eta";
 import { ModelMapView, Prose, RequirementsView, ResolveView, SideLink } from "./domain-model-screens";
 import { gearRefs } from "./entity-gears";
-import type { GearDraft } from "./gear-from-entity";
 import { DataTable } from "./data-table";
 import { GlossaryScreen } from "./glossary-screen";
 import { PrioritiesScreen } from "./priorities-screen";
 import type { Obligation } from "./behaviour";
 import { BehaviourScreen, HypothesesScreen, NeedsScreen, RulesScreen } from "./discovery-screens";
-import type { EvidenceState } from "./need-view";
+import { checkIndex, checkWrite, hypothesesFor, methodCatalogue, type Check, type MethodDef } from "./hypothesis-check";
+import { hypothesesOf, materialDocument, type EvidenceState, type Hypothesis } from "./need-view";
+import { readRule } from "./rule-checks";
 import { decisionIndex, EVIDENCE_PREFIX, evidenceIndex, FactReviewContext, factKey, reviewIndex, withoutRejected, type FactReview, type SpecModelReview } from "./review-state";
 import { overlaySaved, pruneSaved, savedWrites, withSaved, type SavedEdit } from "./saved-entities";
 import { useGearCatalogue } from "./product-configurator-view";
@@ -75,7 +76,6 @@ export function SpecModelTab({
   only,
   orgId,
   onOpenFile,
-  onCreateGear,
 }: {
   token: string;
   projectId: string;
@@ -87,8 +87,6 @@ export function SpecModelTab({
   orgId?: string;
   /** Open a document in the project's IDE session. */
   onOpenFile?: (path: string) => void;
-  /** Open the project's Product tab with a gear for an entity drafted, ready to scaffold. */
-  onCreateGear?: (draft: GearDraft) => void;
 }) {
   const [model, setModel] = useState<SpecModel | null>(null);
   const [findings, setFindings] = useState<SpecModelFinding[]>([]);
@@ -106,6 +104,8 @@ export function SpecModelTab({
   /** Entities saved this visit, laid over the model until a build reads them,
    *  so the map, the cards and the queue all show a save at once. */
   const [saved, setSaved] = useState<SavedEdit[]>([]);
+  /** The check methods the project's kits add, read when Hypotheses opens. */
+  const [kitMethods, setKitMethods] = useState<{ items: MethodDef[]; note: string | null } | null>(null);
   /** Members' accept or reject on each fact: rejected readings leave the
    *  model, accepted ones are the project's reading. */
   const [reviews, setReviews] = useState<SpecModelReview[]>([]);
@@ -318,6 +318,41 @@ export function SpecModelTab({
       live = false;
     };
   }, [token, orgId, view]);
+  useEffect(() => {
+    if (view !== "hypotheses" || kitMethods) return;
+    let live = true;
+    void api
+      .kitInstallations(token, projectId)
+      .then(async ({ items }) => {
+        const kits = [...new Set(items.filter((k) => k.status === "installed").map((k) => k.kit_slug))];
+        if (kits.length === 0) return { items: [], note: null };
+        const got = await api.specModelCheckMethods(token, projectId, kits);
+        const from = [...new Set(got.items.map((m) => m.kit))];
+        return {
+          items: got.items.map((m) => ({ id: m.id, kit: m.kit, label: m.label, uncertainty: m.uncertainty, inputs: m.inputs, action: m.action, limits: m.limits, appliesTo: m.applies_to })),
+          note: [
+            from.length ? `Methods from the ${from.join(", ")} kit${from.length === 1 ? "" : "s"} included.` : "",
+            Object.keys(got.unread).length
+              ? `Not read: ${Object.entries(got.unread).map(([kit, why]) => `${kit} (${why})`).join(", ")}.`
+              : "",
+          ]
+            .filter(Boolean)
+            .join(" ") || null,
+        };
+      })
+      .catch((e: unknown) => ({ items: [], note: `The kits' methods were not read: ${message(e)}` }))
+      .then((v) => live && setKitMethods(v));
+    return () => {
+      live = false;
+    };
+  }, [view, token, projectId, kitMethods]);
+  const methods = useMemo(() => methodCatalogue(kitMethods?.items ?? []), [kitMethods]);
+  const checks = useMemo(() => checkIndex(reviews), [reviews]);
+  const saveCheck = async (h: Hypothesis, check: Check) => {
+    const revision = model?.documents.find((d) => d.path === h.fact.source.path)?.revision ?? "";
+    await api.reviewSpecModelFacts(token, projectId, [checkWrite(h, check, revision)]);
+    setReviews((await api.specModelReviews(token, projectId)).items);
+  };
   /** Record a decision kept by key: an excluded obligation, a match across
    *  projects. `proposed` withdraws it. */
   const recordDecision = async (key: string, state: string, note: string | null = null, path = "") => {
@@ -362,6 +397,7 @@ export function SpecModelTab({
     [reviewByKey, reviews, allFacts, model, token, projectId],
   );
   const writes = useMemo(() => savedWrites(saved), [saved]);
+  const hypotheses = useMemo(() => hypothesesOf(facts), [facts]);
   const entities = useMemo(() => entitiesOf(facts, glossary), [facts, glossary]);
   // The lines a fact names are the repository's lines only for a document
   // read at its current revision: a sentence is proposed only there.
@@ -371,7 +407,7 @@ export function SpecModelTab({
   );
   // Which gear keeps each Domain entity: read when the map is first opened.
   // Without the catalogue no gear is known, so no gap is claimed either.
-  const catalogue = useGearCatalogue(token, view === "map");
+  const catalogue = useGearCatalogue(token, view === "map", projectId);
 
   const index = catalogue && "index" in catalogue ? catalogue.index : null;
   const gears = useMemo(() => (index ? gearRefs(index, ownGears) : null), [index, ownGears]);
@@ -535,7 +571,6 @@ export function SpecModelTab({
           onSave={saveEntity}
           saved={writes}
           gears={gears}
-          onCreateGear={onCreateGear}
         />
       )}
       {view === "reqs" && (
@@ -545,6 +580,7 @@ export function SpecModelTab({
         <NeedsScreen
           facts={facts}
           onOpenFile={onOpenFile}
+          readStopped={model.build.error}
           accepted={(f) => reviewByKey.get(factKey(f)) === "accepted"}
           onAddMaterial={
             workspaceId
@@ -552,16 +588,7 @@ export function SpecModelTab({
                   const doc = await api.createProjectDocument(token, workspaceId, projectId, {
                     type_key: "material",
                     title,
-                    content: `# ${title}
-
-## Source
-
-${title}
-
-## Material
-
-${content}
-`,
+                    content: materialDocument(title, content),
                   });
                   // Read at once, on the key of whoever added it: no separate start.
                   await startBuild(`studio:${doc.id}`);
@@ -581,6 +608,11 @@ ${content}
           facts={facts}
           stateOf={(f) => (evidence.get(factKey(f)) as EvidenceState | undefined) ?? "unchecked"}
           onEvidence={recordEvidence}
+          catalogue={methods}
+          kitNote={kitMethods?.note}
+          checkOf={(h) => checks.get(factKey(h.fact))}
+          onSaveCheck={saveCheck}
+          onPropose={(content) => api.proposeSpecModelFile(token, projectId, "docs/hypotheses.md", content, "the hypotheses and their checks")}
           onOpenFile={onOpenFile}
         />
       )}
@@ -590,6 +622,7 @@ ${content}
       {model && view === "behaviour" && (
         <BehaviourScreen
           facts={facts}
+          rules={facts.filter((f) => f.kind === "constraint" && f.status === "active" && reviewByKey.get(factKey(f)) === "accepted").map(readRule)}
           decisionOf={(key) => decisions.get(key)}
           onExclude={(o: Obligation, reason) => recordDecision(o.key, reason === null ? "proposed" : "excluded", reason, o.from.source.path)}
           onOpenFile={onOpenFile}
@@ -599,6 +632,18 @@ ${content}
         <PrioritiesScreen
           read={requirements}
           projectId={projectId}
+          reviews={reviews}
+          claimsFor={(r) =>
+            hypothesesFor(r, hypotheses).map((h) => ({
+              claim: h.solution || h.effect || h.fact.subject,
+              state: (evidence.get(factKey(h.fact)) as EvidenceState | undefined) ?? "unchecked",
+              methods: checks.get(factKey(h.fact))?.methods ?? [],
+            }))
+          }
+          onSave={async (writes) => {
+            await api.reviewSpecModelFacts(token, projectId, writes);
+            setReviews((await api.specModelReviews(token, projectId)).items);
+          }}
           onConfirm={(content) => api.proposeSpecModelFile(token, projectId, "docs/priorities.md", content, "the priorities as confirmed in Studio")}
           onTrace={(id) => {
             setTraced(id);

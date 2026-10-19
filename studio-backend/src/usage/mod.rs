@@ -11,19 +11,27 @@
 //! account-management metadata row on the organization, [`PRICES_METADATA_TYPE`])
 //! and a report of its usage over a period, priced with that list and grouped
 //! (`rest.rs`, `service.rs`). Records stay quantities; money is derived when
-//! the report is read.
+//! the report is read. Its monthly budgets ([`BUDGETS_METADATA_TYPE`]) warn
+//! when this month's spend, or its forecast, nears or passes them, and stop
+//! nothing.
 //!
 //! No database of its own: the records are the collector's and the price list
 //! is bounded.
 
+mod budgets;
 mod costs;
 mod prices;
 mod rest;
 mod service;
 
+mod reader;
+
 pub mod port;
 pub mod sdk;
 pub mod types;
+
+/// An organization's priced usage, for the organization's overview.
+pub use reader::{Fact, FactKind, GroupBy, OrganizationUsage, PricedUsage};
 
 use std::sync::Arc;
 
@@ -37,6 +45,10 @@ use toolkit::{Gear, GearCtx};
 pub const PRICES_METADATA_TYPE: &str =
     "gts.cf.core.am.tenant_metadata.v1~cf.studio.usage.prices.v1~";
 
+/// An organization's monthly budgets: warnings, never limits.
+pub const BUDGETS_METADATA_TYPE: &str =
+    "gts.cf.core.am.tenant_metadata.v1~cf.studio.usage.budgets.v1~";
+
 #[toolkit::gear(
     name = "studio-usage",
     deps = [account_management],
@@ -47,7 +59,18 @@ pub struct StudioUsageGear;
 
 #[async_trait]
 impl Gear for StudioUsageGear {
-    async fn init(&self, _ctx: &GearCtx) -> anyhow::Result<()> {
+    async fn init(&self, ctx: &GearCtx) -> anyhow::Result<()> {
+        // An organization's priced usage, for the organization's overview.
+        if let Ok(am) = ctx
+            .client_hub()
+            .get::<dyn account_management_sdk::AccountManagementClient>()
+        {
+            ctx.client_hub()
+                .register::<dyn reader::OrganizationUsage>(Arc::new(reader::UsageReader::new(
+                    am,
+                    ctx.client_hub(),
+                )));
+        }
         Ok(())
     }
 }

@@ -107,6 +107,70 @@ impl GearboxConfig {
 pub struct EngineCatalogue {
     #[serde(default)]
     pub gears: BTreeMap<String, EngineGear>,
+    /// What the engine refused or warned about while reading the roots.
+    #[serde(default)]
+    pub diagnostics: Vec<CatalogueDiagnostic>,
+}
+
+/// A diagnostic as the catalogue prints it; [`parse_diagnostics`] makes the
+/// repository-relative [`EngineDiagnostic`] a person reads.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CatalogueDiagnostic {
+    pub code: String,
+    #[serde(default)]
+    pub severity: String,
+    #[serde(default)]
+    pub message: String,
+    #[serde(default)]
+    pub location: Option<CatalogueLocation>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CatalogueLocation {
+    pub uri: String,
+}
+
+impl EngineCatalogue {
+    /// A root the engine read no gear from while refusing files in it: the
+    /// engine cannot read that root's GDL (a corpus moved past the pinned
+    /// engine reads like this: GBX0102 on every gear.gdl and zero gears).
+    /// Without this the catalogue loads with the root's gears silently gone.
+    pub fn unreadable_root(&self, roots: &[(String, PathBuf)]) -> Option<String> {
+        roots.iter().find_map(|(id, dir)| {
+            if self
+                .gears
+                .values()
+                .any(|g| g.source.as_deref() == Some(id.as_str()))
+            {
+                return None;
+            }
+            let dir = dir.to_string_lossy().replace('\\', "/");
+            let dir = dir.trim_end_matches('/');
+            let errors: Vec<&CatalogueDiagnostic> = self
+                .diagnostics
+                .iter()
+                .filter(|d| d.severity == "error")
+                .filter(|d| d.location.as_ref().is_some_and(|l| l.uri.contains(dir)))
+                .collect();
+            let first = errors.first()?;
+            let mut codes: BTreeMap<&str, usize> = BTreeMap::new();
+            for d in &errors {
+                *codes.entry(d.code.as_str()).or_default() += 1;
+            }
+            let codes: Vec<String> = codes
+                .iter()
+                .map(|(c, n)| format!("{c} \u{d7}{n}"))
+                .collect();
+            Some(format!(
+                "the gear engine read no gear from the repository `{id}`: {} error(s) ({}), \
+                 first: {}. The repository has likely moved to a GDL this engine cannot read; \
+                 point the deployment at a ref this engine reads, or move the engine",
+                errors.len(),
+                codes.join(", "),
+                first.message
+            ))
+        })
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -195,7 +259,11 @@ impl EngineGear {
     pub fn contracts(&self) -> Vec<String> {
         let mut out: Vec<String> = self.provides.iter().map(|p| p.contract.clone()).collect();
         out.extend(self.extension_points.iter().filter_map(|p| p.spec.clone()));
-        out.extend(self.fills.as_ref().and_then(|f| f.point.spec.clone()));
+        out.extend(
+            self.fills
+                .as_ref()
+                .and_then(|f| f.spec().map(str::to_owned)),
+        );
         out.sort();
         out.dedup();
         out
@@ -281,10 +349,27 @@ pub fn config_schemas(catalogue: &EngineCatalogue, names: &[String]) -> Vec<Gear
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct EngineFills {
-    pub point: EnginePoint,
+    /// The full GTS type id of the spec it implements. The engine states it
+    /// on every plugin since gearbox#2; the old `fills` only had `point`.
+    #[serde(default)]
+    pub spec: Option<String>,
+    /// The host's declaration of that point. The engine leaves it out when no
+    /// gear in the corpus declares the spec (GBX0519), so one such plugin
+    /// must not fail the whole catalogue: it is a plugin without a host.
+    #[serde(default)]
+    pub point: Option<EnginePoint>,
     /// Lower wins, as the runtime's plugin selector reads it.
     #[serde(default)]
     pub default_priority: Option<i64>,
+}
+
+impl EngineFills {
+    /// The spec of the point it implements, wherever the engine stated it.
+    pub fn spec(&self) -> Option<&str> {
+        self.spec
+            .as_deref()
+            .or_else(|| self.point.as_ref().and_then(|p| p.spec.as_deref()))
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1671,6 +1756,12 @@ pub fn render_product_gdl_from(
         })
         .collect::<Vec<_>>()
         .join(",\n                   ");
+    // A cluster's Postgres password comes out of an existing Secret.
+    let cluster_db = format!(
+        "postgres(host = \"postgres\", user = \"app\", password = \"${{GEARS_PG_PASSWORD}}\",\n\
+         \x20                                      existing_secret = {})",
+        gdl_string(&format!("{product_id}-db"))
+    );
     format!(
         "# The product this project ships, as Gearbox composes it.\n\
          #\n\
@@ -1686,11 +1777,17 @@ pub fn render_product_gdl_from(
          \x20   name = {name},\n\
          \x20   version = \"0.1.0\",\n\
          \x20   sources = [{declared}],\n\
+         \x20   # Where the gears that keep data keep it: one Postgres per profile\n\
+         \x20   # (GDL 1.1). The password is only ever a `${{NAME}}` the deployment\n\
+         \x20   # sets; change the host and user to the server you run.\n\
          \x20   profiles = [\n\
-         \x20       embedded(id = \"dev\"),\n\
+         \x20       embedded(id = \"dev\",\n\
+         \x20                database = {local_db}),\n\
          \x20       self_hosted(id = \"local\", host = {id}, worker_discovery = \"directory\",\n\
-         \x20                   target_dir = \"target\"),\n\
-         \x20       kubernetes(id = \"prod\", discovery = \"static\", namespace = {id}),\n\
+         \x20                   target_dir = \"target\",\n\
+         \x20                   database = {local_db}),\n\
+         \x20       kubernetes(id = \"prod\", discovery = \"static\", namespace = {id},\n\
+         \x20                  database = {cluster_db}),\n\
          \x20   ],\n\
          \x20   default_profile = {profile},\n\
          \x20   gears = [\n\
@@ -1699,8 +1796,15 @@ pub fn render_product_gdl_from(
          )\n",
         name = gdl_string(name),
         profile = gdl_string(default_profile),
+        local_db = PROFILE_DATABASE,
     )
 }
+
+/// The Postgres a profile on a machine names. Without one, a product with any
+/// gear that keeps data -- types-registry is in nearly all of them -- does not
+/// resolve since GDL 1.1 (GBX0306); a product with none resolves with it too.
+const PROFILE_DATABASE: &str =
+    "postgres(host = \"127.0.0.1\", user = \"app\", password = \"${GEARS_PG_PASSWORD}\")";
 
 // ── What the engine said ──────────────────────────────────────────────────
 
@@ -1906,6 +2010,22 @@ pub struct PreviewInput {
     pub profile: String,
     /// The product's configuration of its gears, by crate name or engine id.
     pub config: GearConfig,
+    /// `owner/name` of the repository the description is saved to, when
+    /// known: a project root in it is a `path(...)` beside the file; one in
+    /// another repository is pinned by its git url instead.
+    pub repo: Option<String>,
+}
+
+/// Where a pinned root sits for the description: inside the repository the
+/// file is saved to (`within` its directory) only when the root's checkout is
+/// that repository. Another project's directory of the organization would be
+/// a path that does not exist beside this file.
+fn within_product_repo<'a>(
+    subdir: Option<&'a str>,
+    root_url: &str,
+    product_repo: Option<&str>,
+) -> Option<&'a str> {
+    subdir.filter(|_| product_repo.is_some_and(|repo| repo_key(repo) == repo_key(root_url)))
 }
 
 pub struct Preview {
@@ -2220,6 +2340,17 @@ impl Gearbox {
             .cloned()
     }
 
+    /// Every product file organization `org`'s projects keep, by project.
+    pub fn project_files_of(&self, org: uuid::Uuid) -> Vec<(uuid::Uuid, ProjectFile)> {
+        self.project_files
+            .lock()
+            .expect("gearbox project files")
+            .iter()
+            .filter(|(_, f)| f.organization == org)
+            .map(|(p, f)| (*p, f.clone()))
+            .collect()
+    }
+
     /// The platform's roots, in the engine's order.
     #[cfg(test)]
     pub fn roots(&self) -> Vec<GearRoot> {
@@ -2287,6 +2418,8 @@ impl Gearbox {
     }
 
     /// Whether organization `org`'s own gear repositories are due to be read.
+    /// A request claims the read with [`Self::begin_org_refresh`].
+    #[cfg(test)]
     pub fn org_roots_due(&self, org: uuid::Uuid) -> bool {
         self.org_roots
             .lock()
@@ -2311,6 +2444,20 @@ impl Gearbox {
             .entry(org)
             .or_insert_with(|| RootSet::new(Vec::new()))
             .take(list);
+    }
+
+    /// Claim the next read of `org`'s roots: true for the one request that
+    /// should read them now (they are due, or `now`), which marks them
+    /// checked before it starts, so requests arriving during that read serve
+    /// the roots there are instead of each starting the same slow read.
+    pub fn begin_org_refresh(&self, org: uuid::Uuid, now: bool) -> bool {
+        let mut sets = self.org_roots.lock().expect("gearbox org roots");
+        let set = sets.entry(org).or_insert_with(|| RootSet::new(Vec::new()));
+        if !now && !set.due() {
+            return false;
+        }
+        set.checked = Some(Instant::now());
+        true
     }
 
     /// Note a failed read of `org`'s list.
@@ -2590,14 +2737,26 @@ impl Gearbox {
             let mut roots = Vec::with_capacity(wanted.len());
             for (r, result) in wanted.iter().zip(cloned) {
                 match result {
-                    Ok(c) => roots.push(Root {
-                        id: r.id.clone(),
-                        dir: match &r.subdir {
-                            Some(sub) => c.dir.join(sub),
+                    Ok(c) => {
+                        // A project's directory is judged again on the
+                        // refreshed checkout: the pull may have made it a
+                        // link out of the repository.
+                        let dir = match &r.subdir {
+                            Some(sub) => match super::project_roots::contained_dir(&c.dir, sub) {
+                                Some(dir) => dir,
+                                None => {
+                                    warn!(source = %r.id, subdir = %sub, "gearbox: a project's gear directory is not a directory inside its repository; not read");
+                                    continue;
+                                }
+                            },
                             None => c.dir,
-                        },
-                        commit: c.commit,
-                    }),
+                        };
+                        roots.push(Root {
+                            id: r.id.clone(),
+                            dir,
+                            commit: c.commit,
+                        });
+                    }
                     // Keep serving the checkout we have; a flaky fetch should
                     // not turn every preview into an error.
                     Err(e) => match previous.and_then(|p| p.roots.iter().find(|x| x.id == r.id)) {
@@ -2661,6 +2820,9 @@ impl Gearbox {
             })?;
             let parsed: EngineCatalogue = serde_json::from_value(raw.clone())
                 .context("the engine's catalogue does not have the expected shape")?;
+            if let Some(why) = parsed.unreadable_root(&named) {
+                bail!(why);
+            }
             corpus.catalogue = Some(Arc::new(parsed));
             corpus.raw = Some(Arc::new(raw));
         }
@@ -2835,7 +2997,11 @@ impl Gearbox {
                 id: &r.root.id,
                 url: &r.root.source.url,
                 rev: r.commit.as_deref(),
-                within: r.root.subdir.as_deref(),
+                within: within_product_repo(
+                    r.root.subdir.as_deref(),
+                    &r.root.source.url,
+                    input.repo.as_deref(),
+                ),
             })
             .collect();
         // Config arrives keyed as the picks are (crate names); the description
@@ -3106,9 +3272,12 @@ fn fills_point(plugin: &EngineGear, point: &EnginePoint) -> bool {
     let Some(f) = plugin.fills.as_ref() else {
         return false;
     };
-    match (f.point.spec.as_deref(), point.spec.as_deref()) {
+    match (f.spec(), point.spec.as_deref()) {
         (Some(a), Some(b)) => a == b,
-        _ => f.point.sdk.crate_name == point.sdk.crate_name,
+        _ => f
+            .point
+            .as_ref()
+            .is_some_and(|p| p.sdk.crate_name == point.sdk.crate_name),
     }
 }
 
@@ -3132,8 +3301,134 @@ mod tests {
         let point = gear
             .fills
             .expect("`implements` is the plugin's point")
-            .point;
+            .point
+            .expect("the host's declaration is carried");
         assert_eq!(point.sdk.crate_name, "cf-gears-authn-resolver-sdk");
+    }
+
+    #[test]
+    fn a_plugin_no_host_declares_does_not_fail_the_catalogue() {
+        // The engine omits `point` when no gear declares the spec (GBX0519).
+        let catalogue: EngineCatalogue = serde_json::from_value(json!({
+            "gears": {
+                "orphan-plugin": {
+                    "id": "orphan-plugin",
+                    "package": {"crate_name": "cf-gears-orphan-plugin"},
+                    "implements": {"spec": "gts.x.core.orphan.plugin.v1~"}
+                }
+            }
+        }))
+        .expect("a plugin without the host's declaration deserializes");
+        let gear = &catalogue.gears["orphan-plugin"];
+        assert_eq!(
+            gear.contracts(),
+            vec!["gts.x.core.orphan.plugin.v1~".to_string()]
+        );
+        assert!(catalogue.host_of(gear).is_none());
+    }
+
+    #[test]
+    fn a_root_the_engine_cannot_read_is_named_not_dropped() {
+        // The pinned engine over a corpus moved to a newer GDL: every
+        // gear.gdl refused, no gear from it, the project's own gears still read.
+        let diag = |file: &str| {
+            json!({
+                "code": "GBX0102",
+                "severity": "error",
+                "message": "Variable `git` not found, did you mean `dict`?",
+                "location": {"uri": format!("file:///var/lib/studio/gearbox/gears-rust/{file}/gear.gdl")}
+            })
+        };
+        let catalogue: EngineCatalogue = serde_json::from_value(json!({
+            "gears": {
+                "studio-authz-plugin": {
+                    "id": "studio-authz-plugin",
+                    "package": {"crate_name": "studio-authz-plugin"},
+                    "source": "studio-web"
+                }
+            },
+            "diagnostics": [diag("gears/a"), diag("gears/b")]
+        }))
+        .expect("a catalogue with diagnostics deserializes");
+        let roots = vec![
+            (
+                "gears-rust".to_string(),
+                PathBuf::from("/var/lib/studio/gearbox/gears-rust"),
+            ),
+            (
+                "studio-web".to_string(),
+                PathBuf::from("/var/lib/studio/gearbox/studio-web"),
+            ),
+        ];
+        let why = catalogue
+            .unreadable_root(&roots)
+            .expect("the corpus root is reported");
+        assert!(why.contains("`gears-rust`"), "{why}");
+        assert!(why.contains("GBX0102 \u{d7}2"), "{why}");
+
+        // A root with no gears and no errors (a project without gear.gdl) is fine.
+        let quiet: EngineCatalogue = serde_json::from_value(json!({"gears": {}})).unwrap();
+        assert!(quiet.unreadable_root(&roots).is_none());
+    }
+
+    /// What the pinned engine (6d60603f) prints over gears-rust in GDL 1.0
+    /// and this repository's own gear.gdl files, trimmed to a host and a
+    /// plugin from each root and one design: the shape grew (`sdks`,
+    /// `origin`, `implementation`, `scenarios`), and none of it may stop the
+    /// catalogue from reading or a plugin from finding its host.
+    #[test]
+    fn a_gdl_1_0_catalogue_reads_and_its_plugins_find_their_hosts() {
+        let raw: Value = serde_json::from_str(include_str!("testdata/catalogue-gdl-1.0.json"))
+            .expect("the fixture is JSON");
+        let catalogue: EngineCatalogue =
+            serde_json::from_value(raw).expect("the GDL 1.0 catalogue deserializes");
+        for (plugin, host) in [
+            ("static-tr-plugin", "tenant-resolver"),
+            ("github-connector-plugin", "studio-connector"),
+        ] {
+            let found = catalogue
+                .host_of(&catalogue.gears[plugin])
+                .map(|g| g.id.as_str());
+            assert_eq!(found, Some(host), "{plugin}");
+        }
+        assert_eq!(
+            catalogue.implementers_of(&catalogue.gears["tenant-resolver"]),
+            ["cf-gears-static-tr-plugin"]
+        );
+        let roots = vec![
+            (
+                "gears-rust".to_string(),
+                PathBuf::from("/corpus/gears-rust"),
+            ),
+            (
+                "studio-backend".to_string(),
+                PathBuf::from("/corpus/studio-backend"),
+            ),
+        ];
+        assert!(catalogue.unreadable_root(&roots).is_none());
+
+        // The same output with one root's gears gone and the engine's own
+        // diagnostic for it, as 6d60603f prints one (`location.uri` under the
+        // root): that root is named, the other is not.
+        let mut raw: Value = serde_json::from_str(include_str!("testdata/catalogue-gdl-1.0.json"))
+            .expect("the fixture is JSON");
+        let gears = raw["gears"].as_object_mut().expect("gears is a map");
+        gears.retain(|_, g| g["source"] == "gears-rust");
+        raw["diagnostics"] = json!([{
+            "code": "GBX0519",
+            "severity": "error",
+            "message": "`postgres-usage-collector-plugin` implements `cf.core.uc.plugin.v1~`, which no described gear declares as an extension point",
+            "location": {
+                "uri": "file:///corpus/studio-backend/plugins/postgres-usage-collector-plugin/gear.gdl",
+                "range": {"start": {"line": 7, "character": 0}, "end": {"line": 19, "character": 1}}
+            }
+        }]);
+        let half: EngineCatalogue = serde_json::from_value(raw).expect("still the shape");
+        let why = half
+            .unreadable_root(&roots)
+            .expect("the root with no gears and an error is named");
+        assert!(why.contains("`studio-backend`"), "{why}");
+        assert!(why.contains("GBX0519 \u{d7}1"), "{why}");
     }
 
     /// The corpus shape that matters: a host with an extension point, two
@@ -3763,9 +4058,14 @@ mod tests {
         assert!(gdl.contains("id = \"my-shop\""));
         assert!(gdl.contains("name = \"My \\\"Shop\\\"\""));
         assert!(gdl.contains("source(id = \"gears-rust\", at = path(\"../gears-rust\"))"));
-        assert!(gdl.contains("embedded(id = \"dev\")"));
+        assert!(gdl.contains("embedded(id = \"dev\","));
         assert!(gdl.contains("self_hosted(id = \"local\", host = \"my-shop\""));
         assert!(gdl.contains("kubernetes(id = \"prod\""));
+        // Every profile names its Postgres (GBX0306 otherwise), with the
+        // password as a reference only.
+        assert_eq!(gdl.matches("database = postgres(").count(), 3, "{gdl}");
+        assert!(gdl.contains("password = \"${GEARS_PG_PASSWORD}\""));
+        assert!(gdl.contains("existing_secret = \"my-shop-db\""));
         assert!(gdl.contains("default_profile = \"local\""));
         assert!(gdl.contains("use_gear(\"api-gateway\", source = \"gears-rust\"),"));
         assert!(gdl.contains(
@@ -4133,6 +4433,35 @@ mod tests {
 
         g.use_repositories(Vec::new());
         assert_eq!(ids(&g), ["gears-rust"]);
+    }
+
+    #[test]
+    fn a_project_root_is_a_path_only_inside_the_repository_the_file_is_saved_to() {
+        let url = "https://github.com/Acme/Shop.git";
+        assert_eq!(
+            within_product_repo(Some("shop-backend"), url, Some("acme/shop")),
+            Some("shop-backend")
+        );
+        assert_eq!(
+            within_product_repo(Some("shop-backend"), url, Some("acme/crm")),
+            None,
+            "another project's directory is pinned by its git url, not a path here"
+        );
+        assert_eq!(within_product_repo(Some("shop-backend"), url, None), None);
+        assert_eq!(within_product_repo(None, url, Some("acme/shop")), None);
+    }
+
+    #[test]
+    fn one_request_claims_an_organizations_refresh_the_others_serve_what_there_is() {
+        let g = Gearbox::new(config("https://github.com/MikeFalcon77/gears-rust.git"));
+        let acme = uuid::Uuid::new_v4();
+        assert!(g.begin_org_refresh(acme, false), "due: the first claims it");
+        assert!(
+            !g.begin_org_refresh(acme, false),
+            "while it reads, the next request does not start the same read"
+        );
+        assert!(!g.org_roots_due(acme));
+        assert!(g.begin_org_refresh(acme, true), "asked for now, it reads");
     }
 
     #[test]

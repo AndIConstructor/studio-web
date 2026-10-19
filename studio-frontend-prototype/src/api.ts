@@ -152,6 +152,18 @@ export interface GlossaryDoc {
   path: string;
 }
 
+/** A hypothesis check method a kit adds (its `check-methods.json`). */
+export interface KitCheckMethod {
+  kit: string;
+  id: string;
+  label: string;
+  uncertainty: string;
+  inputs: string;
+  action: string;
+  limits: string;
+  applies_to: string[];
+}
+
 export interface SpecModelWrite {
   path: string;
   branch: string;
@@ -1195,6 +1207,46 @@ export interface PullReviewer {
   state: string;
 }
 
+/** One job of a CI run's attempt (`GET /studio-artifact-ingest/v1/runs`). */
+export interface CiJob {
+  name: string;
+  status: string | null;
+  conclusion: string | null;
+  /** The first step that failed, when one did. */
+  failed_step: string | null;
+  started_at: string | null;
+  completed_at: string | null;
+  duration_seconds: number | null;
+  url: string | null;
+}
+
+/** One CI run as the sync kept it, with its jobs once a sync read them. */
+export interface CiRun {
+  id: string;
+  /** The repository node it ran in. */
+  repo: string | null;
+  workflow: string;
+  workflow_path: string | null;
+  title: string | null;
+  event: string | null;
+  branch: string | null;
+  sha: string;
+  status: string | null;
+  conclusion: string | null;
+  url: string | null;
+  number: number | null;
+  created_at: string | null;
+  updated_at: string | null;
+  jobs?: CiJob[];
+}
+
+export interface CiRunList {
+  items: CiRun[];
+  total: number;
+  /** The newest completed run on a mainline (else the newest completed run). */
+  latest_completed: string | null;
+}
+
 /** One open pull request and who it is waiting on. */
 export interface OpenPullRequest {
   id: string;
@@ -1206,6 +1258,8 @@ export interface OpenPullRequest {
   number: number;
   title: string;
   url: string | null;
+  /** The branch it would merge: what its CI runs ran on. */
+  source_branch?: string | null;
   author: PullPerson | null;
   waiting: PullWaiting;
   waiting_on: PullPerson[];
@@ -1473,6 +1527,57 @@ export interface CostReport {
   unpriced: string[];
 }
 
+/** A monthly budget: the organization's (no `tenant_id`), a workspace's or a
+ *  project's, in the price list's currency. It warns and stops nothing. */
+export interface Budget {
+  tenant_id?: string | null;
+  monthly: number;
+}
+
+/** What a budget can be set on. */
+export interface BudgetPlace {
+  id: string;
+  label: string;
+  kind: "organization" | "workspace" | "project";
+}
+
+export interface BudgetList {
+  currency: string;
+  /** Percent of a budget at which it warns. */
+  warn_at_percent: number;
+  budgets: Budget[];
+  places: BudgetPlace[];
+  may_manage: boolean;
+}
+
+export type BudgetLevel = "ok" | "warning" | "over";
+
+/** A budget against this month's spend. */
+export interface BudgetStanding {
+  tenant_id?: string | null;
+  label: string;
+  monthly: number;
+  spent: number;
+  /** The month's spend at the pace so far; absent in the first three days. */
+  forecast?: number | null;
+  level: BudgetLevel;
+  /** Only the forecast reaches the level. */
+  by_forecast: boolean;
+}
+
+export interface BudgetStatus {
+  currency: string;
+  warn_at_percent: number;
+  from: string;
+  to: string;
+  measured_at: string;
+  include_personal: boolean;
+  /** Worst first. */
+  standings: BudgetStanding[];
+  /** What had no price this month, so is not in the spend. */
+  unpriced: string[];
+}
+
 /** One place an organization's products run: a cluster reached through a
  *  `kubernetes` connection, a registry, a namespace per project. */
 export interface DeployEnvironment {
@@ -1560,6 +1665,43 @@ export interface DeploymentStatus {
   deployment: Deployment;
   workloads: { name: string; ready: number; desired: number; images: string[] }[];
   hosts: string[];
+}
+
+/** `build_artifact`: a file a CI run kept. `release`: a release and its files. */
+export type OutputKind = "build_artifact" | "release";
+
+/** A file attached to a release. */
+export interface OutputAsset {
+  id: string;
+  name: string;
+  size?: number | null;
+  content_type?: string | null;
+  download_count?: number | null;
+}
+
+/** What a build produced (`GET /studio-artifact-ingest/v1/outputs`). Only a
+ *  description: the bytes stay with the provider until someone downloads. */
+export interface BuildOutput {
+  id: string;
+  kind: OutputKind;
+  repo?: string | null;
+  repo_full_path?: string | null;
+  title: string;
+  size_in_bytes?: number | null;
+  /** The provider no longer keeps the artifact. */
+  expired: boolean;
+  /** The `workflow_run` node that kept an artifact. */
+  run?: string | null;
+  branch?: string | null;
+  sha?: string | null;
+  tag?: string | null;
+  draft: boolean;
+  prerelease: boolean;
+  url?: string | null;
+  assets: OutputAsset[];
+  created_at?: string | null;
+  expires_at?: string | null;
+  published_at?: string | null;
 }
 
 /** How a document binding's type was decided. */
@@ -2984,6 +3126,112 @@ export interface RollupRow {
   last_at?: string | null;
 }
 
+/** `GET /studio-organizations/v1/overview`: an organization for its leaders.
+ *  Money fields are null unless `costs` is `shown`; any other null is a
+ *  source that could not be asked, never zero. */
+export interface OrgOverview {
+  organization_id: string;
+  name: string;
+  period_from: string;
+  period_to: string;
+  previous_from: string;
+  previous_to: string;
+  stuck_days: number;
+  growth_alert: number;
+  quiet_days: number;
+  costs: "shown" | "hidden" | "unreadable";
+  needs: OrgNeed[];
+  spend: OrgSpend | null;
+  delivery: { merged: number | null; window_days: number; open: number | null; median_wait_days: number | null };
+  specs: { specs: number | null; failing: number | null; open_findings: number | null };
+  people: {
+    active: number | null;
+    with_spend: number | null;
+    per_person: number | null;
+    idle: { person_id: string; name: string | null }[] | null;
+  };
+  workspaces: OrgWorkspace[];
+  money: OrgMoney[] | null;
+  waiting_on: OrgQueue[] | null;
+  decisions: { undecided: number; candidates: number; registered: number; published: number } | null;
+}
+
+/** One thing that waits on the leaders; `kind` says which fields are set. */
+export interface OrgNeed {
+  kind: "connection" | "spend" | "pulls" | "components" | "runs";
+  tone: "danger" | "warn";
+  provider?: string | null;
+  status?: string | null;
+  projects: string[];
+  repos?: number | null;
+  current?: number | null;
+  previous?: number | null;
+  forecast?: number | null;
+  grower?: string | null;
+  pulls?: number | null;
+  people?: number | null;
+  components?: number | null;
+  runs?: number | null;
+}
+
+export interface OrgSpend {
+  currency: string;
+  current: number;
+  previous: number;
+  forecast: number;
+  own_keys: number;
+  attributed: number;
+  unattributed: number;
+  sessions: number;
+  unpriced: string[];
+}
+
+export interface OrgReason {
+  kind: "refused" | "specs_failing" | "stuck" | "spend_grows" | "quiet";
+  value: number | null;
+}
+
+export interface OrgProjectHealth {
+  id: string;
+  name: string;
+  spend: number | null;
+  previous: number | null;
+  specs_failing: number | null;
+  open_findings: number | null;
+  stuck: number;
+  quiet_days: number | null;
+  broken: boolean;
+  score: number;
+  reasons: OrgReason[];
+}
+
+export interface OrgWorkspace {
+  id: string;
+  name: string;
+  spend: number | null;
+  previous: number | null;
+  specs_failing: number;
+  stuck: number;
+  quiet_days: number | null;
+  score: number;
+  projects: OrgProjectHealth[];
+}
+
+export interface OrgMoney {
+  group_by: CostGroup;
+  include_personal: boolean;
+  /** By person: `key` is the member, `unattributed`, or empty for IDE sessions. */
+  rows: { key: string; label: string | null; cost: number; previous: number; unpriced: boolean }[];
+}
+
+export interface OrgQueue {
+  person_id: string | null;
+  /** Null: pull requests nobody was asked to review. */
+  who: string | null;
+  count: number;
+  oldest_days: number;
+}
+
 /** A verdict as the server read it. Fields follow the detector, so most are
  *  absent for any one answer; the nulls are load-bearing where present. */
 export interface SpecQualityVerdict {
@@ -3055,6 +3303,14 @@ export const api = {
       token,
     );
   },
+
+  /** What an organization's leaders ask of it, over the last 30 days — one
+   *  request; the rules are the server's (`organizations/overview.rs`). */
+  orgOverview: (token: string, org: string) =>
+    request<OrgOverview>(
+      `/studio-organizations/v1/overview?organization_id=${encodeURIComponent(org)}`,
+      token,
+    ),
 
   /* ── studio-documents gear (types + templates + validation) ── */
 
@@ -3355,6 +3611,14 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ project_id: projectId, path, content, title }),
     }),
+  /** The hypothesis check methods the named kits add, read from each one's
+   *  `check-methods.json` in the project's repository; a kit whose file is
+   *  absent or unreadable is listed under `unread` with the reason. */
+  specModelCheckMethods: (token: string, projectId: string, kits: string[]) =>
+    request<{ items: KitCheckMethod[]; total: number; unread: Record<string, string> }>(
+      `/studio-documents/v1/spec-model/check-methods?project_id=${encodeURIComponent(projectId)}&kits=${encodeURIComponent(kits.join(","))}`,
+      token,
+    ),
   /** The glossary the project's documents keep, read as written. */
   glossaryDocument: (token: string, projectId: string) =>
     request<GlossaryDoc>(`/studio-documents/v1/spec-model/glossary/document?project_id=${encodeURIComponent(projectId)}`, token),
@@ -3447,6 +3711,17 @@ export const api = {
     request<{ items: RepoActivity[]; total: number; days: number }>(
       `/studio-artifact-ingest/v1/source-activity?scope=${encodeURIComponent(scope)}` +
         (days ? `&days=${days}` : ""),
+      token,
+    ),
+
+  /** A project's CI runs, newest first, each with the jobs of its attempt;
+   *  `latest_completed` names the run that speaks for the mainline. As fresh
+   *  as the project's last sync. */
+  ciRuns: (token: string, projectId: string, filter: { revision?: string; branch?: string } = {}) =>
+    request<CiRunList>(
+      `/studio-artifact-ingest/v1/runs?project_id=${encodeURIComponent(projectId)}` +
+        (filter.revision ? `&revision=${encodeURIComponent(filter.revision)}` : "") +
+        (filter.branch ? `&branch=${encodeURIComponent(filter.branch)}` : ""),
       token,
     ),
 
@@ -3973,6 +4248,26 @@ export const api = {
         to: q.to,
         group_by: q.group_by,
         include_personal: String(q.include_personal),
+      })}`,
+      token,
+    ),
+
+  /** The organization's monthly budgets and what one can be set on (`cost.view`). */
+  budgets: (token: string, org: string) =>
+    request<BudgetList>(`/studio-usage/v1/budgets?organization_id=${encodeURIComponent(org)}`, token),
+  /** Replace the budgets (`cost.manage`). */
+  updateBudgets: (token: string, org: string, body: { warn_at_percent?: number; budgets: Budget[] }) =>
+    request<BudgetList>(`/studio-usage/v1/budgets?organization_id=${encodeURIComponent(org)}`, token, {
+      method: "PUT",
+      body: JSON.stringify(body),
+    }),
+  /** Where this month's spend stands against each budget, worst first (`cost.view`).
+   *  People's own keys count only with `include_personal`. */
+  budgetStatus: (token: string, org: string, include_personal = false) =>
+    request<BudgetStatus>(
+      `/studio-usage/v1/budget-status?${new URLSearchParams({
+        organization_id: org,
+        include_personal: String(include_personal),
       })}`,
       token,
     ),
@@ -4771,6 +5066,26 @@ export const api = {
       { method: "POST", body: JSON.stringify(body) },
     ),
 
+  /** What the project's builds produced: the files CI runs kept and the
+   *  repositories' releases, newest first, as the last sync read them. */
+  listOutputs: (token: string, projectId: string, opts?: { kind?: OutputKind; run?: string }) => {
+    const qs = new URLSearchParams({ project_id: projectId });
+    if (opts?.kind) qs.set("kind", opts.kind);
+    if (opts?.run) qs.set("run", opts.run);
+    return request<{ items: BuildOutput[]; total: number }>(`/studio-artifact-ingest/v1/outputs?${qs}`, token);
+  },
+
+  /** A provider-signed link to one output (a release's file names `assetId`).
+   *  It lives about a minute: open it at once, never keep it. */
+  outputDownload: (token: string, projectId: string, outputId: string, assetId?: string) => {
+    const qs = new URLSearchParams({ project_id: projectId });
+    if (assetId) qs.set("asset_id", assetId);
+    return request<{ url: string }>(
+      `/studio-artifact-ingest/v1/outputs/${encodeURIComponent(outputId)}/download?${qs}`,
+      token,
+    );
+  },
+
   /** Relations between ingested nodes (authored_by / modifies / …), optionally
    * scoped to a tenant (both endpoints must be in-scope). */
   artifactEdges: async (token: string, scope?: string) => ({
@@ -5307,6 +5622,8 @@ export const api = {
       roots?: { source_id: string; tier?: string | null }[];
       /** The roots read out of the organization's projects' own repositories. */
       project_sources?: string[];
+      /** Whose each of those roots is: project ids by source id. */
+      project_source_owners?: Record<string, string[]>;
     }>(
       `/studio-product/v1/gearbox/catalogue`,
       token,

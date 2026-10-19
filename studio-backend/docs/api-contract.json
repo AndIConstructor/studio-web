@@ -407,6 +407,39 @@
     },
     {
       "method": "GET",
+      "path": "/studio-artifact-ingest/v1/outputs",
+      "operation_id": "studio_artifact_ingest.list_outputs",
+      "tag": "StudioArtifactIngest",
+      "summary": "What a project's builds produced: CI artifacts and releases",
+      "authenticated": true,
+      "responses": [
+        "OutputListDto"
+      ],
+      "errors": [
+        "400",
+        "401",
+        "500"
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/studio-artifact-ingest/v1/outputs/{output_id}/download",
+      "operation_id": "studio_artifact_ingest.get_output_download",
+      "tag": "StudioArtifactIngest",
+      "summary": "A short-lived link that downloads one output",
+      "authenticated": true,
+      "responses": [
+        "OutputDownloadDto"
+      ],
+      "errors": [
+        "400",
+        "401",
+        "404",
+        "500"
+      ]
+    },
+    {
+      "method": "GET",
       "path": "/studio-artifact-ingest/v1/repo-files",
       "operation_id": "studio_artifact_ingest.repo_files",
       "tag": "StudioArtifactIngest",
@@ -1148,6 +1181,23 @@
       "authenticated": true,
       "responses": [
         "SpecModelBuildEstimateDto"
+      ],
+      "errors": [
+        "400",
+        "401",
+        "404",
+        "500"
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/studio-documents/v1/spec-model/check-methods",
+      "operation_id": "studio_documents.list_spec_model_check_methods",
+      "tag": "StudioDocuments",
+      "summary": "The hypothesis check methods the project's kits add",
+      "authenticated": true,
+      "responses": [
+        "KitCheckMethodListDto"
       ],
       "errors": [
         "400",
@@ -2047,6 +2097,23 @@
     },
     {
       "method": "GET",
+      "path": "/studio-organizations/v1/overview",
+      "operation_id": "studio_organizations.get_organization_overview",
+      "tag": "StudioOrganizations",
+      "summary": "What an organization's leaders ask of it, over the last 30 days",
+      "authenticated": true,
+      "responses": [
+        "OrganizationOverviewDto"
+      ],
+      "errors": [
+        "400",
+        "401",
+        "404",
+        "500"
+      ]
+    },
+    {
+      "method": "GET",
       "path": "/studio-organizations/v1/rollups",
       "operation_id": "studio_organizations.list_rollups",
       "tag": "StudioOrganizations",
@@ -2662,6 +2729,40 @@
       "authenticated": true,
       "errors": [
         "401",
+        "404",
+        "500"
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/studio-usage/v1/budget-status",
+      "operation_id": "studio_usage.get_budget_status",
+      "tag": "",
+      "summary": "Where this month's spend stands against each budget",
+      "authenticated": true,
+      "responses": [
+        "BudgetStatusDto"
+      ],
+      "errors": [
+        "401",
+        "403",
+        "404",
+        "500"
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/studio-usage/v1/budgets",
+      "operation_id": "studio_usage.get_budgets",
+      "tag": "",
+      "summary": "An organization's monthly budgets",
+      "authenticated": true,
+      "responses": [
+        "BudgetsDto"
+      ],
+      "errors": [
+        "401",
+        "403",
         "404",
         "500"
       ]
@@ -5657,6 +5758,25 @@
       "errors": [
         "400",
         "401",
+        "404",
+        "500"
+      ]
+    },
+    {
+      "method": "PUT",
+      "path": "/studio-usage/v1/budgets",
+      "operation_id": "studio_usage.update_budgets",
+      "tag": "",
+      "summary": "Replace an organization's monthly budgets",
+      "authenticated": true,
+      "request": "BudgetsRequest",
+      "responses": [
+        "BudgetsDto"
+      ],
+      "errors": [
+        "400",
+        "401",
+        "403",
         "404",
         "500"
       ]

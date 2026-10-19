@@ -45,6 +45,13 @@ const MAX_COMMITS: usize = 20_000;
 const MAX_RUN_PAGES: u32 = 3;
 /// Workflows whose runs are read, one page of 100 each.
 const MAX_WORKFLOWS: usize = 20;
+/// Completed runs whose jobs one sync reads, newest first, one request each.
+/// Runs whose jobs are already kept are not counted, so the first sync of a
+/// busy repository fills its history in over a few syncs.
+const MAX_JOB_RUNS: usize = 40;
+/// CI artifacts and releases read per repository, newest first, every sync:
+/// two pages of each.
+const MAX_OUTPUT_PAGES: u32 = 2;
 /// How many open pull requests the review-thread query walks.
 ///
 /// Not a flood guard — the query stores nothing per pull request beyond one
@@ -1097,6 +1104,8 @@ impl IngestService {
         progress.set("pulling CI runs…");
         let mut runs = 0usize;
         let mut ci_error: Option<String> = None;
+        // Completed runs, for their jobs: (created_at, run node, run id, attempt).
+        let mut finished_runs: Vec<(Option<String>, String, i64, Option<i64>)> = Vec::new();
         let reads: Vec<(Option<i64>, u32)> = match driver
             .list_workflows(&auth, repo_full_path)
             .await
@@ -1140,6 +1149,8 @@ impl IngestService {
                 runs += batch.len();
                 for r in batch {
                     let author = r.actor.clone();
+                    let finished = r.status.as_deref() == Some("completed");
+                    let (external, attempt, created) = (r.id, r.attempt, r.created_at.clone());
                     let node = gts::workflow_run_node(
                         source_scope,
                         &repo_id,
@@ -1151,6 +1162,9 @@ impl IngestService {
                     edges.push(gts::artifact_of_edge(&run_id, &repo_id));
                     author_edge(&mut edges, &mut users, &run_id, author.as_deref());
                     nodes.push(node);
+                    if finished {
+                        finished_runs.push((created, run_id, external, attempt));
+                    }
                 }
                 self.flush_and_report(
                     ctx,
@@ -1174,6 +1188,159 @@ impl IngestService {
             runs,
             "studio-artifact-ingest: pulled CI runs"
         );
+
+        // What the builds produced: the files CI runs kept, and releases with
+        // their attachments -- the Artifacts tab's outputs. Read again every
+        // sync, like the runs: an artifact expires and a release gains
+        // assets. Only descriptions; the bytes stay with the provider and a
+        // download is a link it signs. Best effort, like the runs.
+        progress.set("pulling build outputs…");
+        let mut outputs = 0usize;
+        'artifacts: for page in 1..=MAX_OUTPUT_PAGES {
+            let batch = match driver
+                .list_build_artifacts(&auth, repo_full_path, page, PER_PAGE)
+                .await
+            {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        repo = repo_full_path,
+                        "studio-artifact-ingest: CI artifact listing failed — skipping them"
+                    );
+                    break 'artifacts;
+                }
+            };
+            let last = batch.len() < PER_PAGE as usize;
+            outputs += batch.len();
+            for a in batch {
+                let node = gts::build_artifact_node(
+                    source_scope,
+                    &repo_id,
+                    connector_id,
+                    repo_full_path,
+                    a,
+                );
+                edges.push(gts::artifact_of_edge(&node.instance_id, &repo_id));
+                nodes.push(node);
+            }
+            if last {
+                break;
+            }
+        }
+        'releases: for page in 1..=MAX_OUTPUT_PAGES {
+            let batch = match driver
+                .list_releases(&auth, repo_full_path, page, PER_PAGE)
+                .await
+            {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        repo = repo_full_path,
+                        "studio-artifact-ingest: release listing failed — skipping releases"
+                    );
+                    break 'releases;
+                }
+            };
+            let last = batch.len() < PER_PAGE as usize;
+            outputs += batch.len();
+            for r in batch {
+                let node =
+                    gts::release_node(source_scope, &repo_id, connector_id, repo_full_path, r);
+                edges.push(gts::artifact_of_edge(&node.instance_id, &repo_id));
+                nodes.push(node);
+            }
+            if last {
+                break;
+            }
+        }
+        self.flush_and_report(
+            ctx,
+            progress,
+            &mut nodes,
+            &mut flushed,
+            workspace_id,
+            project_id,
+            "pulling build outputs…",
+            issues,
+            pull_requests,
+            files,
+            comments,
+            commits,
+        )
+        .await?;
+        tracing::info!(
+            repo = repo_full_path,
+            outputs,
+            "studio-artifact-ingest: pulled build outputs"
+        );
+
+        // The jobs of the newest completed runs: which part of a run failed,
+        // and at which step. A finished attempt's jobs never change, so a run
+        // whose attempt already has its jobs is not asked again -- a steady
+        // sync asks only for the runs that finished since the last one. Best
+        // effort, like the runs.
+        if ci_error.is_none() && !finished_runs.is_empty() {
+            progress.set("pulling CI jobs…");
+            let known: HashSet<(String, Option<i64>)> = match project_id.or(workspace_id) {
+                Some(scope) => self
+                    .list_in_scope(ctx, Some("workflow_job"), scope)
+                    .await
+                    .unwrap_or_default()
+                    .iter()
+                    .filter_map(|n| {
+                        let run = n.value.get("run")?.as_str()?.to_string();
+                        Some((
+                            run,
+                            n.value.get("attempt").and_then(serde_json::Value::as_i64),
+                        ))
+                    })
+                    .collect(),
+                None => HashSet::new(),
+            };
+            finished_runs.sort_by(|a, b| b.0.cmp(&a.0));
+            let mut jobs = 0usize;
+            for (_, run_node, external, attempt) in finished_runs
+                .into_iter()
+                .filter(|(_, run, _, attempt)| !known.contains(&(run.clone(), *attempt)))
+                .take(MAX_JOB_RUNS)
+            {
+                let batch = match driver
+                    .list_workflow_jobs(&auth, repo_full_path, external)
+                    .await
+                {
+                    Ok(b) => b,
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            repo = repo_full_path,
+                            "studio-artifact-ingest: CI job listing failed — skipping CI jobs"
+                        );
+                        break;
+                    }
+                };
+                jobs += batch.len();
+                for j in batch {
+                    let node = gts::workflow_job_node(
+                        source_scope,
+                        &repo_id,
+                        connector_id,
+                        repo_full_path,
+                        &run_node,
+                        attempt,
+                        j,
+                    );
+                    edges.push(gts::artifact_of_edge(&node.instance_id, &repo_id));
+                    nodes.push(node);
+                }
+            }
+            tracing::info!(
+                repo = repo_full_path,
+                jobs,
+                "studio-artifact-ingest: pulled CI jobs"
+            );
+        }
 
         // Author nodes discovered along the way join the batch, then a final
         // flush stores them plus anything appended since the last page. Node
@@ -2270,6 +2437,84 @@ impl IngestService {
         Ok((source.full_path, workflow, started_on))
     }
 
+    /// What a project's builds produced -- CI artifacts and releases -- as
+    /// the last sync kept them, unsorted.
+    pub async fn list_outputs(
+        &self,
+        ctx: &SecurityContext,
+        project: &str,
+    ) -> anyhow::Result<Vec<super::outputs::Output>> {
+        use super::outputs::{OutputKind, output_of};
+        let mut outputs = Vec::new();
+        for kind in [OutputKind::BuildArtifact, OutputKind::Release] {
+            for node in self.list_in_scope(ctx, Some(kind.leaf()), project).await? {
+                outputs.extend(output_of(kind, &node.instance_id, &node.value));
+            }
+        }
+        Ok(outputs)
+    }
+
+    /// A provider-signed link that downloads one of the project's outputs
+    /// (or one asset of a release), asked for through the connection of the
+    /// project repository it came from -- only one the project's organization
+    /// owns, as for Build in CI. The link lives about a minute; nothing is
+    /// downloaded here.
+    pub async fn output_download_link(
+        &self,
+        ctx: &SecurityContext,
+        am: &dyn account_management_sdk::AccountManagementClient,
+        project: Uuid,
+        output_id: &str,
+        asset: Option<&str>,
+    ) -> Result<String, super::builds::BuildRefusal> {
+        use super::builds::BuildRefusal;
+        let output = self
+            .list_outputs(ctx, &project.to_string())
+            .await?
+            .into_iter()
+            .find(|o| o.id == output_id)
+            .ok_or_else(|| {
+                BuildRefusal::NotFound(format!("output {output_id} is not in project {project}"))
+            })?;
+        let (repo, target) = super::outputs::download_target(&output, asset)
+            .map_err(|why| BuildRefusal::Invalid(why.to_string()))?;
+        let config = crate::project_sources::read_config(am, ctx, project)
+            .await
+            .ok_or_else(|| BuildRefusal::NotFound(format!("project {project} is not found")))?;
+        let source = crate::project_sources::parse(&config)
+            .into_iter()
+            .find(|s| s.full_path.eq_ignore_ascii_case(repo.trim()))
+            .ok_or_else(|| {
+                BuildRefusal::NotFound(format!(
+                    "{repo} is no longer one of the project's repositories"
+                ))
+            })?;
+        let service = self
+            .connectors
+            .as_ref()
+            .and_then(crate::connectors::sdk::Connectors::get)
+            .ok_or_else(|| BuildRefusal::Internal(anyhow::anyhow!("no connector service")))?;
+        service
+            .ensure_owned(ctx, project, project, source.connection_id, "github")
+            .await
+            .map_err(BuildRefusal::NotOwned)?;
+        let repository = crate::connectors::sdk::Repository::open(
+            &service,
+            ctx,
+            project,
+            source.connection_id,
+            "github",
+            &source.full_path,
+            None,
+        )
+        .await
+        .map_err(|e| BuildRefusal::Provider(format!("{e:#}")))?;
+        repository
+            .download_link(target)
+            .await
+            .map_err(|e| BuildRefusal::Provider(format!("{e:#}")))
+    }
+
     pub async fn record_mapping_decision(
         &self,
         ctx: &SecurityContext,
@@ -2501,6 +2746,43 @@ impl super::port::DeliveryEvidence for IngestService {
             })
             .count();
         Ok(u32::try_from(waiting).unwrap_or(u32::MAX))
+    }
+}
+
+#[async_trait::async_trait]
+impl super::port::OpenPullRequests for IngestService {
+    async fn open_pulls(
+        &self,
+        ctx: &SecurityContext,
+        scope: &str,
+    ) -> anyhow::Result<Vec<super::port::OpenPull>> {
+        let pulls: Vec<(String, serde_json::Value)> = self
+            .list_in_scope(ctx, Some("pull_request"), scope)
+            .await?
+            .into_iter()
+            .map(|n| (n.instance_id, n.value))
+            .collect();
+        let now = time::OffsetDateTime::now_utc().unix_timestamp() * 1000;
+        Ok(super::pull_request_waits::waiting_pulls(&pulls, now)
+            .into_iter()
+            .map(|w| {
+                let mut reviewers = w.facts.requested_reviewers.clone();
+                for r in w.facts.reviews.iter().flatten() {
+                    if !reviewers.contains(&r.login) {
+                        reviewers.push(r.login.clone());
+                    }
+                }
+                super::port::OpenPull {
+                    project_id: w.project_id,
+                    author: w.facts.author,
+                    waiting: w.verdict.waiting.as_str().to_owned(),
+                    waiting_on: w.verdict.on,
+                    reviewers,
+                    days_open: w.days_open,
+                    days_since_update: w.days_since_update,
+                }
+            })
+            .collect())
     }
 }
 

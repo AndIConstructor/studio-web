@@ -207,6 +207,12 @@ pub struct NodesQuery {
     /// field carried by issue/pull_request/file/comment/commit nodes).
     #[serde(default)]
     pub repo: Option<String>,
+    /// Filter to the nodes about one document — the `subject` a
+    /// `spec_finding` carries (a file node id, or `studio-doc:<id>`). The IDE
+    /// asks this for the document on screen instead of reading every finding
+    /// in the project.
+    #[serde(default)]
+    pub subject: Option<String>,
     /// Sort order: `updated` (newest `updated_at` first) or the default stable
     /// order by instance id.
     #[serde(default)]
@@ -850,6 +856,7 @@ async fn list_nodes(
             .map(str::to_owned)
     };
     let (filter, scope, repo) = (trimmed(&q.r#type), trimmed(&q.scope), trimmed(&q.repo));
+    let subject = trimmed(&q.subject);
     let needle = trimmed(&q.q).map(|s| s.to_lowercase());
     let limit = q.limit.unwrap_or(50).clamp(1, 200);
     // Offset wins when present (classic paginator); otherwise the legacy cursor
@@ -866,6 +873,7 @@ async fn list_nodes(
                 type_filter: filter.as_deref(),
                 scope: scope.as_deref(),
                 repo: repo.as_deref(),
+                subject: subject.as_deref(),
                 needle: needle.as_deref(),
                 by_updated: q.sort.as_deref() == Some("updated"),
                 start,
@@ -1357,6 +1365,8 @@ pub struct WaitingPullRequestDto {
     pub title: String,
     /// The pull request on the provider's site.
     pub url: Option<String>,
+    /// The branch it would merge: what its CI runs ran on.
+    pub source_branch: Option<String>,
     pub author: Option<PullRequestPersonDto>,
     /// The one bucket it is in: `review`, `author`, `merge`, `draft` or
     /// `nobody`.
@@ -1568,6 +1578,7 @@ async fn open_pull_requests(
                 number: p.number,
                 title: p.title,
                 url: p.url,
+                source_branch: p.source_branch,
                 author: p.facts.author.as_deref().map(|a| person(provider_ref, a)),
                 waiting: p.verdict.waiting.as_str().to_owned(),
                 waiting_on: p
@@ -1668,6 +1679,25 @@ pub struct CiRunDto {
     pub number: Option<i64>,
     pub created_at: Option<String>,
     pub updated_at: Option<String>,
+    /// The jobs of the attempt the run is at, in the order they started;
+    /// empty until a sync has read them.
+    pub jobs: Vec<CiJobDto>,
+}
+
+/// One job of a CI run: which part of it passed or failed, and where.
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+pub struct CiJobDto {
+    pub name: String,
+    pub status: Option<String>,
+    pub conclusion: Option<String>,
+    /// The first step that failed, when one did.
+    pub failed_step: Option<String>,
+    pub started_at: Option<String>,
+    pub completed_at: Option<String>,
+    /// From start to finish, for a finished job.
+    pub duration_seconds: Option<i64>,
+    pub url: Option<String>,
 }
 
 #[derive(Debug)]
@@ -1688,8 +1718,35 @@ pub struct CiRunQuery {
     pub branch: Option<String>,
 }
 
-fn ci_run_dto(r: super::ci_runs::CiRun) -> CiRunDto {
+fn ci_job_dto(j: &super::ci_runs::CiJob) -> CiJobDto {
+    let at = |s: &Option<String>| {
+        s.as_deref().and_then(|s| {
+            time::OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339).ok()
+        })
+    };
+    let duration_seconds = match (at(&j.started_at), at(&j.completed_at)) {
+        (Some(start), Some(end)) if end >= start => Some((end - start).whole_seconds()),
+        _ => None,
+    };
+    CiJobDto {
+        name: j.name.clone(),
+        status: j.status.clone(),
+        conclusion: j.conclusion.clone(),
+        failed_step: j.failed_step.clone(),
+        started_at: j.started_at.clone(),
+        completed_at: j.completed_at.clone(),
+        duration_seconds,
+        url: j.url.clone(),
+    }
+}
+
+fn ci_run_dto(r: super::ci_runs::CiRun, jobs: &[super::ci_runs::CiJob]) -> CiRunDto {
+    let jobs = super::ci_runs::jobs_of_run(&r, jobs)
+        .into_iter()
+        .map(ci_job_dto)
+        .collect();
     CiRunDto {
+        jobs,
         id: r.id,
         repo: r.repo,
         workflow: r.workflow,
@@ -1725,17 +1782,213 @@ async fn list_ci_runs(
         .iter()
         .filter_map(|(id, v)| super::ci_runs::run_of(id, v))
         .collect();
+    let jobs: Vec<super::ci_runs::CiJob> = scoped_entries(service, &ctx, "workflow_job", scope)
+        .await?
+        .iter()
+        .filter_map(|(id, v)| super::ci_runs::job_of(id, v))
+        .collect();
     let latest = super::ci_runs::latest_completed(&runs).map(|r| r.id.clone());
     let items: Vec<CiRunDto> =
         super::ci_runs::filter(runs, query.revision.as_deref(), query.branch.as_deref())
             .into_iter()
-            .map(ci_run_dto)
+            .map(|r| ci_run_dto(r, &jobs))
             .collect();
     Ok(Json(CiRunListDto {
         total: u32::try_from(items.len()).unwrap_or(u32::MAX),
         items,
         latest_completed: latest,
     }))
+}
+
+/// A file attached to a release.
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+pub struct OutputAssetDto {
+    /// The provider's id: what `asset_id` names for a download.
+    pub id: String,
+    pub name: String,
+    pub size: Option<i64>,
+    pub content_type: Option<String>,
+    pub download_count: Option<i64>,
+}
+
+/// What a build produced: a file a CI run kept, or a release with its files.
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+pub struct OutputDto {
+    pub id: String,
+    /// `build_artifact` or `release`.
+    pub kind: String,
+    /// The repo node.
+    pub repo: Option<String>,
+    /// `owner/name`.
+    pub repo_full_path: Option<String>,
+    /// An artifact's name; a release's name, else its tag.
+    pub title: String,
+    pub size_in_bytes: Option<i64>,
+    /// The provider no longer keeps the artifact: listed, not downloadable.
+    pub expired: bool,
+    /// The run that kept an artifact: an id from `/runs`.
+    pub run: Option<String>,
+    pub branch: Option<String>,
+    pub sha: Option<String>,
+    pub tag: Option<String>,
+    pub draft: bool,
+    pub prerelease: bool,
+    /// The release's page at the provider.
+    pub url: Option<String>,
+    pub assets: Vec<OutputAssetDto>,
+    /// RFC 3339: when the run kept the artifact, or the release was made.
+    pub created_at: Option<String>,
+    /// RFC 3339: when the provider drops the artifact.
+    pub expires_at: Option<String>,
+    /// RFC 3339: when the release was published.
+    pub published_at: Option<String>,
+}
+
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+pub struct OutputListDto {
+    pub items: Vec<OutputDto>,
+    pub total: u32,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct OutputQuery {
+    pub project_id: String,
+    /// `build_artifact` or `release`.
+    pub kind: Option<String>,
+    /// A run id from `/runs`: that run's artifacts only.
+    pub run: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct OutputDownloadQuery {
+    pub project_id: String,
+    /// For a release: which of its files.
+    pub asset_id: Option<String>,
+}
+
+/// A link that downloads an output with no credential, for about a minute.
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+pub struct OutputDownloadDto {
+    /// The provider-signed link. Open it right away; it is not kept.
+    pub url: String,
+}
+
+fn output_dto(o: super::outputs::Output) -> OutputDto {
+    OutputDto {
+        id: o.id,
+        kind: o.kind.leaf().to_owned(),
+        repo: o.repo,
+        repo_full_path: o.repo_full_path,
+        title: o.title,
+        size_in_bytes: o.size_in_bytes,
+        expired: o.expired,
+        run: o.run,
+        branch: o.branch,
+        sha: o.sha,
+        tag: o.tag,
+        draft: o.draft,
+        prerelease: o.prerelease,
+        url: o.url,
+        assets: o
+            .assets
+            .into_iter()
+            .map(|a| OutputAssetDto {
+                id: a.id,
+                name: a.name,
+                size: a.size,
+                content_type: a.content_type,
+                download_count: a.download_count,
+            })
+            .collect(),
+        created_at: o.created_at,
+        expires_at: o.expires_at,
+        published_at: o.published_at,
+    }
+}
+
+/// What a project's builds produced, newest first.
+async fn list_outputs(
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(ingest): Extension<Ingest>,
+    Query(query): Query<OutputQuery>,
+) -> ApiResult<JsonBody<OutputListDto>> {
+    let scope = query.project_id.trim();
+    if scope.is_empty() {
+        return Err(StudioArtifactIngestError::invalid_argument()
+            .with_field_violation("project_id", "required".to_owned(), "REQUIRED")
+            .create());
+    }
+    let kind = match query
+        .kind
+        .as_deref()
+        .map(str::trim)
+        .filter(|k| !k.is_empty())
+    {
+        None => None,
+        Some(k) => Some(super::outputs::OutputKind::parse(k).ok_or_else(|| {
+            StudioArtifactIngestError::invalid_argument()
+                .with_field_violation("kind", "build_artifact or release".to_owned(), "INVALID")
+                .create()
+        })?),
+    };
+    let service = ingest.get()?;
+    let mut outputs = service
+        .list_outputs(&ctx, scope)
+        .await
+        .map_err(|e| CanonicalError::internal(format!("{e:#}")).create())?;
+    if let Some(kind) = kind {
+        outputs.retain(|o| o.kind == kind);
+    }
+    let items: Vec<OutputDto> = super::outputs::filter(outputs, query.run.as_deref())
+        .into_iter()
+        .map(output_dto)
+        .collect();
+    Ok(Json(OutputListDto {
+        total: u32::try_from(items.len()).unwrap_or(u32::MAX),
+        items,
+    }))
+}
+
+/// A provider-signed link to one output, for a member of its project.
+async fn get_output_download(
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(ingest): Extension<Ingest>,
+    axum::extract::Path(output_id): axum::extract::Path<String>,
+    Query(query): Query<OutputDownloadQuery>,
+) -> ApiResult<JsonBody<OutputDownloadDto>> {
+    use super::builds::BuildRefusal;
+    let project_id = BuildQuery {
+        project_id: query.project_id.clone(),
+    }
+    .project()?;
+    let svc = ingest.get()?;
+    let (am, _) = reachable_project(&ingest, &ctx, project_id).await?;
+    let url = svc
+        .output_download_link(
+            &ctx,
+            am.as_ref(),
+            project_id,
+            output_id.trim(),
+            query.asset_id.as_deref(),
+        )
+        .await
+        .map_err(|e| match e {
+            BuildRefusal::NotFound(why) => StudioArtifactIngestError::not_found(why)
+                .with_resource(output_id.clone())
+                .create(),
+            BuildRefusal::Invalid(why) => StudioArtifactIngestError::failed_precondition()
+                .with_precondition_violation("output".to_owned(), why, "NOT_DOWNLOADABLE")
+                .create(),
+            BuildRefusal::Provider(why) => StudioArtifactIngestError::failed_precondition()
+                .with_precondition_violation("provider".to_owned(), why, "DOWNLOAD_REFUSED")
+                .create(),
+            other => build_problem(other),
+        })?;
+    Ok(Json(OutputDownloadDto { url }))
 }
 
 async fn scoped_entries(
@@ -1939,7 +2192,9 @@ pub fn register_routes(
              narrowed to a revision (a full or short sha) or a branch: workflow, revision, \
              branch, status, conclusion and when. `latest_completed` names the newest \
              completed run on a mainline (main, master, trunk), else the newest completed run \
-             — what a `tests` stage gate reads (issue #783). As fresh as the last sync.",
+             — what a `tests` stage gate reads (issue #783). Each run carries the jobs of \
+             the attempt it is at, with the step a failed job failed at, once a sync has \
+             read them. As fresh as the last sync.",
         )
         .tag("StudioArtifactIngest")
         .authenticated()
@@ -1953,6 +2208,58 @@ pub fn register_routes(
         .error_401(openapi)
         .error_500(openapi)
         .error_503(openapi)
+        .register(router, openapi);
+
+    let router = OperationBuilder::get("/studio-artifact-ingest/v1/outputs")
+        .operation_id("studio_artifact_ingest.list_outputs")
+        .summary("What a project's builds produced: CI artifacts and releases")
+        .description(
+            "The files CI runs kept (`build_artifact`: name, size, the run from `/runs` \
+             that kept it, when the provider drops it) and the repositories' releases with \
+             their attached files (`release`), newest first, as the last sync read them. \
+             Only descriptions: download one with `GET /outputs/{output_id}/download`. \
+             `kind` keeps one of the two; `run` keeps one run's artifacts.",
+        )
+        .tag("StudioArtifactIngest")
+        .authenticated()
+        .require_license_features::<License>([])
+        .query_param("project_id", true, "The project")
+        .query_param("kind", false, "build_artifact or release")
+        .query_param("run", false, "A run id from /runs")
+        .handler(list_outputs)
+        .json_response_with_schema::<OutputListDto>(openapi, StatusCode::OK, "The outputs")
+        .error_400(openapi)
+        .error_401(openapi)
+        .error_500(openapi)
+        .error_503(openapi)
+        .register(router, openapi);
+
+    let router = OperationBuilder::get("/studio-artifact-ingest/v1/outputs/{output_id}/download")
+        .operation_id("studio_artifact_ingest.get_output_download")
+        .summary("A short-lived link that downloads one output")
+        .description(
+            "For a member of the project: asks the provider, through the connection of the \
+             project repository the output came from, for its own signed link to the file \
+             (a CI artifact's zip, or the release file `asset_id` names) and answers it as \
+             `url`. The link works without a credential for about a minute, so open it at \
+             once and do not keep it; the bytes go from the provider to the browser and \
+             never through Studio. A link rather than a redirect, because a browser \
+             navigation does not carry the bearer token. 400 `NOT_DOWNLOADABLE` for an \
+             expired artifact or a release without `asset_id`; 400 `DOWNLOAD_REFUSED` with \
+             the provider's words; 400 `CONNECTION_NOT_OWNED` as for Build in CI.",
+        )
+        .tag("StudioArtifactIngest")
+        .authenticated()
+        .require_license_features::<License>([])
+        .path_param("output_id", "An output id from /outputs")
+        .query_param("project_id", true, "The project")
+        .query_param("asset_id", false, "For a release: which of its files")
+        .handler(get_output_download)
+        .json_response_with_schema::<OutputDownloadDto>(openapi, StatusCode::OK, "The link")
+        .error_400(openapi)
+        .error_401(openapi)
+        .error_404(openapi)
+        .error_500(openapi)
         .register(router, openapi);
 
     let router = OperationBuilder::get("/studio-artifact-ingest/v1/open-pull-requests")

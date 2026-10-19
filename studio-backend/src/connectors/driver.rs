@@ -356,6 +356,55 @@ pub struct RemoteWorkflowRun {
     pub updated_at: Option<String>,
 }
 
+/// A file a CI run uploaded and kept: a build's output, retained by the
+/// provider until `expires_at`. The bytes stay with the provider.
+#[derive(Debug, Clone, Default)]
+pub struct RemoteBuildArtifact {
+    pub id: i64,
+    pub name: String,
+    pub size_in_bytes: Option<i64>,
+    /// The provider dropped it: listed, no longer downloadable.
+    pub expired: bool,
+    pub created_at: Option<String>,
+    pub expires_at: Option<String>,
+    /// The run that uploaded it ([`RemoteWorkflowRun::id`]).
+    pub run_id: Option<i64>,
+    pub branch: Option<String>,
+    pub sha: Option<String>,
+}
+
+/// A release of a repository: a tag with notes and the files attached to it.
+#[derive(Debug, Clone, Default)]
+pub struct RemoteRelease {
+    pub id: i64,
+    pub tag: String,
+    pub name: Option<String>,
+    pub draft: bool,
+    pub prerelease: bool,
+    pub url: Option<String>,
+    pub created_at: Option<String>,
+    pub published_at: Option<String>,
+    pub assets: Vec<RemoteReleaseAsset>,
+}
+
+/// A file attached to a [`RemoteRelease`].
+#[derive(Debug, Clone, Default)]
+pub struct RemoteReleaseAsset {
+    pub id: i64,
+    pub name: String,
+    pub size: Option<i64>,
+    pub content_type: Option<String>,
+    pub download_count: Option<i64>,
+}
+
+/// What a download link is asked for: a CI run's artifact or a release's
+/// asset, by the provider's id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DownloadTarget {
+    BuildArtifact(i64),
+    ReleaseAsset(i64),
+}
+
 /// One CI workflow of a repository: what the sync reads its runs by. Its
 /// name comes with every run.
 #[derive(Debug, Clone, Default)]
@@ -363,6 +412,24 @@ pub struct RemoteWorkflow {
     pub id: i64,
     /// `active`, or why it does not run (`disabled_manually`, …).
     pub state: Option<String>,
+}
+
+/// One job of a CI run's latest attempt (`build-backend`, `test-prototype`):
+/// what a run's single result does not say — which part of it failed, and at
+/// which step.
+#[derive(Debug, Clone, Default)]
+pub struct RemoteWorkflowJob {
+    pub id: i64,
+    pub name: String,
+    /// `queued`, `in_progress`, `completed`, …
+    pub status: Option<String>,
+    /// For a completed job: `success`, `failure`, `skipped`, …
+    pub conclusion: Option<String>,
+    /// The first step that failed, when one did.
+    pub failed_step: Option<String>,
+    pub started_at: Option<String>,
+    pub completed_at: Option<String>,
+    pub url: Option<String>,
 }
 
 /// A repository tree read at a ref, for the knowledge-graph sync.
@@ -664,6 +731,61 @@ pub trait ConnectorDriver: Send + Sync + 'static {
         per_page: u32,
     ) -> anyhow::Result<Vec<RemoteWorkflowRun>> {
         let _ = (auth, repo_full_path, workflow, page, per_page);
+        Ok(Vec::new())
+    }
+
+    /// The files CI runs kept in one repository, newest first: `page` of
+    /// `per_page` (1-based). Defaulted to empty so a driver without CI
+    /// contributes none.
+    async fn list_build_artifacts(
+        &self,
+        auth: &ConnectionAuth,
+        repo_full_path: &str,
+        page: u32,
+        per_page: u32,
+    ) -> anyhow::Result<Vec<RemoteBuildArtifact>> {
+        let _ = (auth, repo_full_path, page, per_page);
+        Ok(Vec::new())
+    }
+
+    /// One repository's releases with their assets, newest first: `page` of
+    /// `per_page` (1-based). Defaulted to empty.
+    async fn list_releases(
+        &self,
+        auth: &ConnectionAuth,
+        repo_full_path: &str,
+        page: u32,
+        per_page: u32,
+    ) -> anyhow::Result<Vec<RemoteRelease>> {
+        let _ = (auth, repo_full_path, page, per_page);
+        Ok(Vec::new())
+    }
+
+    /// A short-lived link that downloads `target` without any credential:
+    /// the provider signs it, so the bytes go from the provider to the
+    /// browser and never through Studio. Defaulted to an error.
+    async fn download_link(
+        &self,
+        auth: &ConnectionAuth,
+        repo_full_path: &str,
+        target: DownloadTarget,
+    ) -> anyhow::Result<String> {
+        let _ = (auth, repo_full_path, target);
+        Err(anyhow::anyhow!(
+            "{} cannot hand out download links through this connection",
+            self.display_name()
+        ))
+    }
+
+    /// The jobs of one CI run's latest attempt, by the provider's run id.
+    /// Defaulted to empty so a driver without CI contributes no jobs.
+    async fn list_workflow_jobs(
+        &self,
+        auth: &ConnectionAuth,
+        repo_full_path: &str,
+        run_id: i64,
+    ) -> anyhow::Result<Vec<RemoteWorkflowJob>> {
+        let _ = (auth, repo_full_path, run_id);
         Ok(Vec::new())
     }
 
