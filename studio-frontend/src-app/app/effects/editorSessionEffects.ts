@@ -77,7 +77,7 @@ export interface EditorScope {
   projectId: string | null;
   orgId: string | null;
   editor: boolean;
-  /** What the editor shows; only a file is told to the IDE. */
+  /** What the editor shows; only a file or a Studio document is told to the IDE. */
   artifact: StudioArtifact | null;
 }
 
@@ -90,6 +90,8 @@ export interface EditorSession {
 
 type Outcome = { ready: true } | { ready: false; failure: EditorSessionFailure };
 type Launched = { ready: true; url: string } | { ready: false; failure: EditorSessionFailure };
+/** What the IDE is told to open: a file, or a Studio document with the workspace that addresses it. */
+type Opened = { artifact: StudioArtifact; workspaceId?: string };
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -132,8 +134,8 @@ export function createEditorSession(app: FrontXApp): EditorSession {
   let stopWait: (() => void) | null = null;
   /** The project's sources as last read: where each repository is checked out. */
   let projectSources: readonly ProjectSource[] = [];
-  /** The file the editor shows, told to the IDE when it changes and to every new frame. */
-  let file: StudioArtifact | null = null;
+  /** The file or document the editor shows, told to the IDE when it changes and to every new frame. */
+  let opened: Opened | null = null;
   /** The bridge to the editor's frame, and whether the IDE in it has answered. */
   let bridge: ReturnType<typeof connectEditorBridge> | null = null;
   let answered = false;
@@ -361,17 +363,39 @@ export function createEditorSession(app: FrontXApp): EditorSession {
     clearAnswerTimer();
   };
 
-  /** Without its directory the IDE looks in every root and one level below, and the first match wins. */
-  const openMessage = (artifact: StudioArtifact): EditorMessage => {
+  const openMessage = ({ artifact, workspaceId }: Opened): EditorMessage => {
+    if (workspaceId) {
+      return {
+        type: 'studio.openDocument',
+        workspaceId,
+        documentId: artifact.artifactId,
+        ...(artifact.path ? { title: artifact.path } : {}),
+      };
+    }
+    // Without its directory the IDE looks in every root and one level below, and the first match wins.
     const directory = checkoutDirectory(projectSources, artifact.repository);
     return { type: 'studio.openInEditor', path: directory ? `${directory}/${artifact.path}` : artifact.path };
   };
 
   // @cpt-begin:cpt-studiofrontend-flow-editor-bridge-open:p1:inst-5
-  const showFile = (artifact: StudioArtifact | null): void => {
-    const next = artifact?.kind === 'file' && artifact.path ? artifact : null;
-    if (next?.repository === file?.repository && next?.path === file?.path) return;
-    file = next;
+  const showArtifact = (artifact: StudioArtifact | null): void => {
+    let next: Opened | null = null;
+    if (artifact?.kind === 'file' && artifact.path) next = { artifact };
+    // The IDE addresses a document by the workspace the Specs list reads it from. A link opened in a fresh
+    // tab may not have that workspace yet, so the document waits for it: held before, it would be taken
+    // as told by the pass that brings the workspace.
+    const workspaceId = readAppContext(app).workspace?.id;
+    if (artifact?.kind === 'document' && workspaceId) next = { artifact, workspaceId };
+    // A document is the same one by its id and workspace (its title is no address), a file by where it
+    // sits. The workspace can move under the same document: a link that names the project alone starts
+    // on the shell's default workspace, then moves to the project's own.
+    const [now, was] = [next?.artifact, opened?.artifact];
+    const same =
+      now?.kind === 'document' || was?.kind === 'document'
+        ? now?.kind === was?.kind && now?.artifactId === was?.artifactId && next?.workspaceId === opened?.workspaceId
+        : now?.repository === was?.repository && now?.path === was?.path;
+    if (same) return;
+    opened = next;
     if (next) bridge?.post(openMessage(next));
   };
   // @cpt-end:cpt-studiofrontend-flow-editor-bridge-open:p1:inst-5
@@ -431,7 +455,7 @@ export function createEditorSession(app: FrontXApp): EditorSession {
       },
     });
     bridge = mine;
-    if (file) mine.post(openMessage(file));
+    if (opened) mine.post(openMessage(opened));
     const unsubscribeTheme = app.themeRegistry.subscribe(() => mine.post({ type: 'studio.theme', theme: theme() }));
     // Every renewal; the read only until one is heard, and only for this frame.
     let heard = false;
@@ -476,7 +500,7 @@ export function createEditorSession(app: FrontXApp): EditorSession {
       entered = false;
       return;
     }
-    showFile(artifact);
+    showArtifact(artifact);
     if (entered || !projectId || !orgId) return;
     entered = true;
     if (!inFlight) void launch(projectId, orgId, false);

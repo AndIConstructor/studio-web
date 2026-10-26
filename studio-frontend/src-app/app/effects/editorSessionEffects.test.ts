@@ -50,6 +50,9 @@ const RUN = 'run-1';
 const ADDRESS = 'https://ide.test/studio/s1/?token=gate';
 const REPOS = [{ name: 'web', kind: 'git', url: 'https://git.test/acme/web.git', token_ref: 'ref-1' }];
 const FILE: StudioArtifact = { artifactId: 'a1', repository: 'acme/web', path: 'src/main.ts', kind: 'file' };
+const WORKSPACE = 'w1';
+/** A Studio document: no repository, and its title where a file has its path. */
+const DOCUMENT: StudioArtifact = { artifactId: 'd1', repository: '', path: 'Payments PRD', kind: 'document' };
 const PROFILE = { id: 'u1', displayName: 'Ada Lovelace', email: 'ada@acme.test' };
 const VIEWER = { sub: 'u1', name: 'Ada Lovelace', email: 'ada@acme.test', kind: 'person' };
 const ANSWER_DEADLINE_MS = 2 * 60_000;
@@ -108,6 +111,8 @@ function harness({ profile = PROFILE as typeof PROFILE | null, projectName = 'We
   let state: EditorSessionState = reducer(undefined, { type: '@@init' });
   const phases: EditorSessionPhase[] = [];
   let themeId: string | undefined = 'default';
+  // Null until the organization's workspaces are read, as on a link opened in a fresh tab.
+  let workspace: { id: string; name: string } | null = { id: WORKSPACE, name: 'Acme' };
   const themeListeners = new Set<() => void>();
   const authListeners = new Set<(event: AuthStateEvent) => void>();
   const getSession = vi.fn<() => Promise<AuthSession | null>>().mockResolvedValue({ kind: 'bearer', token: 'T1' });
@@ -119,7 +124,7 @@ function harness({ profile = PROFILE as typeof PROFILE | null, projectName = 'We
       },
       getState: () => ({
         [EDITOR_SESSION_SLICE_KEY]: state,
-        [APP_CONTEXT_SLICE_KEY]: { project: { id: PROJECT, name: projectName } },
+        [APP_CONTEXT_SLICE_KEY]: { workspace, project: { id: PROJECT, name: projectName } },
         [APP_SESSION_SLICE_KEY]: { profile },
       }),
     },
@@ -142,6 +147,9 @@ function harness({ profile = PROFILE as typeof PROFILE | null, projectName = 'We
   const setTheme = (id: string | undefined): void => {
     themeId = id;
     themeListeners.forEach((listener) => listener());
+  };
+  const setWorkspace = (next: typeof workspace): void => {
+    workspace = next;
   };
   const authEvent = (event: AuthStateEvent): void => authListeners.forEach((listener) => listener(event));
   const renewToken = (token: string): void => authEvent({ state: 'authenticated', session: { kind: 'bearer', token } });
@@ -236,6 +244,7 @@ function harness({ profile = PROFILE as typeof PROFILE | null, projectName = 'We
     mount,
     unmount,
     setTheme,
+    setWorkspace,
     authEvent,
     renewToken,
     getSession,
@@ -1078,6 +1087,88 @@ describe('createEditorSession', () => {
       await vi.waitFor(() => expect(h.state().phase).toBe('ready'));
 
       expect(h.frames[0]?.sent()).toContainEqual({ type: 'studio.openInEditor', path: 'src/main.ts' });
+    });
+
+    it('opens a Studio document by its workspace and id, under its title', async () => {
+      const h = harness();
+      h.launch.mockResolvedValue(session('running'));
+
+      h.open(PROJECT, DOCUMENT);
+      await vi.waitFor(() => expect(h.state().phase).toBe('ready'));
+
+      expect(h.frames[0]?.sent()).toContainEqual({
+        type: 'studio.openDocument',
+        workspaceId: WORKSPACE,
+        documentId: 'd1',
+        title: 'Payments PRD',
+      });
+      expect(h.frames[0]?.types()).not.toContain('studio.openInEditor');
+    });
+
+    it('opens an untitled document without a title, so the IDE names its tab itself', async () => {
+      const h = harness();
+      h.launch.mockResolvedValue(session('running'));
+
+      h.open(PROJECT, { ...DOCUMENT, path: '' });
+      await vi.waitFor(() => expect(h.state().phase).toBe('ready'));
+
+      expect(h.frames[0]?.sent()).toContainEqual({ type: 'studio.openDocument', workspaceId: WORKSPACE, documentId: 'd1' });
+    });
+
+    it('opens a document once its workspace is known, when the IDE answered before the workspaces did', async () => {
+      const h = harness();
+      h.setWorkspace(null);
+      h.launch.mockResolvedValue(session('running'));
+      h.open(PROJECT, DOCUMENT);
+      await vi.waitFor(() => expect(h.state().phase).toBe('ready'));
+      expect(h.frames[0]?.types()).not.toContain('studio.openDocument');
+
+      // The workspaces arrive, and the address is applied again with the same document.
+      h.setWorkspace({ id: WORKSPACE, name: 'Acme' });
+      h.open(PROJECT, DOCUMENT);
+
+      expect(h.frames[0]?.sent()).toContainEqual({
+        type: 'studio.openDocument',
+        workspaceId: WORKSPACE,
+        documentId: 'd1',
+        title: 'Payments PRD',
+      });
+    });
+
+    it("opens the document again in the project's own workspace, when a link named the project alone", async () => {
+      const h = harness();
+      h.launch.mockResolvedValue(session('running'));
+      h.open(PROJECT, DOCUMENT);
+      await vi.waitFor(() => expect(h.state().phase).toBe('ready'));
+
+      // The shell started on its default workspace, then moved the address to the project's.
+      h.setWorkspace({ id: 'w2', name: 'Payments' });
+      h.open(PROJECT, DOCUMENT);
+
+      expect(h.frames[0]?.sent().slice(-1)).toEqual([
+        { type: 'studio.openDocument', workspaceId: 'w2', documentId: 'd1', title: 'Payments PRD' },
+      ]);
+    });
+
+    it('opens another document by its id, whatever its title, and a file after it', async () => {
+      const h = harness();
+      h.launch.mockResolvedValue(session('running'));
+      h.open(PROJECT, DOCUMENT);
+      await vi.waitFor(() => expect(h.state().phase).toBe('ready'));
+      const opens = (): unknown[] =>
+        (h.frames[0]?.sent() ?? []).filter(
+          (message) => message.type === 'studio.openDocument' || message.type === 'studio.openInEditor'
+        );
+
+      h.open(PROJECT, { ...DOCUMENT });
+      h.open(PROJECT, { ...DOCUMENT, artifactId: 'd2' });
+      h.open(PROJECT, FILE);
+
+      expect(opens()).toEqual([
+        { type: 'studio.openDocument', workspaceId: WORKSPACE, documentId: 'd1', title: 'Payments PRD' },
+        { type: 'studio.openDocument', workspaceId: WORKSPACE, documentId: 'd2', title: 'Payments PRD' },
+        { type: 'studio.openInEditor', path: 'web/src/main.ts' },
+      ]);
     });
 
     it("says the catalogue is not in the portal when the IDE asks for a component's page", async () => {
