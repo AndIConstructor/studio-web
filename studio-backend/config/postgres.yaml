@@ -577,6 +577,13 @@ gears:
         max_lifetime: "30m"
     config: {}
 
+  github-mirror:
+    database:
+      engine: "sqlite"
+      file: "github_mirror.db"
+    config:
+      api_base_url: "https://api.github.com"
+
   # ── studio-scheduler (cron/interval schedules) ──
   # Owns schedules and nothing else: each tick it enqueues due runs into
   # studio-tasks. A tick runs under a PostgreSQL advisory lock, so a second
