@@ -485,6 +485,9 @@ gears:
         # IDE chat never read it: they use a person's own key.
         - key: "studio-assistant-llm-key"
           value: "sk-REPLACE_ME"
+        - tenant_id: "00000000-0000-0000-0000-000000000001"
+          key: "github-token"
+          value: "${GITHUB_TOKEN:-}"
 
   # ── studio-tasks (durable background runs) ──
   # Owns the queue every gear's background work goes through, plus the run
@@ -583,6 +586,9 @@ gears:
       file: "github_mirror.db"
     config:
       api_base_url: "https://api.github.com"
+      github_token_secret:
+        tenant_id: "00000000-0000-0000-0000-000000000001"
+        key: "github-token"
 
   # ── studio-scheduler (cron/interval schedules) ──
   # Owns schedules and nothing else: each tick it enqueues due runs into

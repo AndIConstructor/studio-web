@@ -119,7 +119,7 @@ authn-resolver-sdk = { package = "cf-gears-authn-resolver-sdk", version = "0.3.3
 toolkit-utils = { package = "cf-gears-toolkit-utils", version = "0.7.2" }
 # studio-connector: GtsTypeId on the account-management metadata boundary.
 # Same version gears-rust pins in its workspace manifest.
-gts = "0.12"
+gts = "0.16.1"
 
 # ── keycloak-idp-plugin (in-crate; real user provisioning, ADR-0004) ──
 # "stream" is for the llm-proxy gear (SSE passthrough to the LLM upstream).
