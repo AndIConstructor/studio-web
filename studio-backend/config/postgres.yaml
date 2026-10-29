@@ -143,6 +143,7 @@ gears:
             subject_tenant_id: "00000000-0000-0000-0000-000000000001"
             token_scopes: ["*"]
             subject_type: "gts.cf.core.security.subject_user.v1~"
+          bearer_token: "studio-admin-token"
 
   authz-resolver:
     config:
@@ -579,7 +580,10 @@ gears:
         acquire_timeout: "10s"
         idle_timeout: "5m"
         max_lifetime: "30m"
-    config: {}
+    config:
+      client_credentials:
+        client_id: "mini-chat"
+        client_secret: "mini-chat-dev-secret"
 
   github-mirror:
     database:
