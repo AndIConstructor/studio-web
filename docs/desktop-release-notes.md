@@ -9,6 +9,50 @@ change for the person using the app. How the app works is
 
 Releases up to 0.3.0-beta.4 are described only on their GitHub release pages.
 
+## 0.3.0-beta.11
+
+Gearbox's Product tab reads as the product it describes, and a build from
+the desktop compiles with the product's own crate versions. Everything merged
+since `desktop-v0.3.0-beta.10`.
+
+### Building
+
+- **The product's header is one card**: its name, a profile you pick from a
+  list that says what each kind of profile is, the branch, a health pill
+  (Healthy, or the warnings and conflicts), Apply and Discard, and Generate.
+  The **⋯** menu holds the product's own actions -- settings, add a profile,
+  recheck, open the description, close. (#932)
+- **A summary above Composition**, always there: how many gears were asked
+  for and pulled in, the applications, the last Generate, and the **next
+  step** -- reconnect, retry, review the conflicts, apply your changes, add
+  the first gear, or Generate. (#932)
+- **Gears in two lines**, the name and what the gear is for, with a dot for
+  its warnings or conflicts and its plugins counted; the gears pulled in
+  automatically say which gear needs them. (#932)
+- **A gear's details** in sections -- overview, features, configuration,
+  plugins -- with features as switches ("3 of 5 on") and the rarely needed
+  keys under Advanced. Identifiers are no longer drawn in red. (#932)
+- **The Building ribbon** groups Resolve, Conflicts and Lock as *Health*,
+  with the number of errors on Conflicts, and sets Generate apart. (#932)
+
+### Running and deploying
+
+- **Build, Run and Build images lock the generated tree to the product's own
+  crate versions.** gearbox writes no `Cargo.lock`, so cargo took the newest
+  release of every crate and a build of studio-web's images failed compiling
+  `cf-gears-toolkit` with two releases of `cf-gears-toolkit-security`. The
+  tree now gets the lock of the product's own code (else a fetched source's)
+  when it has none; a lock already there stays. (#934)
+
+### Known not to work
+
+- **A build of images with the new lock is not run end to end on the
+  desktop yet**; the same lock builds studio-web's api-gateway in Studio.
+- **Not looked at in a running app yet**: the dark theme of the new header,
+  switches and summary; the ⋯ menu and the profile list on the desktop,
+  where the menu may be drawn natively and without icons. Features show no
+  description: the engine does not report one.
+
 ## 0.3.0-beta.10
 
 What trying Build in the IDE on 0.3.0-beta.9 turned up, and Constructor
