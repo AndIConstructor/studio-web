@@ -72,6 +72,7 @@ const build = (over: Partial<IdeBuild>): IdeBuild => ({
   chartVersion: "0.1.0-sha.1",
   images: [],
   step: null,
+  url: null,
   ...over,
 });
 
