@@ -318,7 +318,7 @@ fn resolve_base_url(
     Ok(url.as_str().trim_end_matches('/').to_string())
 }
 
-fn test_base_url(
+fn direct_base_url(
     driver: &dyn ConnectorDriver,
     base_url: &str,
     options: &BTreeMap<String, String>,
@@ -719,10 +719,15 @@ impl ConnectorService {
 
     /// Assemble driver credentials for a stored connection.
     async fn auth(&self, ctx: &SecurityContext, c: &Connection) -> anyhow::Result<ConnectionAuth> {
+        let base_url = direct_base_url(
+            self.driver(&c.provider)?.as_ref(),
+            &c.base_url,
+            &c.options,
+        );
         // Stored without a credential (a public gear repository).
         if c.secret_ref.is_empty() {
             return Ok(ConnectionAuth {
-                base_url: c.base_url.clone(),
+                base_url,
                 token: String::new(),
             });
         }
@@ -766,7 +771,7 @@ impl ConnectorService {
                 })?;
         }
         Ok(ConnectionAuth {
-            base_url: c.base_url.clone(),
+            base_url,
             token: access.token,
         })
     }
@@ -817,7 +822,7 @@ impl ConnectorService {
         let identity = driver
             .test_with_options(
                 &ConnectionAuth {
-                    base_url: test_base_url(driver.as_ref(), &base_url, &options),
+                    base_url: direct_base_url(driver.as_ref(), &base_url, &options),
                     token: token.to_string(),
                 },
                 &options,
@@ -1236,7 +1241,7 @@ impl ConnectorService {
         let identity = driver
             .test_with_options(
                 &ConnectionAuth {
-                    base_url: test_base_url(driver.as_ref(), &base_url, &options),
+                    base_url: direct_base_url(driver.as_ref(), &base_url, &options),
                     token: token.clone(),
                 },
                 &options,

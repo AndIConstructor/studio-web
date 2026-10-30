@@ -521,6 +521,10 @@ impl IngestService {
             Some(_) => driver.default_base_url(),
             None => base_url.as_str(),
         };
+        let download_auth = ConnectionAuth {
+            base_url: clone_base_url.to_string(),
+            token: token.to_string(),
+        };
 
         // What the walk turns up, kept for the classification pass at the end.
         //
@@ -1404,7 +1408,7 @@ impl IngestService {
             self.record_pipeline_builds(
                 ctx,
                 driver.as_ref(),
-                &auth,
+                &download_auth,
                 repo_full_path,
                 project,
                 workspace_id,
