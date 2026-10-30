@@ -30,7 +30,7 @@ use anyhow::{Context, anyhow, bail};
 use async_trait::async_trait;
 use k8s_openapi::api::batch::v1::Job;
 use k8s_openapi::api::core::v1::{Pod, Secret};
-use kube::api::{DeleteParams, ListParams, Patch, PatchParams};
+use kube::api::{DeleteParams, ListParams, LogParams, Patch, PatchParams};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use toolkit::client_hub::{ClientHub, ClientScope};
@@ -44,7 +44,9 @@ use crate::tasks::sdk::{TaskContext, TaskHandler, TaskOutcome};
 pub const TASK_TYPE: &str = "environments.build";
 pub const WATCH_TASK_TYPE: &str = "environments.build.watch";
 
-/// The image BuildKit runs in, rootless.
+/// The image BuildKit runs in, rootless, unless `STUDIO_BUILDKIT_IMAGE` names
+/// another: a cluster that admits only its own registry's images wants the
+/// same image through that registry's proxy.
 pub const BUILDKIT_IMAGE: &str = "moby/buildkit:v0.20.0-rootless";
 
 /// How long a build may take before the cluster stops it.
@@ -55,8 +57,17 @@ const DEADLINE_SECS: i64 = 60 * 60;
 const WATCH_FOR: Duration = Duration::from_secs(10 * 60);
 const WATCH_EVERY: Duration = Duration::from_secs(20);
 
+/// The watch run past which a Job still running has outlived its deadline by
+/// two rounds: the cluster should have stopped it, so nothing it says now can
+/// be trusted, and the build is recorded as lost.
+const LAST_WATCH_ROUND: u32 = (DEADLINE_SECS as u64 / WATCH_FOR.as_secs()) as u32 + 2;
+
+/// How much of a failure a build keeps: a container's termination message is
+/// at most 4 KiB, and the start of it names what broke.
+const FAILURE_CHARS: usize = 3000;
+
 /// Where the product's repository is, as the server read it.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RepoRef {
     /// The tenant whose connection reaches it.
     pub tenant: Uuid,
@@ -85,6 +96,56 @@ pub struct BuildPayload {
     pub git_ref: Option<String>,
     /// The image `prepare` and `publish` run in: this Studio's backend.
     pub builder_image: String,
+    /// The image the `build` step runs BuildKit in. Absent from a build
+    /// queued before it was recorded, which gets the default.
+    #[serde(default = "default_buildkit_image")]
+    pub buildkit_image: String,
+    /// The tenant the build's record was started in: the caller's. Every
+    /// later record of it is written there too, or the page that reads the
+    /// caller's records keeps the first one, `running`, for ever. Absent from
+    /// a build queued before it was recorded, whose records go to the run's
+    /// own tenant.
+    #[serde(default)]
+    pub records_in: Option<Uuid>,
+    /// The description revision Studio keeps that the build lays at
+    /// `product_file` before it generates (ADR-0053 §2), and its text, which
+    /// the Job's `prepare` gets in its environment. Absent when the project
+    /// has none: `prepare` reads the file in the checkout (or, for a
+    /// `product/…` ref, from that branch -- §4).
+    #[serde(default)]
+    pub description_revision: Option<i64>,
+    #[serde(default)]
+    pub description_text: Option<String>,
+    /// The tenant the environment's connections are found from and read as
+    /// (ADR-0054 §5): the project, for a project's own environment. Absent
+    /// for an organization's, and from a build queued before it was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connections_from: Option<Uuid>,
+    /// The repository's own Dockerfiles and chart (ADR-0054 §7); `None`
+    /// builds `product_file` on gears.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub own: Option<super::model::OwnBuild>,
+}
+
+/// The context a run reads an environment's connections as, and the tenant
+/// it finds them from: the project's service for a project's own
+/// environment, else the run's own (ADR-0054 §5).
+pub(super) fn connection_reader(
+    run: &toolkit_security::SecurityContext,
+    org: Uuid,
+    from: Option<Uuid>,
+) -> anyhow::Result<(toolkit_security::SecurityContext, Uuid)> {
+    match from {
+        Some(tenant) if tenant != org => Ok((super::store::service_context(tenant)?, tenant)),
+        _ => Ok((run.clone(), org)),
+    }
+}
+
+/// The environment variable the Job's `prepare` reads the description from.
+pub const DESCRIPTION_ENV: &str = "STUDIO_PRODUCT_DESCRIPTION";
+
+fn default_buildkit_image() -> String {
+    BUILDKIT_IMAGE.to_owned()
 }
 
 /// What a watch run carries: the Job to follow.
@@ -101,6 +162,18 @@ pub struct WatchPayload {
     /// How many watch runs came before this one.
     #[serde(default)]
     pub round: u32,
+    /// The step last recorded as running, so a step is recorded once.
+    #[serde(default)]
+    pub step: Option<String>,
+    /// See [`BuildPayload::records_in`].
+    #[serde(default)]
+    pub records_in: Option<Uuid>,
+    /// See [`BuildPayload::description_revision`]: recorded beside `commit`.
+    #[serde(default)]
+    pub description_revision: Option<i64>,
+    /// See [`BuildPayload::connections_from`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connections_from: Option<Uuid>,
 }
 
 /// The Job's name for a build: a DNS label.
@@ -126,6 +199,15 @@ pub fn git_secret_name(build_id: &str) -> String {
         .collect()
 }
 
+/// The image BuildKit runs in: `STUDIO_BUILDKIT_IMAGE`, else [`BUILDKIT_IMAGE`].
+pub fn buildkit_image() -> String {
+    std::env::var("STUDIO_BUILDKIT_IMAGE")
+        .ok()
+        .map(|image| image.trim().to_owned())
+        .filter(|image| !image.is_empty())
+        .unwrap_or_else(default_buildkit_image)
+}
+
 /// The image `prepare` and `publish` run in: `STUDIO_BUILDER_IMAGE`, else the
 /// published image of the commit this server was built from.
 pub fn builder_image() -> Option<String> {
@@ -146,14 +228,36 @@ pub fn builder_image() -> Option<String> {
 const BUILD_SCRIPT: &str = r#"set -eu
 TAG="$(cat /work/tag)"
 mkdir -p /work/meta
-while read -r app name dockerfile context; do
+while read -r app name dockerfile context filename; do
   echo "building $app as $PREFIX/$name:$TAG"
   buildctl-daemonless.sh build --frontend dockerfile.v0 \
-    --local context="$context" --local dockerfile="$dockerfile" --opt filename=Dockerfile \
+    --local context="$context" --local dockerfile="$dockerfile" --opt filename="${filename:-Dockerfile}" \
     --output "type=image,name=$PREFIX/$name:$TAG,push=true" \
     --metadata-file "/work/meta/$app.json"
 done < /work/apps
 "#;
+
+/// Which ref a build takes its code from, and which (if any) only its
+/// description (ADR-0053 §4). A `product/…` branch is a snapshot of the whole
+/// repository from the day the description was saved on it, so a build of one
+/// compiles the base branch's code and takes only `product.gdl` from the
+/// product branch. Any other ref -- a branch, a tag, a commit somebody chose
+/// -- is built as it is.
+pub fn code_and_description_refs(git_ref: Option<&str>, base: &str) -> (String, Option<String>) {
+    match git_ref.map(str::trim).filter(|r| !r.is_empty()) {
+        Some(r) if is_product_branch(r) => (base.to_owned(), Some(r.to_owned())),
+        Some(r) => (r.to_owned(), None),
+        None => (base.to_owned(), None),
+    }
+}
+
+/// A branch Studio saved a product's description on: `product/<id>` or
+/// `product/<id>-<digest>`.
+pub fn is_product_branch(r: &str) -> bool {
+    r.strip_prefix("product/")
+        .or_else(|| r.strip_prefix("refs/heads/product/"))
+        .is_some_and(|rest| !rest.is_empty())
+}
 
 /// The Job that builds `p`.
 pub fn job_manifest(p: &BuildPayload, git_secret: bool) -> serde_json::Value {
@@ -163,7 +267,7 @@ pub fn job_manifest(p: &BuildPayload, git_secret: bool) -> serde_json::Value {
         "app.kubernetes.io/name": "studio-build",
         "studio.constructor.tech/build": p.build_id,
     });
-    let git_env = if git_secret {
+    let mut git_env = if git_secret {
         serde_json::json!([
             { "name": "GIT_USERNAME", "valueFrom": { "secretKeyRef": { "name": git_secret_name(&p.build_id), "key": "username" } } },
             { "name": "GIT_PASSWORD", "valueFrom": { "secretKeyRef": { "name": git_secret_name(&p.build_id), "key": "password" } } },
@@ -172,6 +276,13 @@ pub fn job_manifest(p: &BuildPayload, git_secret: bool) -> serde_json::Value {
     } else {
         serde_json::json!([{ "name": "HOME", "value": "/work/home" }])
     };
+    // The description revision's text (ADR-0053 §2): kilobytes, in the Job's
+    // own spec rather than a Secret -- it is no secret, and it goes with the
+    // Job.
+    let description = p.description_text.as_ref().filter(|t| !t.trim().is_empty());
+    if let (Some(text), Some(env)) = (description, git_env.as_array_mut()) {
+        env.push(serde_json::json!({ "name": DESCRIPTION_ENV, "value": text }));
+    }
     let mut prepare_args = vec![
         "build-prepare".to_owned(),
         "--work".to_owned(),
@@ -183,12 +294,25 @@ pub fn job_manifest(p: &BuildPayload, git_secret: bool) -> serde_json::Value {
         "--profile".to_owned(),
         p.profile.clone(),
     ];
-    if let Some(r) = p.git_ref.as_ref().filter(|r| !r.trim().is_empty()) {
-        prepare_args.push("--ref".to_owned());
-        prepare_args.push(r.trim().to_owned());
-    } else {
-        prepare_args.push("--ref".to_owned());
-        prepare_args.push(p.repo.branch.clone());
+    let (code_ref, description_ref) =
+        code_and_description_refs(p.git_ref.as_deref(), &p.repo.branch);
+    prepare_args.push("--ref".to_owned());
+    prepare_args.push(code_ref);
+    match (description, p.description_revision) {
+        (Some(_), Some(revision)) => {
+            prepare_args.push("--description-revision".to_owned());
+            prepare_args.push(revision.to_string());
+        }
+        _ => {
+            if let Some(r) = description_ref {
+                prepare_args.push("--description-ref".to_owned());
+                prepare_args.push(r);
+            }
+        }
+    }
+    if let Some(own) = &p.own {
+        prepare_args.push("--own".to_owned());
+        prepare_args.push(serde_json::to_string(own).unwrap_or_default());
     }
     let restricted = serde_json::json!({
         "runAsNonRoot": true, "runAsUser": 1000, "runAsGroup": 1000,
@@ -226,7 +350,7 @@ pub fn job_manifest(p: &BuildPayload, git_secret: bool) -> serde_json::Value {
                         },
                         {
                             "name": "build",
-                            "image": BUILDKIT_IMAGE,
+                            "image": p.buildkit_image,
                             "command": ["sh", "-c", BUILD_SCRIPT],
                             "env": [
                                 { "name": "PREFIX", "value": p.prefix },
@@ -347,17 +471,33 @@ pub async fn enqueue(
         .await
 }
 
-/// Record a build's outcome in the project's graph.
+/// Record a build's outcome in the project's graph: in `records_in`, the
+/// tenant its first record went to, when it names one; else in the run's.
+pub(super) async fn record_outcome(
+    hub: &Arc<ClientHub>,
+    ctx: &toolkit_security::SecurityContext,
+    records_in: Option<Uuid>,
+    project: Uuid,
+    outcome: crate::artifact_ingest::port::BuildOutcome,
+) -> anyhow::Result<()> {
+    record(hub, ctx, records_in, project, outcome).await
+}
+
 async fn record(
     hub: &Arc<ClientHub>,
     ctx: &toolkit_security::SecurityContext,
+    records_in: Option<Uuid>,
     project: Uuid,
     outcome: crate::artifact_ingest::port::BuildOutcome,
 ) -> anyhow::Result<()> {
     let builds = hub
         .get::<dyn crate::artifact_ingest::port::BuildRecords>()
         .map_err(|_| anyhow!("builds are not available in this deployment"))?;
-    builds.record(ctx, &project.to_string(), &outcome).await
+    let there = match records_in {
+        Some(tenant) if tenant != ctx.subject_tenant_id() => super::store::service_context(tenant)?,
+        _ => ctx.clone(),
+    };
+    builds.record(&there, &project.to_string(), &outcome).await
 }
 
 #[async_trait]
@@ -387,6 +527,7 @@ impl TaskHandler for BuildTask {
                 let _ = record(
                     &self.hub,
                     &ctx.security,
+                    p.records_in,
                     p.project_id,
                     crate::artifact_ingest::port::BuildOutcome::failed(
                         &p.build_id,
@@ -406,17 +547,12 @@ impl TaskHandler for BuildTask {
 impl BuildTask {
     async fn start(&self, ctx: &TaskContext, p: &BuildPayload) -> anyhow::Result<String> {
         ctx.progress("reading the cluster's access").await;
-        let access =
-            cluster_access(&self.hub, &ctx.security, p.organization_id, p.connection_id).await?;
+        let (reader, from) =
+            connection_reader(&ctx.security, p.organization_id, p.connections_from)?;
+        let access = cluster_access(&self.hub, &reader, from, p.connection_id).await?;
         let client = access.client().await?;
         deploy::prepare_namespace(&client, &p.namespace, p.project_id).await?;
-        let registry = registry_access(
-            &self.hub,
-            &ctx.security,
-            p.organization_id,
-            p.registry_connection_id,
-        )
-        .await?;
+        let registry = registry_access(&self.hub, &reader, from, p.registry_connection_id).await?;
         deploy::write_pull_secret(&client, &p.namespace, &registry).await?;
 
         ctx.progress("reading the repository's access").await;
@@ -476,6 +612,10 @@ impl BuildTask {
             repository: p.repo.repo.clone(),
             profile: p.profile.clone(),
             round: 0,
+            step: None,
+            records_in: p.records_in,
+            description_revision: p.description_revision,
+            connections_from: p.connections_from,
         };
         enqueue(
             &self.hub,
@@ -557,13 +697,75 @@ fn pod_messages(pod: &Pod) -> (Option<String>, Option<(String, String)>) {
     (publish, failed)
 }
 
-/// The last `n` characters of `s`: a failure's end says most.
+/// The step the build's pod is in: the first container, init or not, that
+/// has not ended.
+fn current_step(pod: &Pod) -> Option<String> {
+    let status = pod.status.as_ref()?;
+    status
+        .init_container_statuses
+        .iter()
+        .flatten()
+        .chain(status.container_statuses.iter().flatten())
+        .find(|c| c.state.as_ref().is_none_or(|s| s.terminated.is_none()))
+        .map(|c| c.name.clone())
+}
+
+/// A container that waits for what will not come: an image that cannot be
+/// pulled, a configuration that cannot be made. Its step, and why.
+fn stuck(pod: &Pod) -> Option<(String, String)> {
+    const HOPELESS: [&str; 5] = [
+        "ErrImagePull",
+        "ImagePullBackOff",
+        "InvalidImageName",
+        "CreateContainerConfigError",
+        "CreateContainerError",
+    ];
+    let status = pod.status.as_ref()?;
+    status
+        .init_container_statuses
+        .iter()
+        .flatten()
+        .chain(status.container_statuses.iter().flatten())
+        .find_map(|c| {
+            let waiting = c.state.as_ref()?.waiting.as_ref()?;
+            let reason = waiting.reason.as_deref()?;
+            HOPELESS.contains(&reason).then(|| {
+                (
+                    c.name.clone(),
+                    format!(
+                        "{reason}: {}",
+                        waiting
+                            .message
+                            .as_deref()
+                            .unwrap_or("the container cannot start")
+                    ),
+                )
+            })
+        })
+}
+
+/// The last `n` characters of `s`: a log's end says most.
 fn tail(s: &str, n: usize) -> String {
     let chars: Vec<char> = s.trim().chars().collect();
     if chars.len() <= n {
         return chars.into_iter().collect();
     }
     format!("…{}", chars[chars.len() - n..].iter().collect::<String>())
+}
+
+/// The first `n` characters of `s`: an error list's start says most.
+fn head(s: &str, n: usize) -> String {
+    let s = s.trim();
+    match s.char_indices().nth(n) {
+        Some((at, _)) => format!("{}…", &s[..at]),
+        None => s.to_owned(),
+    }
+}
+
+/// What a build records when its watch can no longer follow it: how it ended
+/// is not known.
+fn lost(why: &str) -> String {
+    format!("Studio lost sight of the build: {why}. How it ended is not known; build again.")
 }
 
 #[async_trait]
@@ -587,6 +789,30 @@ impl TaskHandler for WatchTask {
         };
         match self.watch(ctx, &p).await {
             Ok(said) => TaskOutcome::done_with(said, serde_json::json!({ "job": p.job })),
+            // The last attempt: nobody watches after this one, so the build
+            // says it is lost rather than running for ever.
+            Err(e) if ctx.attempt >= self.max_attempts() => {
+                let why = format!("{e:#}");
+                let outcome = crate::artifact_ingest::port::BuildOutcome::failed(
+                    &p.build_id,
+                    &p.repository,
+                    &p.profile,
+                    &lost(&why),
+                    "watch",
+                );
+                if let Err(e) = record(
+                    &self.hub,
+                    &ctx.security,
+                    p.records_in,
+                    p.project_id,
+                    outcome,
+                )
+                .await
+                {
+                    warn!(build = %p.build_id, "studio-environments: a lost build could not be recorded ({e})");
+                }
+                TaskOutcome::Failed(why)
+            }
             Err(e) => TaskOutcome::Retry(format!("{e:#}")),
         }
     }
@@ -594,11 +820,14 @@ impl TaskHandler for WatchTask {
 
 impl WatchTask {
     async fn watch(&self, ctx: &TaskContext, p: &WatchPayload) -> anyhow::Result<String> {
-        let access =
-            cluster_access(&self.hub, &ctx.security, p.organization_id, p.connection_id).await?;
+        let (reader, from) =
+            connection_reader(&ctx.security, p.organization_id, p.connections_from)?;
+        let access = cluster_access(&self.hub, &reader, from, p.connection_id).await?;
         let client = access.client().await?;
         let jobs: kube::Api<Job> = kube::Api::namespaced(client.clone(), &p.namespace);
         let started = std::time::Instant::now();
+        let pods: kube::Api<Pod> = kube::Api::namespaced(client.clone(), &p.namespace);
+        let mut step = p.step.clone();
         loop {
             let Some(job) = jobs
                 .get_opt(&p.job)
@@ -609,37 +838,83 @@ impl WatchTask {
                     ctx,
                     &client,
                     p,
-                    Err(("watch".into(), "the build Job is gone".into())),
+                    Err(("watch".into(), lost("its Job is gone from the cluster"))),
                 )
                 .await?;
                 return Ok("the build Job is gone".into());
             };
             match job_state(&job) {
-                JobState::Running if started.elapsed() < WATCH_FOR => {
-                    ctx.progress(format!("building in {}", p.namespace)).await;
+                JobState::Running => {
+                    let pod = pods
+                        .list(&ListParams::default().labels(&format!("job-name={}", p.job)))
+                        .await
+                        .ok()
+                        .and_then(|l| l.items.into_iter().next());
+                    // A pod that cannot start never fails the Job: it waits
+                    // out the deadline. Say why now instead.
+                    if let Some((at, why)) = pod.as_ref().and_then(stuck) {
+                        let said = format!("failed in {at}: {why}");
+                        self.finish(ctx, &client, p, Err((at, why))).await?;
+                        let _ = jobs.delete(&p.job, &DeleteParams::background()).await;
+                        return Ok(said);
+                    }
+                    let now = pod.as_ref().and_then(current_step);
+                    if now.is_some() && now != step {
+                        let mut running = crate::artifact_ingest::port::BuildOutcome::running(
+                            &p.build_id,
+                            &p.repository,
+                            &p.profile,
+                        );
+                        running.step = now.clone();
+                        if let Err(e) = record(
+                            &self.hub,
+                            &ctx.security,
+                            p.records_in,
+                            p.project_id,
+                            running,
+                        )
+                        .await
+                        {
+                            warn!(build = %p.build_id, "studio-environments: the build's step could not be recorded ({e})");
+                        }
+                        step = now;
+                    }
+                    if started.elapsed() >= WATCH_FOR && p.round + 1 >= LAST_WATCH_ROUND {
+                        let why = lost("its Job still runs past the hour a build may take");
+                        self.finish(ctx, &client, p, Err(("watch".into(), why.clone())))
+                            .await?;
+                        let _ = jobs.delete(&p.job, &DeleteParams::background()).await;
+                        return Ok(why);
+                    }
+                    if started.elapsed() >= WATCH_FOR {
+                        let next = WatchPayload {
+                            round: p.round + 1,
+                            step: step.clone(),
+                            ..p.clone()
+                        };
+                        enqueue(
+                            &self.hub,
+                            p.organization_id,
+                            WATCH_TASK_TYPE,
+                            serde_json::to_value(&next)?,
+                            &format!("build-watch:{}", p.build_id),
+                            &format!("{}:watch:{}", p.build_id, next.round),
+                        )
+                        .await?;
+                        return Ok("still building; watching on".into());
+                    }
+                    ctx.progress(format!(
+                        "building in {}: {}",
+                        p.namespace,
+                        step.as_deref().unwrap_or("starting")
+                    ))
+                    .await;
                     tokio::select! {
                         () = tokio::time::sleep(WATCH_EVERY) => {}
                         () = ctx.cancel.cancelled() => bail!("the watch was cancelled"),
                     }
                 }
-                JobState::Running => {
-                    let next = WatchPayload {
-                        round: p.round + 1,
-                        ..p.clone()
-                    };
-                    enqueue(
-                        &self.hub,
-                        p.organization_id,
-                        WATCH_TASK_TYPE,
-                        serde_json::to_value(&next)?,
-                        &format!("build-watch:{}", p.build_id),
-                        &format!("{}:watch:{}", p.build_id, next.round),
-                    )
-                    .await?;
-                    return Ok("still building; watching on".into());
-                }
                 state => {
-                    let pods: kube::Api<Pod> = kube::Api::namespaced(client.clone(), &p.namespace);
                     let pod = pods
                         .list(&ListParams::default().labels(&format!("job-name={}", p.job)))
                         .await
@@ -671,7 +946,7 @@ impl WatchTask {
         outcome: Result<String, (String, String)>,
     ) -> anyhow::Result<()> {
         use crate::artifact_ingest::port::BuildOutcome;
-        let record_of = match outcome {
+        let mut record_of = match outcome {
             Ok(manifest) => match serde_json::from_str::<Manifest>(manifest.trim()) {
                 Ok(m) => BuildOutcome {
                     build_id: p.build_id.clone(),
@@ -698,11 +973,19 @@ impl WatchTask {
                 &p.build_id,
                 &p.repository,
                 &p.profile,
-                &tail(&why, 480),
+                &tail(&why, FAILURE_CHARS),
                 &step,
             ),
         };
-        record(&self.hub, &ctx.security, p.project_id, record_of).await?;
+        record_of.description_revision = p.description_revision;
+        record(
+            &self.hub,
+            &ctx.security,
+            p.records_in,
+            p.project_id,
+            record_of,
+        )
+        .await?;
         // The repository's token goes with the build.
         let secrets: kube::Api<Secret> = kube::Api::namespaced(client.clone(), &p.namespace);
         if let Err(e) = secrets
@@ -714,6 +997,93 @@ impl WatchTask {
         }
         Ok(())
     }
+}
+
+/* ── a build's log, read from its pod ── */
+
+/// How much of a step's log is read: its end, where a failure says why.
+const LOG_LINES: i64 = 500;
+const LOG_BYTES: i64 = 256 * 1024;
+
+/// One step of a build, as its pod shows it now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StepLog {
+    /// `prepare`, `build` or `publish`.
+    pub step: String,
+    /// `waiting` | `running` | `passed` | `failed`.
+    pub state: String,
+    /// The end of what it wrote; empty while it has not started.
+    pub log: String,
+}
+
+/// Each step of the build's pod, in the order they run, and whether it has
+/// started: what is read of a step's log.
+fn steps_of(pod: &Pod) -> Vec<(String, &'static str)> {
+    let Some(status) = pod.status.as_ref() else {
+        return Vec::new();
+    };
+    status
+        .init_container_statuses
+        .iter()
+        .flatten()
+        .chain(status.container_statuses.iter().flatten())
+        .map(|c| {
+            let state = match c.state.as_ref() {
+                Some(s) if s.running.is_some() => "running",
+                Some(s) => match &s.terminated {
+                    Some(t) if t.exit_code == 0 => "passed",
+                    Some(_) => "failed",
+                    None => "waiting",
+                },
+                None => "waiting",
+            };
+            (c.name.clone(), state)
+        })
+        .collect()
+}
+
+/// The build's steps and the end of each one's log, as its pod in
+/// `namespace` has them; `None` when there is no such pod there (another
+/// environment's, or gone a day after the build ended).
+pub async fn step_logs(
+    client: &kube::Client,
+    namespace: &str,
+    build_id: &str,
+) -> anyhow::Result<Option<Vec<StepLog>>> {
+    let pods: kube::Api<Pod> = kube::Api::namespaced(client.clone(), namespace);
+    let Some(pod) = pods
+        .list(&ListParams::default().labels(&format!("job-name={}", job_name(build_id))))
+        .await
+        .map_err(|e| anyhow!("the cluster did not answer: {e}"))?
+        .items
+        .into_iter()
+        .next()
+    else {
+        return Ok(None);
+    };
+    let name = pod.metadata.name.clone().unwrap_or_default();
+    let mut out = Vec::new();
+    for (step, state) in steps_of(&pod) {
+        let log = if state == "waiting" {
+            String::new()
+        } else {
+            let params = LogParams {
+                container: Some(step.clone()),
+                tail_lines: Some(LOG_LINES),
+                limit_bytes: Some(LOG_BYTES),
+                ..LogParams::default()
+            };
+            pods.logs(&name, &params)
+                .await
+                .unwrap_or_else(|e| format!("(the log could not be read: {e})"))
+        };
+        out.push(StepLog {
+            step,
+            state: state.to_owned(),
+            log,
+        });
+    }
+    Ok(Some(out))
 }
 
 /* ── the Job side: `studio-backend build-prepare` and `build-publish` ── */
@@ -854,9 +1224,92 @@ fn run(cmd: &mut Command, what: &str) -> anyhow::Result<String> {
         String::from_utf8_lossy(&out.stderr)
     );
     if !out.status.success() {
-        bail!("{what} failed: {}", tail(&text, 1500));
+        // The whole output to the container's log; the failure itself carries
+        // what went wrong, which the run records as the build's reason.
+        eprintln!("{text}");
+        bail!("{what} failed: {}", failure_text(&text));
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Give the generated workspace the lock of the sources it builds, when it
+/// has none of its own: the product's own code first (a source in the
+/// repository), else a fetched one. Without it cargo locks every crate to its
+/// latest version, and the first build on a cluster mixed two releases of the
+/// platform's toolkit crates whose traits no longer met; cargo keeps what the
+/// lock names and adds only what it lacks.
+fn seed_lock(roots: &[PathBuf], repo: &Path, out: &Path) -> anyhow::Result<()> {
+    let target = out.join("Cargo.lock");
+    if target.exists() {
+        return Ok(());
+    }
+    let in_repo = |r: &PathBuf| {
+        r.canonicalize()
+            .map(|c| c.starts_with(repo.canonicalize().unwrap_or_else(|_| repo.to_owned())))
+            .unwrap_or(false)
+    };
+    let own = roots.iter().filter(|r| in_repo(r));
+    let fetched = roots.iter().filter(|r| !in_repo(r));
+    if let Some(lock) = own
+        .chain(fetched)
+        .map(|r| r.join("Cargo.lock"))
+        .find(|l| l.is_file())
+    {
+        std::fs::copy(&lock, &target)
+            .with_context(|| format!("{} could not be copied into the tree", lock.display()))?;
+    }
+    Ok(())
+}
+
+/// A tool's output reduced to its `error` diagnostics, each with the lines
+/// indented under it, or all of it when it names none. gearbox prints every
+/// `info` and `warning` before it gives up, and a whole product's of them
+/// pushed the one `error` out of the tail a failure keeps.
+fn errors_first(text: &str) -> String {
+    let mut kept = Vec::new();
+    let mut in_error = false;
+    for line in text.lines() {
+        if line.starts_with(char::is_whitespace) {
+            if in_error {
+                kept.push(line);
+            }
+        } else {
+            in_error = line.starts_with("error");
+            if in_error {
+                kept.push(line);
+            }
+        }
+    }
+    if kept.is_empty() {
+        text.to_owned()
+    } else {
+        kept.join("\n")
+    }
+}
+
+/// What a failed tool said, for the build's record: its errors from the
+/// first, which name what broke (a gear, a file), or the end of all it said
+/// when it names none.
+fn failure_text(text: &str) -> String {
+    let kept = errors_first(text);
+    if kept == text {
+        tail(text, FAILURE_CHARS)
+    } else {
+        head(&kept, FAILURE_CHARS)
+    }
+}
+
+/// A step's failure as its container's termination message, which the watch
+/// records as the build's reason. Without it the kubelet falls back to the
+/// log's last 2 KiB, which the tool's own output fills, and the start of the
+/// error -- the gear it names -- falls out of it.
+pub fn say_failure(e: &anyhow::Error) {
+    let text = format!("{e:#}");
+    let mut end = text.len().min(4000);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let _ = std::fs::write("/dev/termination-log", &text[..end]);
 }
 
 fn gearbox() -> String {
@@ -872,6 +1325,180 @@ pub fn prepare(
     work: &Path,
     repo_url: &str,
     git_ref: Option<&str>,
+    description: &DescriptionFrom<'_>,
+    product_file: &str,
+    profile: &str,
+    own: Option<&str>,
+) -> anyhow::Result<()> {
+    let username = std::env::var("GIT_USERNAME").unwrap_or_default();
+    let password = std::env::var("GIT_PASSWORD").unwrap_or_default();
+    if let Some(own) = own {
+        let own: super::model::OwnBuild =
+            serde_json::from_str(own).context("--own is not a build of the repository's own")?;
+        return prepare_own(work, repo_url, (&username, &password), git_ref, &own);
+    }
+    prepare_as(
+        work,
+        repo_url,
+        (&username, &password),
+        git_ref,
+        description,
+        product_file,
+        profile,
+    )
+}
+
+/// Where `prepare` takes the product's description from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DescriptionFrom<'a> {
+    /// The file as it is in the checkout.
+    Checkout,
+    /// Only the file, from another ref of the repository: a `product/…`
+    /// branch, whose code is not built (ADR-0053 §4).
+    Ref(&'a str),
+    /// A revision Studio keeps, laid at the product's path over whatever the
+    /// checkout holds there (ADR-0053 §2).
+    Text {
+        revision: Option<i64>,
+        text: &'a str,
+    },
+}
+
+/// Lay the description `from` names at `product_file` in the checkout `repo`.
+fn lay_description(
+    repo: &Path,
+    (username, password): (&str, &str),
+    from: &DescriptionFrom<'_>,
+    product_file: &str,
+) -> anyhow::Result<()> {
+    let text = match from {
+        DescriptionFrom::Checkout => return Ok(()),
+        DescriptionFrom::Ref(r) => {
+            let (text, commit) = crate::connectors::sdk::git_checkout::file_at_ref(
+                repo,
+                username,
+                password,
+                r,
+                product_file,
+            )
+            .with_context(|| format!("the description could not be read from {r}"))?
+            .ok_or_else(|| anyhow!("{r} has no {product_file}"))?;
+            println!(
+                "the description is {product_file} of {r} at {commit}; the code is the checkout's"
+            );
+            text
+        }
+        DescriptionFrom::Text { revision, text } => {
+            match revision {
+                Some(r) => println!(
+                    "the description is revision {r} from Studio; the code is the checkout's"
+                ),
+                None => println!("the description is Studio's; the code is the checkout's"),
+            }
+            (*text).to_owned()
+        }
+    };
+    let at = inside(repo, Path::new(product_file))
+        .ok_or_else(|| anyhow!("'{product_file}' leaves the repository"))?;
+    if let Some(dir) = at.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(&at, text).with_context(|| format!("{product_file} could not be written"))
+}
+
+/// `build-prepare` for a project built without a product description
+/// (ADR-0054 §7): the repository cloned, and its own Dockerfiles and chart
+/// listed for `build` and `publish` as a generated tree's would be.
+pub fn prepare_own(
+    work: &Path,
+    repo_url: &str,
+    (username, password): (&str, &str),
+    git_ref: Option<&str>,
+    own: &super::model::OwnBuild,
+) -> anyhow::Result<()> {
+    let own = super::model::checked_own_build(own.clone()).map_err(|e| anyhow!("{e}"))?;
+    let repo = work.join("repo");
+    crate::connectors::sdk::git_checkout::clone_or_update_into(
+        &repo, repo_url, username, password, git_ref,
+    )
+    .context("the repository could not be cloned")?;
+    let commit = crate::connectors::sdk::git_checkout::head_commit(&repo)
+        .ok_or_else(|| anyhow!("the clone has no commit"))?;
+    let mut list = String::new();
+    let mut named = Vec::new();
+    for i in &own.images {
+        let dockerfile = repo.join(&i.dockerfile);
+        if !dockerfile.is_file() {
+            bail!("{} is not in the repository at {commit}", i.dockerfile);
+        }
+        let folder = dockerfile.parent().unwrap_or(&repo).to_path_buf();
+        let filename = dockerfile
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("Dockerfile")
+            .to_owned();
+        let context = if i.context == "." {
+            repo.clone()
+        } else {
+            repo.join(&i.context)
+        };
+        if !context.is_dir() {
+            bail!(
+                "the build context {} is not a folder in the repository",
+                i.context
+            );
+        }
+        list.push_str(&format!(
+            "{} {} {} {} {}\n",
+            i.app,
+            i.name,
+            folder.display(),
+            context.display(),
+            filename
+        ));
+        named.push((i.app.clone(), i.name.clone()));
+    }
+    std::fs::write(work.join("apps"), list)?;
+    let short: String = commit.chars().take(12).collect();
+    std::fs::write(work.join("tag"), format!("sha-{short}"))?;
+    let chart_dir = repo.join(&own.chart);
+    let chart_yaml = std::fs::read_to_string(chart_dir.join("Chart.yaml"))
+        .with_context(|| format!("{} has no Chart.yaml", own.chart))?;
+    let product = chart_yaml
+        .lines()
+        .find_map(|l| l.strip_prefix("name:"))
+        .map(|n| n.trim().trim_matches('"').trim_matches('\'').to_owned())
+        .filter(|n| !n.is_empty())
+        .ok_or_else(|| anyhow!("{}/Chart.yaml names no chart", own.chart))?;
+    let prepared = Prepared {
+        product,
+        profile: "own".to_owned(),
+        commit,
+        lock_hash: None,
+        chart_dir: chart_dir.display().to_string(),
+        chart_base: chart_base_version(&chart_yaml),
+        apps: named,
+    };
+    std::fs::write(
+        work.join("build.json"),
+        serde_json::to_vec_pretty(&prepared)?,
+    )?;
+    println!(
+        "prepared {} image(s) and chart {} of the repository's own",
+        prepared.apps.len(),
+        prepared.product
+    );
+    Ok(())
+}
+
+/// [`prepare`] with the repository's credentials given, not read from the
+/// environment: the server prepares a Research build in its own process.
+pub fn prepare_as(
+    work: &Path,
+    repo_url: &str,
+    (username, password): (&str, &str),
+    git_ref: Option<&str>,
+    description: &DescriptionFrom<'_>,
     product_file: &str,
     profile: &str,
 ) -> anyhow::Result<()> {
@@ -879,14 +1506,13 @@ pub fn prepare(
         bail!("'{product_file}' is not a product description in the repository");
     }
     let repo = work.join("repo");
-    let username = std::env::var("GIT_USERNAME").unwrap_or_default();
-    let password = std::env::var("GIT_PASSWORD").unwrap_or_default();
     crate::connectors::sdk::git_checkout::clone_or_update_into(
-        &repo, repo_url, &username, &password, git_ref,
+        &repo, repo_url, username, password, git_ref,
     )
     .context("the product's repository could not be cloned")?;
     let commit = crate::connectors::sdk::git_checkout::head_commit(&repo)
         .ok_or_else(|| anyhow!("the clone has no commit"))?;
+    lay_description(&repo, (username, password), description, product_file)?;
     let file = repo.join(product_file);
 
     let intent: serde_json::Value = serde_json::from_str(&run(
@@ -987,6 +1613,7 @@ pub fn prepare(
         .arg("--out")
         .arg(&out);
     run(&mut generate, "gearbox generate")?;
+    seed_lock(&roots, &repo, &out)?;
 
     // The tree, made buildable (constructorfabric/gearbox#12).
     let docker = out.join("docker");
@@ -1156,7 +1783,171 @@ mod tests {
             },
             git_ref: None,
             builder_image: "ghcr.io/acme/studio-backend:sha-1".into(),
+            buildkit_image: BUILDKIT_IMAGE.into(),
+            records_in: None,
+            description_revision: None,
+            description_text: None,
+            connections_from: None,
+            own: None,
         }
+    }
+
+    #[test]
+    fn a_watch_queued_before_records_in_still_reads_and_carries_it_on() {
+        // A run queued by the release before: no `records_in`.
+        let old: WatchPayload = serde_json::from_value(serde_json::json!({
+            "build_id": "studio-0123456789ab", "organization_id": Uuid::nil(),
+            "project_id": Uuid::nil(), "connection_id": Uuid::nil(),
+            "namespace": "studio-web-dev", "job": "studio-build-0123456789ab",
+            "repository": "acme/shop", "profile": "prod",
+        }))
+        .unwrap();
+        assert_eq!(old.records_in, None);
+        let mut b = payload();
+        let tenant = Uuid::from_u128(1);
+        b.records_in = Some(tenant);
+        let back: BuildPayload = serde_json::from_value(serde_json::to_value(&b).unwrap()).unwrap();
+        assert_eq!(back.records_in, Some(tenant));
+    }
+
+    fn pod(init: serde_json::Value, main: serde_json::Value) -> Pod {
+        serde_json::from_value(serde_json::json!({
+            "metadata": { "name": "studio-build-1" },
+            "status": { "initContainerStatuses": init, "containerStatuses": main },
+        }))
+        .unwrap()
+    }
+
+    fn done(name: &str) -> serde_json::Value {
+        serde_json::json!({ "name": name, "ready": false, "restartCount": 0, "image": "i", "imageID": "",
+            "state": { "terminated": { "exitCode": 0 } } })
+    }
+
+    fn waiting(name: &str, reason: &str) -> serde_json::Value {
+        serde_json::json!({ "name": name, "ready": false, "restartCount": 0, "image": "i", "imageID": "",
+            "state": { "waiting": { "reason": reason, "message": "no such image" } } })
+    }
+
+    #[test]
+    fn the_step_is_the_first_container_that_has_not_ended() {
+        let p = pod(
+            serde_json::json!([done("prepare"), waiting("build", "PodInitializing")]),
+            serde_json::json!([waiting("publish", "PodInitializing")]),
+        );
+        assert_eq!(current_step(&p).as_deref(), Some("build"));
+        let p = pod(
+            serde_json::json!([done("prepare"), done("build")]),
+            serde_json::json!([waiting("publish", "ContainerCreating")]),
+        );
+        assert_eq!(current_step(&p).as_deref(), Some("publish"));
+        assert_eq!(stuck(&p), None);
+    }
+
+    #[test]
+    fn each_step_says_whether_it_ran_so_only_a_started_ones_log_is_read() {
+        let failed = serde_json::json!({ "name": "prepare", "ready": false, "restartCount": 0,
+            "image": "i", "imageID": "", "state": { "terminated": { "exitCode": 1 } } });
+        let running = serde_json::json!({ "name": "build", "ready": true, "restartCount": 0,
+            "image": "i", "imageID": "", "state": { "running": {} } });
+        let p = pod(
+            serde_json::json!([failed, waiting("build", "PodInitializing")]),
+            serde_json::json!([waiting("publish", "PodInitializing")]),
+        );
+        assert_eq!(
+            steps_of(&p),
+            vec![
+                ("prepare".to_owned(), "failed"),
+                ("build".to_owned(), "waiting"),
+                ("publish".to_owned(), "waiting"),
+            ]
+        );
+        let p = pod(
+            serde_json::json!([done("prepare"), running]),
+            serde_json::json!([waiting("publish", "PodInitializing")]),
+        );
+        assert_eq!(steps_of(&p)[0], ("prepare".to_owned(), "passed"));
+        assert_eq!(steps_of(&p)[1], ("build".to_owned(), "running"));
+    }
+
+    #[test]
+    fn an_image_that_cannot_be_pulled_fails_the_build_at_once() {
+        let p = pod(
+            serde_json::json!([waiting("prepare", "ImagePullBackOff")]),
+            serde_json::json!([waiting("publish", "PodInitializing")]),
+        );
+        assert_eq!(
+            stuck(&p),
+            Some(("prepare".into(), "ImagePullBackOff: no such image".into()))
+        );
+    }
+
+    #[test]
+    fn the_tree_gets_the_lock_of_the_products_own_code_before_a_fetched_ones() {
+        let work = std::env::temp_dir().join(format!("studio-seed-lock-{}", Uuid::new_v4()));
+        let repo = work.join("repo");
+        let own = repo.join("studio-backend");
+        let fetched = work.join("sources").join("gears-rust");
+        let out = repo.join(".gearbox").join("out");
+        for d in [&own, &fetched, &out] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::write(fetched.join("Cargo.lock"), "fetched").unwrap();
+        std::fs::write(own.join("Cargo.lock"), "own").unwrap();
+
+        seed_lock(&[fetched.clone(), own.clone()], &repo, &out).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(out.join("Cargo.lock")).unwrap(),
+            "own"
+        );
+
+        // A lock the engine wrote is the tree's own, and stays.
+        std::fs::write(out.join("Cargo.lock"), "generated").unwrap();
+        seed_lock(&[own], &repo, &out).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(out.join("Cargo.lock")).unwrap(),
+            "generated"
+        );
+
+        std::fs::remove_dir_all(&work).ok();
+    }
+
+    #[test]
+    fn a_failure_keeps_its_errors_however_many_notes_come_before_them() {
+        let notes = "info [GBX0517] two plugins share a vendor\n    help: give them priorities\n"
+            .repeat(40);
+        let text = format!(
+            "{notes}error [GBX0511] gear `tenant-resolver` has no implementation\n    \
+             help: pick one\nwarning [GBX0315] no gRPC services\nerror: resolution reported errors"
+        );
+        let kept = errors_first(&text);
+        assert_eq!(
+            kept,
+            "error [GBX0511] gear `tenant-resolver` has no implementation\n    help: pick one\n\
+             error: resolution reported errors"
+        );
+        assert_eq!(errors_first("fatal: no such ref"), "fatal: no such ref");
+    }
+
+    #[test]
+    fn a_failure_keeps_the_start_of_its_errors_and_the_end_of_a_log() {
+        let error = "error [GBX0322] gear `tenant-resolver` carries `#[toolkit::consumes(...)]`";
+        let notes = "info [GBX0517] note\n".repeat(40);
+        let text = format!("{notes}{error}\n    help: {}", "x".repeat(5000));
+        let kept = failure_text(&text);
+        assert!(kept.starts_with(error), "{kept}");
+        assert_eq!(kept.chars().count(), FAILURE_CHARS + 1);
+
+        let log = format!("{}fatal: no such ref", "y".repeat(5000));
+        let kept = failure_text(&log);
+        assert!(
+            kept.starts_with('…') && kept.ends_with("fatal: no such ref"),
+            "{kept}"
+        );
+    }
+
+    #[test]
+    fn the_last_watch_round_comes_after_the_deadline() {
+        assert!(u64::from(LAST_WATCH_ROUND) * WATCH_FOR.as_secs() > DEADLINE_SECS as u64);
     }
 
     #[test]
@@ -1209,6 +2000,37 @@ mod tests {
     }
 
     #[test]
+    fn a_build_of_the_repositorys_own_tells_prepare_what_to_build() {
+        let mut p = payload();
+        assert!(
+            !job_manifest(&p, true)["spec"]["template"]["spec"]["initContainers"][0]["args"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|a| a == "--own")
+        );
+        p.own = Some(super::super::model::OwnBuild {
+            images: vec![super::super::model::OwnImage {
+                app: "hello".into(),
+                name: "csharp-hello".into(),
+                dockerfile: "Dockerfile".into(),
+                context: ".".into(),
+            }],
+            chart: "chart/csharp-hello".into(),
+        });
+        let job = job_manifest(&p, true);
+        let args = job["spec"]["template"]["spec"]["initContainers"][0]["args"]
+            .as_array()
+            .unwrap()
+            .clone();
+        let at = args.iter().position(|a| a == "--own").unwrap();
+        let own: super::super::model::OwnBuild =
+            serde_json::from_str(args[at + 1].as_str().unwrap()).unwrap();
+        assert_eq!(own, p.own.unwrap());
+        assert!(BUILD_SCRIPT.contains("--opt filename=\"${filename:-Dockerfile}\""));
+    }
+
+    #[test]
     fn the_job_runs_rootless_buildkit_between_studios_own_steps() {
         let job = with_clone_url(
             job_manifest(&payload(), true),
@@ -1246,6 +2068,86 @@ mod tests {
                 .iter()
                 .all(|e| e["name"] != "GIT_PASSWORD")
         );
+    }
+
+    #[test]
+    fn a_product_branch_lends_the_build_only_its_description() {
+        assert_eq!(
+            code_and_description_refs(Some("product/shop-1a2b3c4d"), "main"),
+            ("main".to_owned(), Some("product/shop-1a2b3c4d".to_owned()))
+        );
+        assert_eq!(
+            code_and_description_refs(Some("release/1.2"), "main"),
+            ("release/1.2".to_owned(), None)
+        );
+        assert_eq!(
+            code_and_description_refs(None, "main"),
+            ("main".to_owned(), None)
+        );
+        assert_eq!(
+            code_and_description_refs(Some("product/"), "main"),
+            ("product/".to_owned(), None)
+        );
+        let mut p = payload();
+        p.git_ref = Some("product/shop-1a2b3c4d".into());
+        let args: Vec<String> = serde_json::from_value(
+            job_manifest(&p, false)["spec"]["template"]["spec"]["initContainers"][0]["args"]
+                .clone(),
+        )
+        .unwrap();
+        let after = |flag: &str| {
+            args.iter()
+                .position(|a| a == flag)
+                .map(|i| args[i + 1].clone())
+        };
+        assert_eq!(after("--ref").as_deref(), Some("main"));
+        assert_eq!(
+            after("--description-ref").as_deref(),
+            Some("product/shop-1a2b3c4d")
+        );
+        p.git_ref = None;
+        let plain = job_manifest(&p, false);
+        assert!(
+            !plain["spec"]["template"]["spec"]["initContainers"][0]["args"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|a| a == "--description-ref")
+        );
+    }
+
+    #[test]
+    fn the_job_takes_the_description_from_studio_and_the_code_from_the_base_branch() {
+        let mut p = payload();
+        p.git_ref = Some("product/shop-1a2b3c4d".into());
+        p.description_revision = Some(4);
+        p.description_text = Some("product shop {}".into());
+        let job = job_manifest(&p, false);
+        let prepare = &job["spec"]["template"]["spec"]["initContainers"][0];
+        let args: Vec<String> = serde_json::from_value(prepare["args"].clone()).unwrap();
+        let after = |flag: &str| {
+            args.iter()
+                .position(|a| a == flag)
+                .map(|i| args[i + 1].clone())
+        };
+        assert_eq!(after("--ref").as_deref(), Some("main"));
+        assert_eq!(after("--description-revision").as_deref(), Some("4"));
+        assert_eq!(after("--description-ref"), None);
+        assert!(
+            prepare["env"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|e| e["name"] == DESCRIPTION_ENV && e["value"] == "product shop {}")
+        );
+        // A watch queued before the revision was carried still reads.
+        let w: WatchPayload = serde_json::from_value(serde_json::json!({
+            "build_id": "b", "organization_id": Uuid::nil(), "project_id": Uuid::nil(),
+            "connection_id": Uuid::nil(), "namespace": "n", "job": "j",
+            "repository": "acme/shop", "profile": "prod",
+        }))
+        .unwrap();
+        assert_eq!(w.description_revision, None);
     }
 
     #[test]

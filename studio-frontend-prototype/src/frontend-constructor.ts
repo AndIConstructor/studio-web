@@ -11,9 +11,111 @@
  * Pure, so it is tested without a backend.
  */
 
-import type { CatalogNode } from "./api";
+import type { CatalogNode, CatalogRepoSource } from "./api";
 
 export const FRONTX_NODE_TYPE = "gts.cf.studio.catalog.frontx.v1~";
+
+/** FrontX's own templates: `template-mfe` carries a blank micro-frontend, a
+ *  demo and two widget fixtures, each with an `mfe.json`. The catalogue reads
+ *  them as templates and examples, not as screens a product mounts, so the
+ *  constructor offers them as where a new micro-frontend starts; the
+ *  micro-frontends a product adds come from a repository that has real ones
+ *  (the project's own, see `frontxSuggestion`). */
+export const SUGGESTED_FRONTX_SOURCE = {
+  repo: "constructorfabric/gears-frontx-templates",
+  git_ref: "main",
+  mode: "frontx",
+} as const;
+
+/** The nil tenant: in an organization's source it stands for the
+ *  organization itself, whose GitHub connection the sync reads through. */
+const ORG_TENANT = "00000000-0000-0000-0000-000000000000";
+
+const repoKey = (repo: string) =>
+  repo
+    .trim()
+    .toLowerCase()
+    .replace(/\.git$/, "");
+
+/** The organization's catalogue sources with the suggested FrontX one added
+ *  at the end, or `null` when it already reads that repository as FrontX
+ *  (at any ref): then there is nothing to add, only to sync. */
+export function withSuggestedFrontx(items: readonly CatalogRepoSource[]): CatalogRepoSource[] | null {
+  return withFrontxSource(items, SUGGESTED_FRONTX_SOURCE.repo, SUGGESTED_FRONTX_SOURCE.git_ref);
+}
+
+/** The organization's catalogue sources with `repo` added as a FrontX source
+ *  at the end, or `null` when it already reads that repository as FrontX (at
+ *  any ref): then there is nothing to add, only to sync. */
+export function withFrontxSource(
+  items: readonly CatalogRepoSource[],
+  repo: string,
+  gitRef: string | null = "main",
+): CatalogRepoSource[] | null {
+  const want = repoKey(repo);
+  const has = items.some((s) => (s.mode || "gears") === "frontx" && repoKey(s.repo) === want);
+  if (has) return null;
+  return [...items, { tenant: ORG_TENANT, connection_id: null, repo, git_ref: gitRef, mode: "frontx" }];
+}
+
+/** The repository the constructor offers to read micro-frontends from: the
+ *  project's own first one the catalogue does not read as FrontX yet. Its
+ *  micro-frontends are the screens this product is likely to mount (Studio's
+ *  own are under `studio-frontend/src-app/mfe_packages/`). `null` when every
+ *  repository of the project is read already, or it has none. */
+export function frontxSuggestion(projectRepos: readonly string[], sources: readonly CatalogRepoSource[]): string | null {
+  const read = new Set(sources.filter((s) => (s.mode || "gears") === "frontx").map((s) => repoKey(s.repo)));
+  return projectRepos.find((r) => r.trim() && !read.has(repoKey(r))) ?? null;
+}
+
+/** `owner/repo` of a GitHub pull request link, or `null`. */
+function repoOfPullRequest(url: string | null | undefined): string | null {
+  const m = /github\.com\/([^/\s]+\/[^/\s]+)\/pull\//i.exec(url ?? "");
+  return m ? m[1] : null;
+}
+
+/** The project's repositories, the one a product is written to first: its
+ *  connected gear repository, its sources, the repository the product's last
+ *  pull request went to, and the repositories ingested as its artifacts. Each
+ *  once, in that order. A project need not have every record: one whose
+ *  repository was never ingested still names it as a source. */
+export function projectRepos(of: {
+  gearRepo?: string | null;
+  sources?: readonly { full_path: string }[];
+  writtenPrUrl?: string | null;
+  artifactRepos?: readonly string[];
+}): string[] {
+  const all = [
+    of.gearRepo,
+    ...(of.sources ?? []).map((s) => s.full_path),
+    repoOfPullRequest(of.writtenPrUrl),
+    ...(of.artifactRepos ?? []),
+  ];
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const r of all) {
+    if (!r?.trim() || seen.has(repoKey(r))) continue;
+    seen.add(repoKey(r));
+    out.push(r.trim());
+  }
+  return out;
+}
+
+/** Catalogue kinds of a package that shows how to write a micro-frontend
+ *  rather than being one a product mounts. */
+const TEMPLATE_KINDS = new Set(["template", "example"]);
+
+/** A template or example micro-frontend: where a new one starts, not a screen
+ *  to add. */
+export function isTemplateMfe(m: Pick<Mfe, "kind" | "repo">): boolean {
+  return TEMPLATE_KINDS.has(m.kind ?? "") || repoKey(m.repo ?? "").includes(repoKey(SUGGESTED_FRONTX_SOURCE.repo));
+}
+
+/** The micro-frontends a product can add, and the templates to start a new
+ *  one from. */
+export function splitTemplates(mfes: readonly Mfe[]): { addable: Mfe[]; templates: Mfe[] } {
+  return { addable: mfes.filter((m) => !isTemplateMfe(m)), templates: mfes.filter(isTemplateMfe) };
+}
 
 /** One place a micro-frontend takes in the shell. */
 export interface Placement {
@@ -31,6 +133,9 @@ export interface Placement {
 export interface Mfe {
   /** The npm package name, the catalogue key. */
   name: string;
+  /** The catalogue's kind: `micro-frontend`, or `template`/`example` for one
+   *  that shows how to write a micro-frontend. */
+  kind?: string | null;
   description: string;
   version: string | null;
   repo: string | null;
@@ -88,7 +193,13 @@ export function mfesFrom(nodes: CatalogNode[], profiles: Record<string, Record<s
     const v = n.value as Record<string, unknown>;
     const name = str(v.name) ?? n.instance_id;
     const auto = (profiles[name]?.auto ?? {}) as Record<string, unknown>;
-    const isMfe = v.component_kind === "micro-frontend" || Array.isArray(auto.mfe_extensions);
+    const kind = str(v.component_kind);
+    // A template or example counts when it is a micro-frontend's template:
+    // it declares extensions, or names itself one (`_blank-mfe`).
+    const isMfe =
+      kind === "micro-frontend" ||
+      Array.isArray(auto.mfe_extensions) ||
+      (TEMPLATE_KINDS.has(kind ?? "") && /mfe/i.test(name));
     if (!isMfe) continue;
     const placements = (Array.isArray(auto.mfe_extensions) ? auto.mfe_extensions : [])
       .map(placementOf)
@@ -105,6 +216,7 @@ export function mfesFrom(nodes: CatalogNode[], profiles: Record<string, Record<s
     }
     out.push({
       name,
+      kind,
       description: str(v.description) ?? str(profiles[name]?.description) ?? "",
       version: str(v.max_version) ?? str(v.newest_version),
       repo: str(v.repository) ?? str(v.synced_from),

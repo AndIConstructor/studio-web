@@ -3034,7 +3034,7 @@ impl super::port::BuildRecords for IngestService {
     ) -> anyhow::Result<()> {
         let report = super::builds::BuildReport {
             build_id: o.build_id.clone(),
-            r#where: "studio".into(),
+            r#where: o.r#where.clone().unwrap_or_else(|| "studio".into()),
             action: Some("build".into()),
             status: o.status.clone(),
             product: o.product.clone(),
@@ -3047,10 +3047,12 @@ impl super::port::BuildRecords for IngestService {
             finished_at: None,
             failure: o.failure.clone(),
             failure_step: o.failure_step.clone(),
+            step: o.step.clone(),
             outputs: o.images.iter().map(|(_, i)| i.clone()).collect(),
             images: o.images.clone(),
             chart_ref: o.chart_ref.clone(),
             chart_version: o.chart_version.clone(),
+            description_revision: o.description_revision,
         };
         self.record_build(ctx, project_id, None, &report)
             .await

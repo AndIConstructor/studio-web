@@ -75,6 +75,13 @@ export const SHOW_CONFLICTS = {
   shortTitle: "Conflicts",
 };
 
+/** Open the catalogue load's diagnostics in the bottom area; opens, never toggles. */
+export const SHOW_CATALOGUE_DIAGNOSTICS = {
+  id: "gearbox.catalogue.diagnostics.show",
+  label: "Gearbox: Show Catalogue Diagnostics",
+  shortTitle: "Diagnostics",
+};
+
 /**
  * Show Generate, for a caller that means *show* it.
  *
@@ -90,6 +97,17 @@ export const SHOW_GENERATE = {
 };
 
 /**
+ * Constructor Studio: Generate the open product and press the Build its
+ * profile shows -- `cargo build` for a local one, Build images for a
+ * kubernetes one. The portal's Builds tab runs it through a `cfstudio://`
+ * link with `build=1` ("On my machine").
+ */
+export const GENERATE_AND_BUILD = {
+  id: "gearbox.product.generateAndBuild",
+  label: "Gearbox: Generate and Build",
+};
+
+/**
  * Constructor Studio: show the Resolution Lock, for a caller that means *show*
  * it -- the ribbon and the Gearbox menu. Same reason as `SHOW_CONFLICTS`:
  * `gearbox.lock.toggle` closes an open lock, which is right in `View > Views`
@@ -99,4 +117,25 @@ export const SHOW_LOCK = {
   id: "gearbox.lock.show",
   label: "Gearbox: Show Resolution Lock",
   shortTitle: "Lock",
+};
+
+/**
+ * Constructor Studio: the Product view's own acts, as commands, so that its
+ * "⋯" menu is a registered Theia menu (`GearboxMenus.PRODUCT_ACTIONS`) rather
+ * than buttons in a hand-built popup. Each opens the Product view and asks it.
+ */
+export const SHOW_PRODUCT_SETTINGS = {
+  id: "gearbox.product.settings",
+  label: "Gearbox: Product Settings",
+};
+
+export const ADD_PROFILE = {
+  id: "gearbox.product.addProfile",
+  label: "Gearbox: Add Profile…",
+};
+
+/** The open product's description, in the editor. */
+export const OPEN_PRODUCT_DESCRIPTION = {
+  id: "gearbox.product.openDescription",
+  label: "Gearbox: Open Product GDL",
 };

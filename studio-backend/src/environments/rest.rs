@@ -18,9 +18,10 @@ use uuid::Uuid;
 
 use super::deploy::Rollout;
 use super::model::{
-    Binding, DatabaseMode, DeployImage, Deployment, DeploymentAction, Environment, EnvironmentInput,
+    Binding, DatabaseMode, DeployImage, Deployment, DeploymentAction, Environment,
+    EnvironmentInput, EnvironmentKind, ResearchTarget,
 };
-use super::service::{DeployRequest, EnvironmentService, Refusal};
+use super::service::{DeployRequest, EnvironmentService, PreviewAsk, Refusal};
 use crate::org_scope::OrgCtx;
 
 /// Errors attributable to an environment or a deployment as a resource.
@@ -68,9 +69,16 @@ pub struct EnvironmentDto {
     pub id: Uuid,
     pub name: String,
     pub description: String,
-    /// The `kubernetes` connection the cluster is reached through.
+    /// `kubernetes` | `research` (ADR-0049).
+    pub kind: String,
+    /// The `kubernetes` connection the cluster is reached through, or the
+    /// `research` connection Constructor Research is signed in with.
     #[schema(value_type = String)]
     pub connection_id: Uuid,
+    /// The Research project a `research` environment runs products in.
+    pub research_project: Option<String>,
+    /// The Research hardware configuration its services run on.
+    pub research_hardware: Option<String>,
     /// Image registry prefix (`ghcr.io/acme`); empty for images as generated.
     pub registry: String,
     /// The `registry` connection the cluster pulls with and a published
@@ -91,8 +99,54 @@ pub struct EnvironmentDto {
     /// The projects that may deploy here; absent for all of them.
     #[schema(value_type = Option<Vec<String>>)]
     pub projects: Option<Vec<Uuid>>,
+    /// The project that keeps it (ADR-0054); absent for one of the
+    /// organization's.
+    #[schema(value_type = Option<String>)]
+    pub project_id: Option<Uuid>,
+    /// Whether projects may preview a build here, and how (ADR-0055);
+    /// absent: no previews.
+    pub previews: Option<PreviewSettingsDto>,
     pub updated_by: String,
     pub updated_at: String,
+}
+
+/// What an environment says of previews (ADR-0055).
+#[derive(Debug)]
+#[toolkit_macros::api_dto(request, response)]
+pub struct PreviewSettingsDto {
+    /// A domain with a wildcard DNS record to the cluster's ingress
+    /// controller: a preview answers at `<namespace>.<domain>`. Empty: no
+    /// address.
+    #[serde(default)]
+    pub domain: String,
+    /// The Ingress class to ask for; absent for the cluster's default.
+    #[serde(default)]
+    pub ingress_class: Option<String>,
+    /// How long a preview lives, and the most a person may ask for; default
+    /// 72, at most 336.
+    #[serde(default)]
+    pub ttl_hours: Option<u32>,
+    /// How many previews a project keeps here at once; default 3, at most 20.
+    #[serde(default)]
+    pub max_live: Option<u32>,
+}
+
+fn preview_settings_dto(p: super::model::PreviewSettings) -> PreviewSettingsDto {
+    PreviewSettingsDto {
+        domain: p.domain,
+        ingress_class: p.ingress_class,
+        ttl_hours: Some(p.ttl_hours),
+        max_live: Some(p.max_live),
+    }
+}
+
+fn preview_settings(p: PreviewSettingsDto) -> super::model::PreviewSettings {
+    super::model::PreviewSettings {
+        domain: p.domain,
+        ingress_class: p.ingress_class,
+        ttl_hours: p.ttl_hours.unwrap_or(super::model::PREVIEW_TTL_HOURS),
+        max_live: p.max_live.unwrap_or(super::model::PREVIEW_MAX_LIVE),
+    }
 }
 
 fn database_str(d: DatabaseMode) -> &'static str {
@@ -103,12 +157,22 @@ fn database_str(d: DatabaseMode) -> &'static str {
     }
 }
 
+fn kind_str(k: EnvironmentKind) -> &'static str {
+    match k {
+        EnvironmentKind::Kubernetes => "kubernetes",
+        EnvironmentKind::Research => "research",
+    }
+}
+
 fn env_dto(e: Environment) -> EnvironmentDto {
     EnvironmentDto {
         id: e.id,
         name: e.name,
         description: e.description,
+        kind: kind_str(e.kind).to_owned(),
         connection_id: e.connection_id,
+        research_project: e.research.as_ref().map(|r| r.project.clone()),
+        research_hardware: e.research.and_then(|r| r.hardware),
         registry: e.registry,
         registry_connection_id: e.registry_connection_id,
         namespace_pattern: e.namespace_pattern,
@@ -117,6 +181,8 @@ fn env_dto(e: Environment) -> EnvironmentDto {
         protected: e.protected,
         promote_from: e.promote_from,
         projects: e.projects,
+        project_id: e.project_id,
+        previews: e.previews.map(preview_settings_dto),
         updated_by: e.updated_by,
         updated_at: e.updated_at,
     }
@@ -129,6 +195,111 @@ pub struct EnvironmentListDto {
     pub total: u32,
     /// Whether the caller may change them and decide about deploys.
     pub may_manage: bool,
+    /// The clusters the organization's projects may put environments of
+    /// their own on (ADR-0054 §2).
+    pub open_clusters: OpenClustersDto,
+}
+
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+pub struct ProjectEnvironmentListDto {
+    /// The project's own environments.
+    pub items: Vec<EnvironmentDto>,
+    pub total: u32,
+    /// The organization's clusters it may put one on; besides them, any
+    /// cluster the project holds itself.
+    pub open_clusters: OpenClustersDto,
+}
+
+/// How a project builds (ADR-0054 §7).
+#[derive(Debug)]
+#[toolkit_macros::api_dto(request, response)]
+pub struct ProjectBuildDto {
+    /// `gears`: from its product description; `own`: the repository's own
+    /// Dockerfiles and Helm chart.
+    pub kind: String,
+    /// For `own`: one image per Dockerfile.
+    #[serde(default)]
+    pub images: Vec<OwnImageDto>,
+    /// For `own`: the chart's folder in the repository.
+    #[serde(default)]
+    pub chart: Option<String>,
+}
+
+#[derive(Debug)]
+#[toolkit_macros::api_dto(request, response)]
+pub struct OwnImageDto {
+    /// The chart's values key: a deploy sets `<app>.image.repository` and `.tag`.
+    pub app: String,
+    /// The image's name under the environment's registry.
+    pub name: String,
+    /// From the repository's root.
+    pub dockerfile: String,
+    /// From the repository's root; `.` by default.
+    #[serde(default)]
+    pub context: Option<String>,
+}
+
+fn build_dto(b: Option<super::model::OwnBuild>) -> ProjectBuildDto {
+    match b {
+        None => ProjectBuildDto {
+            kind: "gears".into(),
+            images: Vec::new(),
+            chart: None,
+        },
+        Some(b) => ProjectBuildDto {
+            kind: "own".into(),
+            images: b
+                .images
+                .into_iter()
+                .map(|i| OwnImageDto {
+                    app: i.app,
+                    name: i.name,
+                    dockerfile: i.dockerfile,
+                    context: Some(i.context),
+                })
+                .collect(),
+            chart: Some(b.chart),
+        },
+    }
+}
+
+fn own_build(r: ProjectBuildDto) -> Result<Option<super::model::OwnBuild>, CanonicalError> {
+    match r.kind.trim() {
+        "gears" => Ok(None),
+        "own" => Ok(Some(super::model::OwnBuild {
+            images: r
+                .images
+                .into_iter()
+                .map(|i| super::model::OwnImage {
+                    app: i.app,
+                    name: i.name,
+                    dockerfile: i.dockerfile,
+                    context: i.context.unwrap_or_else(|| ".".into()),
+                })
+                .collect(),
+            chart: r.chart.unwrap_or_default(),
+        })),
+        other => Err(StudioEnvironmentsError::invalid_argument()
+            .with_constraint(format!("kind is gears or own, not '{other}'"))
+            .create()),
+    }
+}
+
+#[derive(Debug)]
+#[toolkit_macros::api_dto(request)]
+pub struct OpenClustersRequest {
+    /// `kubernetes` connections the organization holds and shares.
+    #[schema(value_type = Vec<String>)]
+    pub connection_ids: Vec<Uuid>,
+}
+
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+pub struct OpenClustersDto {
+    /// `kubernetes` connection ids.
+    #[schema(value_type = Vec<String>)]
+    pub connection_ids: Vec<Uuid>,
 }
 
 #[derive(Debug)]
@@ -137,8 +308,17 @@ pub struct EnvironmentRequest {
     pub name: String,
     #[serde(default)]
     pub description: String,
+    /// `kubernetes` (default) | `research`.
+    #[serde(default)]
+    pub kind: Option<String>,
     #[schema(value_type = String)]
     pub connection_id: Uuid,
+    /// For `research`: the Research project products run in.
+    #[serde(default)]
+    pub research_project: Option<String>,
+    /// For `research`: the hardware configuration; default Research's.
+    #[serde(default)]
+    pub research_hardware: Option<String>,
     #[serde(default)]
     pub registry: String,
     /// A `registry` connection the organization holds, on the prefix's host.
@@ -166,6 +346,10 @@ pub struct EnvironmentRequest {
     #[schema(value_type = Option<Vec<String>>)]
     #[serde(default)]
     pub projects: Option<Vec<Uuid>>,
+    /// Let projects preview builds here (ADR-0055); absent: no previews. Not
+    /// on a protected or a Research environment.
+    #[serde(default)]
+    pub previews: Option<PreviewSettingsDto>,
 }
 
 fn env_input(r: EnvironmentRequest) -> Result<EnvironmentInput, CanonicalError> {
@@ -181,10 +365,25 @@ fn env_input(r: EnvironmentRequest) -> Result<EnvironmentInput, CanonicalError> 
                 .create());
         }
     };
+    let kind = match r.kind.as_deref().map(str::trim) {
+        None | Some("" | "kubernetes") => EnvironmentKind::Kubernetes,
+        Some("research") => EnvironmentKind::Research,
+        Some(other) => {
+            return Err(StudioEnvironmentsError::invalid_argument()
+                .with_constraint(format!("kind is kubernetes or research, not '{other}'"))
+                .create());
+        }
+    };
+    let research = r.research_project.map(|project| ResearchTarget {
+        project,
+        hardware: r.research_hardware,
+    });
     Ok(EnvironmentInput {
         name: r.name,
         description: r.description,
+        kind,
         connection_id: r.connection_id,
+        research,
         registry: r.registry,
         registry_connection_id: r.registry_connection_id,
         namespace_pattern: r.namespace_pattern,
@@ -193,6 +392,7 @@ fn env_input(r: EnvironmentRequest) -> Result<EnvironmentInput, CanonicalError> 
         protected: r.protected,
         promote_from: r.promote_from,
         projects: r.projects,
+        previews: r.previews.map(preview_settings),
     })
 }
 
@@ -256,6 +456,28 @@ pub struct StudioBuildDto {
     pub run_id: Uuid,
     /// Where it runs.
     pub namespace: String,
+}
+
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+pub struct BuildStepLogDto {
+    /// `prepare`, `build` or `publish`.
+    pub step: String,
+    /// `waiting`, `running`, `passed` or `failed`.
+    pub state: String,
+    /// The end of what the step wrote; empty while it has not started.
+    pub log: String,
+}
+
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+pub struct BuildLogDto {
+    pub build_id: String,
+    /// The environment the build runs in.
+    pub environment: String,
+    pub namespace: String,
+    /// In the order they run.
+    pub steps: Vec<BuildStepLogDto>,
 }
 
 #[derive(Debug)]
@@ -405,6 +627,22 @@ pub struct DeploymentDto {
     pub decided_at: Option<String>,
     pub reason: Option<String>,
     pub outcome: Option<String>,
+    /// A preview (ADR-0055); absent for a deploy of what runs there.
+    pub preview: Option<PreviewDto>,
+}
+
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+pub struct PreviewDto {
+    pub name: String,
+    /// RFC 3339: when the sweep removes it.
+    pub expires_at: String,
+    /// The host it answers on; absent for none.
+    pub host: Option<String>,
+    /// When it was removed; absent while it is there.
+    pub removed_at: Option<String>,
+    /// Why the last attempt to remove it failed; the next sweep tries again.
+    pub removal_error: Option<String>,
 }
 
 fn deployment_dto(d: Deployment) -> DeploymentDto {
@@ -443,6 +681,13 @@ fn deployment_dto(d: Deployment) -> DeploymentDto {
         decided_at: d.decided_at,
         reason: d.reason,
         outcome: d.outcome,
+        preview: d.preview.map(|p| PreviewDto {
+            name: p.name,
+            expires_at: p.expires_at,
+            host: p.host,
+            removed_at: p.removed_at,
+            removal_error: p.removal_error,
+        }),
     }
 }
 
@@ -500,6 +745,30 @@ pub struct CreateDeploymentRequest {
     #[schema(value_type = Option<String>)]
     #[serde(default)]
     pub redeploy_of: Option<Uuid>,
+    /// Install it as a preview (ADR-0055): into a namespace of its own, with
+    /// an address of its own, removed when it expires.
+    #[serde(default)]
+    pub preview: Option<PreviewRequest>,
+}
+
+#[derive(Debug)]
+#[toolkit_macros::api_dto(request)]
+pub struct PreviewRequest {
+    /// Lowercase letters, digits and `-`, at most 20 (`pr-42`); default made
+    /// of the deployment's id.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// How long it lives; default, and at most, the environment's.
+    #[serde(default)]
+    pub ttl_hours: Option<u32>,
+}
+
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+pub struct PreviewRemovalDto {
+    /// The run that removes it.
+    #[schema(value_type = String)]
+    pub run_id: Uuid,
 }
 
 #[derive(Debug)]
@@ -577,7 +846,132 @@ async fn list_environments(
         total: total(list.items.len()),
         items: list.items.into_iter().map(env_dto).collect(),
         may_manage,
+        open_clusters: OpenClustersDto {
+            connection_ids: list.open_clusters,
+        },
     }))
+}
+
+async fn update_open_clusters(
+    OrgCtx(ctx): OrgCtx,
+    Extension(envs): Extension<Environments>,
+    Json(body): Json<OpenClustersRequest>,
+) -> ApiResult<JsonBody<OpenClustersDto>> {
+    let connection_ids = envs
+        .0
+        .put_open_clusters(&ctx, ctx.subject_tenant_id(), body.connection_ids)
+        .await
+        .map_err(problem)?;
+    Ok(Json(OpenClustersDto { connection_ids }))
+}
+
+async fn get_project_build(
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(envs): Extension<Environments>,
+    Query(q): Query<ProjectQuery>,
+) -> ApiResult<JsonBody<ProjectBuildDto>> {
+    let b = envs
+        .0
+        .project_build(&ctx, q.project_id)
+        .await
+        .map_err(problem)?;
+    Ok(Json(build_dto(b)))
+}
+
+async fn update_project_build(
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(envs): Extension<Environments>,
+    Query(q): Query<ProjectQuery>,
+    Json(body): Json<ProjectBuildDto>,
+) -> ApiResult<JsonBody<ProjectBuildDto>> {
+    let b = envs
+        .0
+        .put_project_build(&ctx, q.project_id, own_build(body)?)
+        .await
+        .map_err(problem)?;
+    Ok(Json(build_dto(b)))
+}
+
+async fn list_project_environments(
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(envs): Extension<Environments>,
+    Query(q): Query<ProjectQuery>,
+) -> ApiResult<JsonBody<ProjectEnvironmentListDto>> {
+    let (items, open_clusters) = envs
+        .0
+        .project_environments(&ctx, q.project_id)
+        .await
+        .map_err(problem)?;
+    Ok(Json(ProjectEnvironmentListDto {
+        total: total(items.len()),
+        items: items.into_iter().map(env_dto).collect(),
+        open_clusters: OpenClustersDto {
+            connection_ids: open_clusters,
+        },
+    }))
+}
+
+async fn create_project_environment(
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(envs): Extension<Environments>,
+    Query(q): Query<ProjectQuery>,
+    Json(body): Json<EnvironmentRequest>,
+) -> ApiResult<(StatusCode, JsonBody<EnvironmentDto>)> {
+    let input = env_input(body)?;
+    let env = envs
+        .0
+        .put_project_environment(&ctx, q.project_id, None, input)
+        .await
+        .map_err(problem)?;
+    Ok((StatusCode::CREATED, Json(env_dto(env))))
+}
+
+async fn update_project_environment(
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(envs): Extension<Environments>,
+    Query(q): Query<ProjectQuery>,
+    Path(environment_id): Path<Uuid>,
+    Json(body): Json<EnvironmentRequest>,
+) -> ApiResult<JsonBody<EnvironmentDto>> {
+    let input = env_input(body)?;
+    let env = envs
+        .0
+        .put_project_environment(&ctx, q.project_id, Some(environment_id), input)
+        .await
+        .map_err(problem)?;
+    Ok(Json(env_dto(env)))
+}
+
+async fn delete_project_environment(
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(envs): Extension<Environments>,
+    Query(q): Query<ProjectQuery>,
+    Path(environment_id): Path<Uuid>,
+) -> ApiResult<StatusCode> {
+    envs.0
+        .delete_project_environment(&ctx, q.project_id, environment_id)
+        .await
+        .map_err(problem)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn test_project_environment(
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(envs): Extension<Environments>,
+    Query(q): Query<ProjectQuery>,
+    Path(environment_id): Path<Uuid>,
+) -> ApiResult<JsonBody<EnvironmentTestDto>> {
+    let org = envs
+        .0
+        .organization_of_project(&ctx, q.project_id)
+        .await
+        .map_err(problem)?;
+    let message = envs
+        .0
+        .test_environment(&ctx, org, environment_id, Some(q.project_id))
+        .await
+        .map_err(problem)?;
+    Ok(Json(EnvironmentTestDto { message }))
 }
 
 async fn create_environment(
@@ -628,10 +1022,95 @@ async fn test_environment(
 ) -> ApiResult<JsonBody<EnvironmentTestDto>> {
     let message = envs
         .0
-        .test_environment(&ctx, ctx.subject_tenant_id(), environment_id)
+        .test_environment(&ctx, ctx.subject_tenant_id(), environment_id, None)
         .await
         .map_err(problem)?;
     Ok(Json(EnvironmentTestDto { message }))
+}
+
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+pub struct ResearchProjectDto {
+    pub id: String,
+    pub name: String,
+}
+
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+pub struct ResearchProjectListDto {
+    pub items: Vec<ResearchProjectDto>,
+    /// Research answers every project at once, so this is `items`' length.
+    pub total: u32,
+}
+
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+pub struct ResearchHardwareDto {
+    pub id: String,
+    pub name: String,
+    /// A trial configuration: Research ends what runs on it by its own rules.
+    pub trial: bool,
+}
+
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+pub struct ResearchHardwareListDto {
+    pub items: Vec<ResearchHardwareDto>,
+    /// Research answers every configuration at once, so this is `items`' length.
+    pub total: u32,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ResearchQuery {
+    connection_id: Uuid,
+}
+
+async fn list_research_projects(
+    OrgCtx(ctx): OrgCtx,
+    Extension(envs): Extension<Environments>,
+    Query(q): Query<ResearchQuery>,
+) -> ApiResult<JsonBody<ResearchProjectListDto>> {
+    let items = envs
+        .0
+        .research_projects(&ctx, ctx.subject_tenant_id(), q.connection_id)
+        .await
+        .map_err(problem)?;
+    let items: Vec<ResearchProjectDto> = items
+        .into_iter()
+        .map(|p| ResearchProjectDto {
+            id: p.id,
+            name: p.name,
+        })
+        .collect();
+    Ok(Json(ResearchProjectListDto {
+        total: u32::try_from(items.len()).unwrap_or(u32::MAX),
+        items,
+    }))
+}
+
+async fn list_research_hardware(
+    OrgCtx(ctx): OrgCtx,
+    Extension(envs): Extension<Environments>,
+    Path(project): Path<String>,
+    Query(q): Query<ResearchQuery>,
+) -> ApiResult<JsonBody<ResearchHardwareListDto>> {
+    let items = envs
+        .0
+        .research_hardware(&ctx, ctx.subject_tenant_id(), q.connection_id, &project)
+        .await
+        .map_err(problem)?;
+    let items: Vec<ResearchHardwareDto> = items
+        .into_iter()
+        .map(|h| ResearchHardwareDto {
+            id: h.id,
+            name: h.name,
+            trial: h.trial,
+        })
+        .collect();
+    Ok(Json(ResearchHardwareListDto {
+        total: u32::try_from(items.len()).unwrap_or(u32::MAX),
+        items,
+    }))
 }
 
 fn binding_dto(b: Binding) -> BindingDto {
@@ -684,7 +1163,7 @@ async fn start_build(
             q.project_id,
             body.environment_id,
             body.profile.as_deref().unwrap_or("prod"),
-            body.product_file.as_deref().unwrap_or("product.gdl"),
+            body.product_file.as_deref(),
             body.git_ref,
         )
         .await
@@ -697,6 +1176,33 @@ async fn start_build(
             namespace: started.namespace,
         }),
     ))
+}
+
+async fn get_build_log(
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(envs): Extension<Environments>,
+    Path(build_id): Path<String>,
+    Query(q): Query<ProjectQuery>,
+) -> ApiResult<JsonBody<BuildLogDto>> {
+    let log = envs
+        .0
+        .build_log(&ctx, q.project_id, &build_id)
+        .await
+        .map_err(problem)?;
+    Ok(Json(BuildLogDto {
+        build_id,
+        environment: log.environment,
+        namespace: log.namespace,
+        steps: log
+            .steps
+            .into_iter()
+            .map(|s| BuildStepLogDto {
+                step: s.step,
+                state: s.state,
+                log: s.log,
+            })
+            .collect(),
+    }))
 }
 
 async fn scaffold_build_workflow(
@@ -841,6 +1347,10 @@ async fn create_deployment(
             }
         },
         redeploy_of: body.redeploy_of,
+        preview: body.preview.map(|p| PreviewAsk {
+            name: p.name,
+            ttl_hours: p.ttl_hours,
+        }),
     };
     let d = envs
         .0
@@ -849,6 +1359,20 @@ async fn create_deployment(
         .map_err(problem)?;
     // 202: queued, or waiting for an approval; the record says which.
     Ok((StatusCode::ACCEPTED, Json(deployment_dto(d))))
+}
+
+async fn remove_preview(
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(envs): Extension<Environments>,
+    Path(deployment_id): Path<Uuid>,
+    Query(q): Query<ProjectQuery>,
+) -> ApiResult<(StatusCode, JsonBody<PreviewRemovalDto>)> {
+    let run_id = envs
+        .0
+        .remove_preview(&ctx, q.project_id, deployment_id)
+        .await
+        .map_err(problem)?;
+    Ok((StatusCode::ACCEPTED, Json(PreviewRemovalDto { run_id })))
 }
 
 async fn list_deployments(
@@ -1036,6 +1560,207 @@ pub fn register_routes(
         .error_500(openapi)
         .register(router, openapi);
 
+    router = OperationBuilder::get("/studio-environments/v1/research/projects")
+        .operation_id("studio_environments.list_research_projects")
+        .summary("The Research projects a connection may run products in")
+        .description(
+            "For `?connection_id=` (an organization's `research` connection): the Constructor              Research projects its user owns or collaborates on, as Research's integration              service lists them (ADR-0049). What a Research environment is created from.",
+        )
+        .tag(TAG)
+        .authenticated()
+        .require_license_features::<License>([])
+        .query_param_typed("connection_id", true, "The research connection", "string")
+        .query_param_typed("organization_id", false, "The organization", "string")
+        .handler(list_research_projects)
+        .json_response_with_schema::<ResearchProjectListDto>(openapi, StatusCode::OK, "Its projects")
+        .error_400(openapi)
+        .error_401(openapi)
+        .error_403(openapi)
+        .error_500(openapi)
+        .register(router, openapi);
+
+    router = OperationBuilder::get("/studio-environments/v1/research/projects/{project}/hardware")
+        .operation_id("studio_environments.list_research_hardware")
+        .summary("The hardware a Research project's services may run on")
+        .description(
+            "For `?connection_id=`: the hardware configurations of the Research project its              user may use, trial ones marked (ADR-0049).",
+        )
+        .tag(TAG)
+        .authenticated()
+        .require_license_features::<License>([])
+        .path_param("project", "Research project id")
+        .query_param_typed("connection_id", true, "The research connection", "string")
+        .query_param_typed("organization_id", false, "The organization", "string")
+        .handler(list_research_hardware)
+        .json_response_with_schema::<ResearchHardwareListDto>(openapi, StatusCode::OK, "Its hardware")
+        .error_400(openapi)
+        .error_401(openapi)
+        .error_403(openapi)
+        .error_404(openapi)
+        .error_500(openapi)
+        .register(router, openapi);
+
+    router = OperationBuilder::put("/studio-environments/v1/open-clusters")
+        .operation_id("studio_environments.update_open_clusters")
+        .summary("Say which clusters projects may put environments of their own on")
+        .description(
+            "Organization administrators only (ADR-0054 §2). The whole list of `kubernetes` \
+             connections the organization holds and shares that its projects may put \
+             environments of their own on. A project may always use a cluster it holds itself.",
+        )
+        .tag(TAG)
+        .authenticated()
+        .require_license_features::<License>([])
+        .query_param_typed("organization_id", false, "The organization", "string")
+        .json_request::<OpenClustersRequest>(openapi, "The clusters")
+        .handler(update_open_clusters)
+        .json_response_with_schema::<OpenClustersDto>(openapi, StatusCode::OK, "Saved")
+        .error_400(openapi)
+        .error_401(openapi)
+        .error_403(openapi)
+        .error_500(openapi)
+        .register(router, openapi);
+
+    router = OperationBuilder::get("/studio-environments/v1/project-build")
+        .operation_id("studio_environments.get_project_build")
+        .summary("How a project builds")
+        .description(
+            "For `?project_id=` (ADR-0054 §7): `gears`, from its product description, or              `own`, from the repository's own Dockerfiles and Helm chart.",
+        )
+        .tag(TAG)
+        .authenticated()
+        .require_license_features::<License>([])
+        .query_param_typed("project_id", true, "The project", "string")
+        .handler(get_project_build)
+        .json_response_with_schema::<ProjectBuildDto>(openapi, StatusCode::OK, "How it builds")
+        .error_401(openapi)
+        .error_404(openapi)
+        .error_500(openapi)
+        .register(router, openapi);
+
+    router = OperationBuilder::put("/studio-environments/v1/project-build")
+        .operation_id("studio_environments.update_project_build")
+        .summary("Set how a project builds")
+        .description(
+            "For `?project_id=`, by a member who may write the project's settings. A build in              Studio then generates the product on gears, or builds the Dockerfiles named and              publishes the chart folder named, each path from the repository's root.",
+        )
+        .tag(TAG)
+        .authenticated()
+        .require_license_features::<License>([])
+        .query_param_typed("project_id", true, "The project", "string")
+        .json_request::<ProjectBuildDto>(openapi, "How it builds")
+        .handler(update_project_build)
+        .json_response_with_schema::<ProjectBuildDto>(openapi, StatusCode::OK, "Saved")
+        .error_400(openapi)
+        .error_401(openapi)
+        .error_404(openapi)
+        .error_500(openapi)
+        .register(router, openapi);
+
+    router = OperationBuilder::get("/studio-environments/v1/project-environments")
+        .operation_id("studio_environments.list_project_environments")
+        .summary("List a project's own environments")
+        .description(
+            "For `?project_id=` (ADR-0054): the environments the project keeps itself, and the \
+             organization's clusters it may put one on.",
+        )
+        .tag(TAG)
+        .authenticated()
+        .require_license_features::<License>([])
+        .query_param_typed("project_id", true, "The project", "string")
+        .handler(list_project_environments)
+        .json_response_with_schema::<ProjectEnvironmentListDto>(
+            openapi,
+            StatusCode::OK,
+            "The project's environments",
+        )
+        .error_401(openapi)
+        .error_404(openapi)
+        .error_500(openapi)
+        .register(router, openapi);
+
+    router = OperationBuilder::post("/studio-environments/v1/project-environments")
+        .operation_id("studio_environments.create_project_environment")
+        .summary("Add an environment of the project's own")
+        .description(
+            "For `?project_id=`, by a member who may write the project's settings (ADR-0054 \
+             §4). Its cluster is one the project holds, or one the organization opened to its \
+             projects; or it runs in the member's Constructor Research. It lists no projects \
+             and needs no approval.",
+        )
+        .tag(TAG)
+        .authenticated()
+        .require_license_features::<License>([])
+        .query_param_typed("project_id", true, "The project", "string")
+        .json_request::<EnvironmentRequest>(openapi, "The environment")
+        .handler(create_project_environment)
+        .json_response_with_schema::<EnvironmentDto>(openapi, StatusCode::CREATED, "Added")
+        .error_400(openapi)
+        .error_401(openapi)
+        .error_403(openapi)
+        .error_404(openapi)
+        .error_500(openapi)
+        .register(router, openapi);
+
+    router = OperationBuilder::put("/studio-environments/v1/project-environments/{environment_id}")
+        .operation_id("studio_environments.update_project_environment")
+        .summary("Change an environment of the project's own")
+        .description("For `?project_id=`. The whole environment is sent.")
+        .tag(TAG)
+        .authenticated()
+        .require_license_features::<License>([])
+        .path_param("environment_id", "Environment id")
+        .query_param_typed("project_id", true, "The project", "string")
+        .json_request::<EnvironmentRequest>(openapi, "The environment")
+        .handler(update_project_environment)
+        .json_response_with_schema::<EnvironmentDto>(openapi, StatusCode::OK, "Changed")
+        .error_400(openapi)
+        .error_401(openapi)
+        .error_403(openapi)
+        .error_404(openapi)
+        .error_500(openapi)
+        .register(router, openapi);
+
+    router =
+        OperationBuilder::delete("/studio-environments/v1/project-environments/{environment_id}")
+            .operation_id("studio_environments.delete_project_environment")
+            .summary("Remove an environment of the project's own")
+            .description(
+                "For `?project_id=`. Its bindings go with it; what runs there stays, and its \
+                 records stay in the organization's history.",
+            )
+            .tag(TAG)
+            .authenticated()
+            .require_license_features::<License>([])
+            .path_param("environment_id", "Environment id")
+            .query_param_typed("project_id", true, "The project", "string")
+            .handler(delete_project_environment)
+            .no_content_response(StatusCode::NO_CONTENT, "Removed")
+            .error_401(openapi)
+            .error_404(openapi)
+            .error_500(openapi)
+            .register(router, openapi);
+
+    router = OperationBuilder::post(
+        "/studio-environments/v1/project-environments/{environment_id}/test",
+    )
+    .operation_id("studio_environments.test_project_environment")
+    .summary("Reach the cluster of an environment of the project's own")
+    .description("For `?project_id=`: asks the cluster's API server, or Research, what answers.")
+    .tag(TAG)
+    .authenticated()
+    .require_license_features::<License>([])
+    .path_param("environment_id", "Environment id")
+    .query_param_typed("project_id", true, "The project", "string")
+    .handler(test_project_environment)
+    .json_response_with_schema::<EnvironmentTestDto>(openapi, StatusCode::OK, "What answered")
+    .error_400(openapi)
+    .error_401(openapi)
+    .error_403(openapi)
+    .error_404(openapi)
+    .error_500(openapi)
+    .register(router, openapi);
+
     router = OperationBuilder::get("/studio-environments/v1/targets")
         .operation_id("studio_environments.get_project_targets")
         .summary("Where a project's product can be deployed")
@@ -1099,6 +1824,30 @@ pub fn register_routes(
         .error_400(openapi)
         .error_401(openapi)
         .error_403(openapi)
+        .error_404(openapi)
+        .error_500(openapi)
+        .error_503(openapi)
+        .register(router, openapi);
+
+    router = OperationBuilder::get("/studio-environments/v1/builds/{build_id}/log")
+        .operation_id("studio_environments.get_build_log")
+        .summary("A build Studio runs, step by step with the end of each step's log")
+        .description(
+            "For `?project_id=`: one of the project's builds the caller can see. Reads the \
+             build's pod in the environment's cluster, through the environment's connection: \
+             each step (prepare, build, publish), whether it waits, runs, passed or failed, \
+             and the last lines it wrote. Asked on demand: the cluster is not polled. 404 \
+             once the pod is gone, a day after the build ended.",
+        )
+        .tag(TAG)
+        .authenticated()
+        .require_license_features::<License>([])
+        .path_param("build_id", "Build id")
+        .query_param_typed("project_id", true, "The project", "string")
+        .handler(get_build_log)
+        .json_response_with_schema::<BuildLogDto>(openapi, StatusCode::OK, "The build's steps")
+        .error_400(openapi)
+        .error_401(openapi)
         .error_404(openapi)
         .error_500(openapi)
         .error_503(openapi)
@@ -1214,6 +1963,29 @@ pub fn register_routes(
         .json_request::<CreateDeploymentRequest>(openapi, "The deploy")
         .handler(create_deployment)
         .json_response_with_schema::<DeploymentDto>(openapi, StatusCode::ACCEPTED, "Accepted")
+        .error_400(openapi)
+        .error_401(openapi)
+        .error_403(openapi)
+        .error_404(openapi)
+        .error_500(openapi)
+        .error_503(openapi)
+        .register(router, openapi);
+
+    router = OperationBuilder::delete("/studio-environments/v1/previews/{deployment_id}")
+        .operation_id("studio_environments.delete_preview")
+        .summary("Remove a preview of a project's product")
+        .description(
+            "For `?project_id=`: deletes the preview's namespace with everything in it, as a \
+             background run, before it expires (ADR-0055). Answers 202 with the run; the \
+             deployment's `preview.removed_at` says when it is gone.",
+        )
+        .tag(TAG)
+        .authenticated()
+        .require_license_features::<License>([])
+        .path_param("deployment_id", "The preview's deployment")
+        .query_param_typed("project_id", true, "The project", "string")
+        .handler(remove_preview)
+        .json_response_with_schema::<PreviewRemovalDto>(openapi, StatusCode::ACCEPTED, "Accepted")
         .error_400(openapi)
         .error_401(openapi)
         .error_403(openapi)

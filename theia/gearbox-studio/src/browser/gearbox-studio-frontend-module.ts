@@ -43,6 +43,10 @@ import { RevealService } from "./reveal-service";
 import { CataloguePicker } from "./catalogue/catalogue-picker";
 import { CatalogueWidget } from "./catalogue/catalogue-widget";
 import { ConflictsWidget } from "./conflicts/conflicts-widget";
+import { CatalogueDiagnosticsWidget } from "./diagnostics/catalogue-diagnostics-widget";
+import { ConfigureSourcesContribution } from "./shell/configure-sources-contribution";
+import { StudioWindowTitleUpdater } from "./shell/studio-window-title-updater";
+import { WindowTitleUpdater } from "@theia/core/lib/browser/window/window-title-updater";
 import { CreateProductWidget } from "./create/create-product-widget";
 import { CreateGearWidget } from "./create/create-gear-widget";
 import { PendingCreate } from "./create/pending-create";
@@ -51,6 +55,7 @@ import {
   AddGearViewContribution,
   CatalogueViewContribution,
   ConflictsViewContribution,
+  CatalogueDiagnosticsViewContribution,
   CreateGearViewContribution,
   CreateProductViewContribution,
   GearAuthorViewContribution,
@@ -75,6 +80,7 @@ import { GdlLanguageContribution } from "./gdl/gdl-language-contribution";
 import { ProductFileChecks } from "./gdl/product-file-checks";
 import { GearSessionService } from "./shell/gear-session-service";
 import { ProductSessionService } from "./shell/product-session-service";
+import { ProductDescriptionSync } from "./shell/product-description-sync";
 import { EngineConnectionService } from "./shell/engine-connection-service";
 import { SelectionService } from "./shell/selection-service";
 import { SessionCommands } from "./shell/session-commands";
@@ -104,6 +110,10 @@ export default new ContainerModule((bind, _unbind, _isBound, rebind) => {
   // `product.lock` opens read-only. Additive: nothing else in Studio rebinds
   // the Monaco editor provider, and every other file opens as before.
   rebind(MonacoEditorProvider).to(ReadOnlyLockEditorProvider).inSingletonScope();
+
+  // The window names the product Building is on (`studio-window-title-updater.ts`);
+  // outside a Gearbox perspective it is Theia's own title.
+  rebind(WindowTitleUpdater).to(StudioWindowTitleUpdater).inSingletonScope();
 
   // One selection for every Gearbox view, bound before the stores that inject it.
   bind(SelectionService).toSelf().inSingletonScope();
@@ -138,6 +148,8 @@ export default new ContainerModule((bind, _unbind, _isBound, rebind) => {
   bind(FrontendApplicationContribution).toService(ProductFileChecks);
 
   bind(ProductSessionService).toSelf().inSingletonScope();
+  // The description read from and saved to Studio (ADR-0053); inert without the Studio extension.
+  bind(ProductDescriptionSync).toSelf().inSingletonScope();
   bind(GearSessionService).toSelf().inSingletonScope();
 
   // The Gearbox top-level menu's label -- see `GearboxMenuContribution`.
@@ -201,6 +213,8 @@ export default new ContainerModule((bind, _unbind, _isBound, rebind) => {
   // `Find Gear…` and `Add Gear…`.
   bind(CataloguePicker).toSelf().inSingletonScope();
   bind(CommandContribution).toService(CataloguePicker);
+  bind(ConfigureSourcesContribution).toSelf().inSingletonScope();
+  bind(CommandContribution).toService(ConfigureSourcesContribution);
   bind(MenuContribution).toService(CataloguePicker);
 
   bindWidget(bind, CatalogueWidget);
@@ -208,6 +222,7 @@ export default new ContainerModule((bind, _unbind, _isBound, rebind) => {
   bindWidget(bind, ProductWidget);
   bindWidget(bind, InspectorWidget);
   bindWidget(bind, ConflictsWidget);
+  bindWidget(bind, CatalogueDiagnosticsWidget);
   bindWidget(bind, StartWidget);
   bindWidget(bind, CreateProductWidget);
   bindWidget(bind, CreateGearWidget);
@@ -236,6 +251,7 @@ export default new ContainerModule((bind, _unbind, _isBound, rebind) => {
   bindViewContribution(bind, GearAuthorViewContribution);
   bindViewContribution(bind, AddGearViewContribution);
   bindViewContribution(bind, ConflictsViewContribution);
+  bindViewContribution(bind, CatalogueDiagnosticsViewContribution);
   bindViewContribution(bind, LockViewContribution);
   bindViewContribution(bind, GenerateViewContribution);
 

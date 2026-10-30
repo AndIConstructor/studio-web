@@ -35,6 +35,30 @@ pub enum DatabaseMode {
     Namespace,
 }
 
+/// What runs an environment's products.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum EnvironmentKind {
+    /// A Kubernetes cluster the organization reaches through a connection.
+    #[default]
+    Kubernetes,
+    /// A member's Constructor Research, through its integration service
+    /// (ADR-0049): a Research project, where each Studio project runs as one
+    /// application per environment.
+    Research,
+}
+
+/// Where in Constructor Research a Research environment runs its products.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResearchTarget {
+    /// The Research project, as the integration service names it.
+    pub project: String,
+    /// The hardware configuration its services run on; `None` for
+    /// Research's default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hardware: Option<String>,
+}
+
 /// One place an organization's products run.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Environment {
@@ -44,9 +68,14 @@ pub struct Environment {
     pub name: String,
     #[serde(default)]
     pub description: String,
+    #[serde(default)]
+    pub kind: EnvironmentKind,
     /// The cluster: a connection of the `kubernetes` kind the organization
-    /// holds.
+    /// holds; or, for `research`, the `research` connection it signs in with.
     pub connection_id: Uuid,
+    /// The Research project and hardware; only for `research`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub research: Option<ResearchTarget>,
     /// The prefix images are pushed to and the chart pulls from
     /// (`ghcr.io/acme`). Empty: the images are used as generated.
     #[serde(default)]
@@ -70,9 +99,18 @@ pub struct Environment {
     /// takes what succeeded in `stage`. `None` takes anything.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub promote_from: Option<Uuid>,
-    /// The projects that may deploy here; `None` is all of them.
+    /// The projects that may deploy here; `None` is all of them. A project's
+    /// own environment names none: it is its project's alone.
     #[serde(default)]
     pub projects: Option<Vec<Uuid>>,
+    /// The project that keeps this environment (ADR-0054); `None` for one of
+    /// the organization's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<Uuid>,
+    /// Whether a project may preview a build here, and how (ADR-0055);
+    /// `None` takes no previews.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previews: Option<PreviewSettings>,
     pub updated_by: String,
     pub updated_at: String,
 }
@@ -86,6 +124,10 @@ fn default_pattern() -> String {
 pub struct EnvironmentList {
     #[serde(default)]
     pub items: Vec<Environment>,
+    /// The organization's clusters its projects may put environments of
+    /// their own on (ADR-0054 §2): `kubernetes` connection ids.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub open_clusters: Vec<Uuid>,
 }
 
 /// What a person may set on an environment.
@@ -93,7 +135,9 @@ pub struct EnvironmentList {
 pub struct EnvironmentInput {
     pub name: String,
     pub description: String,
+    pub kind: EnvironmentKind,
     pub connection_id: Uuid,
+    pub research: Option<ResearchTarget>,
     pub registry: String,
     pub registry_connection_id: Option<Uuid>,
     pub namespace_pattern: Option<String>,
@@ -102,6 +146,7 @@ pub struct EnvironmentInput {
     pub protected: bool,
     pub promote_from: Option<Uuid>,
     pub projects: Option<Vec<Uuid>>,
+    pub previews: Option<PreviewSettings>,
 }
 
 /// A refusal of an environment as written.
@@ -202,6 +247,8 @@ pub fn checked(
     by: String,
     at: String,
 ) -> Result<Environment, Invalid> {
+    let research = check_research(&input, input.registry.trim())?;
+    let previews = check_previews(&input)?;
     let name = input.name.trim().to_owned();
     if !is_dns_label(&name) {
         return Err(invalid(
@@ -216,7 +263,7 @@ pub fn checked(
     {
         return Err(invalid(
             "name",
-            format!("the organization already has an environment '{name}'"),
+            format!("there is already an environment '{name}' here"),
         ));
     }
     let pattern = input
@@ -266,7 +313,9 @@ pub fn checked(
         id: own,
         name,
         description: input.description.trim().to_owned(),
+        kind: input.kind,
         connection_id: input.connection_id,
+        research,
         registry,
         registry_connection_id: input.registry_connection_id,
         namespace_pattern: pattern,
@@ -279,9 +328,115 @@ pub fn checked(
             p.dedup();
             p
         }),
+        project_id: None,
+        previews,
         updated_by: by,
         updated_at: at,
     })
+}
+
+/// A project's own environment (ADR-0054 §3), checked against every
+/// environment the project sees: `admitted`, the organization's that take
+/// its deploys, and `own`, its own (`id` is the one being edited, if any).
+/// It lists no projects and needs no approval: both are the organization's
+/// to say, on an environment of its own.
+pub fn checked_for_project(
+    admitted: &[Environment],
+    own: &[Environment],
+    project: Uuid,
+    id: Option<Uuid>,
+    input: EnvironmentInput,
+    by: String,
+    at: String,
+) -> Result<Environment, Invalid> {
+    if input.projects.is_some() {
+        return Err(invalid(
+            "projects",
+            "a project's own environment is its project's alone: it lists no projects",
+        ));
+    }
+    if input.protected {
+        return Err(invalid(
+            "protected",
+            "an environment whose deploys need approval is the organization's: ask an              organization administrator for one",
+        ));
+    }
+    let visible = EnvironmentList {
+        items: admitted.iter().chain(own).cloned().collect(),
+        open_clusters: Vec::new(),
+    };
+    let mut env = checked(&visible, id, input, by, at)?;
+    env.project_id = Some(project);
+    Ok(env)
+}
+
+/// An environment of the organization that admits `project`, on the same
+/// cluster as `env`, that gives the project the same namespace: two releases
+/// there would overwrite each other (ADR-0054 §6).
+pub fn namespace_clash<'a>(
+    env: &Environment,
+    admitted: &'a [Environment],
+    project_name: &str,
+) -> Option<&'a Environment> {
+    let ns = namespace_for(&env.namespace_pattern, project_name, &env.name).ok()?;
+    admitted.iter().find(|o| {
+        o.id != env.id
+            && o.kind == EnvironmentKind::Kubernetes
+            && o.connection_id == env.connection_id
+            && namespace_for(&o.namespace_pattern, project_name, &o.name).ok() == Some(ns.clone())
+    })
+}
+
+/// A Research environment's target, checked; `None` for a cluster. Research
+/// keeps the registry and the namespace itself, and has no shared database
+/// server (ADR-0049 §2), so a Research environment names none of them.
+fn check_research(
+    input: &EnvironmentInput,
+    registry: &str,
+) -> Result<Option<ResearchTarget>, Invalid> {
+    if input.kind == EnvironmentKind::Kubernetes {
+        if input.research.is_some() {
+            return Err(invalid(
+                "research",
+                "only a research environment names a Research project",
+            ));
+        }
+        return Ok(None);
+    }
+    let Some(target) = &input.research else {
+        return Err(invalid(
+            "research",
+            "a research environment names its Research project",
+        ));
+    };
+    let project = target.project.trim().to_owned();
+    if project.is_empty() {
+        return Err(invalid(
+            "research",
+            "a research environment names its Research project",
+        ));
+    }
+    if !registry.is_empty() || input.registry_connection_id.is_some() {
+        return Err(invalid(
+            "registry",
+            "Constructor Research keeps the images in its own registry: leave the registry empty",
+        ));
+    }
+    if input.database == DatabaseMode::Shared {
+        return Err(invalid(
+            "database",
+            "Constructor Research has no shared database server: choose none, or the product's own",
+        ));
+    }
+    Ok(Some(ResearchTarget {
+        project,
+        hardware: target
+            .hardware
+            .as_deref()
+            .map(str::trim)
+            .filter(|h| !h.is_empty())
+            .map(str::to_owned),
+    }))
 }
 
 /// `own` taking releases from `from`: another environment of the list, and
@@ -318,9 +473,20 @@ fn check_promotion(list: &EnvironmentList, own: Uuid, from: Uuid) -> Result<(), 
 }
 
 impl Environment {
-    /// May `project` deploy here?
+    /// May `project` deploy here? A project's own environment takes only
+    /// its project's deploys.
     pub fn admits(&self, project: Uuid) -> bool {
-        self.projects.as_ref().is_none_or(|p| p.contains(&project))
+        match self.project_id {
+            Some(owner) => owner == project,
+            None => self.projects.as_ref().is_none_or(|p| p.contains(&project)),
+        }
+    }
+
+    /// The tenant its connections are found from and read as (ADR-0054 §5):
+    /// its project for a project's own environment, so a connection the
+    /// project holds is found and the organization's still inherited.
+    pub fn connections_from(&self, org: Uuid) -> Uuid {
+        self.project_id.unwrap_or(org)
     }
 
     /// An image as this environment's registry holds it. One already named
@@ -387,6 +553,130 @@ pub struct BindingList {
     /// The secret keys set for it, per environment; the values never here.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub secrets: Vec<ConfigSecret>,
+    /// The project's own environments (ADR-0054), kept with its bindings.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub environments: Vec<Environment>,
+    /// How Studio builds the project (ADR-0054 §7): `None` from its
+    /// `product.gdl`, on gears; `Some` from the repository's own Dockerfiles
+    /// and Helm chart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build: Option<OwnBuild>,
+}
+
+/// A project built without a product description (ADR-0054 §7): the
+/// repository's own Dockerfiles, one image each, and its own Helm chart.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OwnBuild {
+    pub images: Vec<OwnImage>,
+    /// The chart's folder in the repository (`chart/shop`).
+    pub chart: String,
+}
+
+/// One image of an [`OwnBuild`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OwnImage {
+    /// The chart's values key for it: a deploy sets `<app>.image.repository`
+    /// and `<app>.image.tag`.
+    pub app: String,
+    /// The image's name under the environment's registry (`shop-api`).
+    pub name: String,
+    /// The Dockerfile, from the repository's root (`Dockerfile`, `api/Dockerfile`).
+    pub dockerfile: String,
+    /// The build context, from the repository's root; `.` by default.
+    #[serde(default = "default_context")]
+    pub context: String,
+}
+
+fn default_context() -> String {
+    ".".to_owned()
+}
+
+/// A path inside the repository: relative, no `..`, no backslash.
+fn is_repo_path(p: &str) -> bool {
+    !p.is_empty()
+        && !p.starts_with('/')
+        && !p.contains('\\')
+        && !p.contains(':')
+        && p.split('/').all(|seg| seg != "..")
+}
+
+/// An [`OwnBuild`] as written, checked; paths normalised.
+pub fn checked_own_build(mut b: OwnBuild) -> Result<OwnBuild, Invalid> {
+    if b.images.is_empty() {
+        return Err(invalid(
+            "images",
+            "a build of the repository's own names at least one Dockerfile",
+        ));
+    }
+    if b.images.len() > 20 {
+        return Err(invalid("images", "at most 20 images"));
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for i in &mut b.images {
+        i.app = i.app.trim().to_owned();
+        i.name = i.name.trim().to_owned();
+        i.dockerfile = i.dockerfile.trim().trim_start_matches("./").to_owned();
+        i.context = match i
+            .context
+            .trim()
+            .trim_start_matches("./")
+            .trim_end_matches('/')
+        {
+            "" => ".".to_owned(),
+            c => c.to_owned(),
+        };
+        if !is_dns_label(&i.app) {
+            return Err(invalid(
+                "images",
+                format!(
+                    "'{}' is not a values key: lowercase letters, digits and '-'",
+                    i.app
+                ),
+            ));
+        }
+        if !seen.insert(i.app.clone()) {
+            return Err(invalid("images", format!("'{}' is named twice", i.app)));
+        }
+        let name_ok = !i.name.is_empty()
+            && i.name.bytes().all(|b| {
+                b.is_ascii_lowercase()
+                    || b.is_ascii_digit()
+                    || matches!(b, b'-' | b'_' | b'.' | b'/')
+            })
+            && !i.name.starts_with('/')
+            && !i.name.ends_with('/');
+        if !name_ok {
+            return Err(invalid(
+                "images",
+                format!("'{}' is not an image name, e.g. shop-api", i.name),
+            ));
+        }
+        if !is_repo_path(&i.dockerfile) {
+            return Err(invalid(
+                "images",
+                format!("'{}' is not a Dockerfile in the repository", i.dockerfile),
+            ));
+        }
+        if i.context != "." && !is_repo_path(&i.context) {
+            return Err(invalid(
+                "images",
+                format!("'{}' is not a folder in the repository", i.context),
+            ));
+        }
+    }
+    b.chart = b
+        .chart
+        .trim()
+        .trim_start_matches("./")
+        .trim_end_matches('/')
+        .to_owned();
+    if !is_repo_path(&b.chart) {
+        return Err(invalid(
+            "chart",
+            "the chart is the folder of a Helm chart in the repository, e.g. chart/shop",
+        ));
+    }
+    Ok(b)
 }
 
 /// How large a binding's values may be once written.
@@ -498,6 +788,8 @@ pub fn checked_bindings(items: Vec<Binding>) -> Result<BindingList, Invalid> {
     Ok(BindingList {
         items,
         secrets: Vec::new(),
+        environments: Vec::new(),
+        build: None,
     })
 }
 
@@ -717,6 +1009,14 @@ pub struct Deployment {
     /// run carries it from then on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_chart: Option<String>,
+    /// For a Constructor Research environment: what the run prepares and
+    /// where it puts the application (ADR-0049 §4).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub research: Option<super::research::ResearchDeploy>,
+    /// A preview (ADR-0055): until when, where it answers, whether it is
+    /// gone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview: Option<Preview>,
 }
 
 impl Deployment {
@@ -746,6 +1046,8 @@ pub fn promotion_gap(
     let promoted = history.iter().any(|p| {
         p.environment_id == src
             && p.project_id == d.project_id
+            // A preview there is not what runs there (ADR-0055).
+            && p.preview.is_none()
             && p.action == DeploymentAction::Install
             && p.state == DeploymentState::Succeeded
             && p.same_release(d)
@@ -754,6 +1056,237 @@ pub fn promotion_gap(
         format!(
             "environment '{}' takes only what runs in '{from}': deploy this release there first",
             env.name
+        )
+    })
+}
+
+/// How long a preview lives unless the environment says otherwise.
+pub const PREVIEW_TTL_HOURS: u32 = 72;
+/// The longest an environment may let a preview live: two weeks.
+pub const MAX_PREVIEW_TTL_HOURS: u32 = 14 * 24;
+/// How many previews a project may keep in an environment at once unless
+/// the environment says otherwise.
+pub const PREVIEW_MAX_LIVE: u32 = 3;
+/// The most an environment may allow.
+pub const MAX_PREVIEW_MAX_LIVE: u32 = 20;
+/// A preview's name is short: it goes into the namespace after the
+/// project's own, and the namespace into the host.
+pub const MAX_PREVIEW_NAME: usize = 20;
+
+/// What an environment says of previews (ADR-0055).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PreviewSettings {
+    /// A domain whose every name reaches the cluster's ingress controller
+    /// (a wildcard DNS record): a preview answers at `<namespace>.<domain>`.
+    /// Empty: previews get no address and are reached by port-forward.
+    #[serde(default)]
+    pub domain: String,
+    /// The `ingressClassName` a preview's Ingress asks for; `None` for the
+    /// cluster's default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ingress_class: Option<String>,
+    /// How long a preview lives before the sweep removes it.
+    #[serde(default = "default_preview_ttl")]
+    pub ttl_hours: u32,
+    /// How many previews one project may keep here at once.
+    #[serde(default = "default_preview_max_live")]
+    pub max_live: u32,
+}
+
+fn default_preview_ttl() -> u32 {
+    PREVIEW_TTL_HOURS
+}
+
+fn default_preview_max_live() -> u32 {
+    PREVIEW_MAX_LIVE
+}
+
+/// Is `s` a DNS name: dot-separated labels, at most 253 characters?
+fn is_dns_name(s: &str) -> bool {
+    !s.is_empty() && s.len() <= 253 && s.split('.').all(is_dns_label)
+}
+
+/// An environment's preview settings, checked. A preview is a namespace of
+/// its own on a cluster, so a Research environment takes none, and a
+/// protected one none either: a preview nobody may approve in time is no
+/// preview.
+fn check_previews(input: &EnvironmentInput) -> Result<Option<PreviewSettings>, Invalid> {
+    let Some(p) = &input.previews else {
+        return Ok(None);
+    };
+    if input.kind == EnvironmentKind::Research {
+        return Err(invalid(
+            "previews",
+            "a preview is a namespace of its own on a cluster: Constructor Research takes none",
+        ));
+    }
+    if input.protected {
+        return Err(invalid(
+            "previews",
+            "a protected environment takes no previews: its deploys wait for approval",
+        ));
+    }
+    let domain = p.domain.trim().trim_matches('.').to_ascii_lowercase();
+    if !domain.is_empty() && !is_dns_name(&domain) {
+        return Err(invalid(
+            "preview_domain",
+            format!("'{domain}' is not a domain, e.g. preview.example.com"),
+        ));
+    }
+    let ingress_class = p
+        .ingress_class
+        .as_deref()
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+        .map(str::to_owned);
+    if let Some(class) = &ingress_class
+        && !is_dns_name(class)
+    {
+        return Err(invalid(
+            "preview_ingress_class",
+            format!("'{class}' is not an ingress class name"),
+        ));
+    }
+    if !(1..=MAX_PREVIEW_TTL_HOURS).contains(&p.ttl_hours) {
+        return Err(invalid(
+            "preview_ttl_hours",
+            format!("a preview lives from 1 to {MAX_PREVIEW_TTL_HOURS} hours"),
+        ));
+    }
+    if !(1..=MAX_PREVIEW_MAX_LIVE).contains(&p.max_live) {
+        return Err(invalid(
+            "preview_max_live",
+            format!("a project keeps from 1 to {MAX_PREVIEW_MAX_LIVE} previews at once"),
+        ));
+    }
+    Ok(Some(PreviewSettings {
+        domain,
+        ingress_class,
+        ttl_hours: p.ttl_hours,
+        max_live: p.max_live,
+    }))
+}
+
+/// A preview: a deploy into a namespace of its own that the sweep removes,
+/// namespace and all, once it expires or somebody removes it (ADR-0055).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Preview {
+    /// What distinguishes it from the project's other previews there.
+    pub name: String,
+    /// RFC 3339.
+    pub expires_at: String,
+    /// Where it answers; `None` when the environment has no preview domain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    /// The cluster it was installed with, so its removal needs nothing that
+    /// could have changed or gone since: the environment may be edited or
+    /// removed while the preview lives.
+    pub connection_id: Uuid,
+    /// The tenant that connection is found from (ADR-0054 §5); `None` for
+    /// the organization.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connections_from: Option<Uuid>,
+    /// When the sweep removed it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub removed_at: Option<String>,
+    /// Why the last attempt to remove it failed; the next sweep tries again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub removal_error: Option<String>,
+}
+
+impl Deployment {
+    /// A preview whose namespace may still be there: not removed yet,
+    /// whatever its install came to (a failed one leaves its namespace too).
+    pub fn is_live_preview(&self) -> bool {
+        self.preview
+            .as_ref()
+            .is_some_and(|p| p.removed_at.is_none())
+    }
+
+    /// A live preview that has expired by `now`.
+    pub fn preview_due(&self, now: time::OffsetDateTime) -> bool {
+        self.is_live_preview()
+            && self.preview.as_ref().is_some_and(|p| {
+                time::OffsetDateTime::parse(
+                    &p.expires_at,
+                    &time::format_description::well_known::Rfc3339,
+                )
+                // An expiry nobody can read is not kept for ever.
+                .map_or(true, |at| at <= now)
+            })
+    }
+}
+
+/// The name a preview gets: the one asked for, or one made of the
+/// deployment's id. Lowercase letters, digits and `-`, at most
+/// [`MAX_PREVIEW_NAME`].
+pub fn preview_name(asked: Option<&str>, id: Uuid) -> Result<String, Invalid> {
+    let Some(asked) = asked.map(str::trim).filter(|a| !a.is_empty()) else {
+        return Ok(format!("p{}", &id.simple().to_string()[..6]));
+    };
+    let name = asked.to_ascii_lowercase();
+    if !is_dns_label(&name) || name.len() > MAX_PREVIEW_NAME {
+        return Err(invalid(
+            "preview_name",
+            format!(
+                "a preview's name is lowercase letters, digits and '-', at most \
+                 {MAX_PREVIEW_NAME} (pr-42, login-fix)"
+            ),
+        ));
+    }
+    Ok(name)
+}
+
+/// The namespace of a preview: the project's namespace there, `-pv-`, its
+/// name. Never the project's own namespace, so removing it never touches
+/// what the environment runs.
+pub fn preview_namespace(base: &str, name: &str) -> Result<String, Invalid> {
+    let ns = format!("{base}-pv-{name}");
+    if !is_dns_label(&ns) {
+        return Err(invalid(
+            "preview_name",
+            format!(
+                "namespace '{ns}' would be longer than 63 characters: choose a shorter preview \
+                 name"
+            ),
+        ));
+    }
+    Ok(ns)
+}
+
+/// Where a preview in `namespace` answers: `<namespace>.<domain>`, when the
+/// environment has a preview domain.
+pub fn preview_host(settings: &PreviewSettings, namespace: &str) -> Option<String> {
+    (!settings.domain.is_empty()).then(|| format!("{namespace}.{}", settings.domain))
+}
+
+/// Why `project` may not have one more preview in `env`: one of that name is
+/// still there, or it already keeps as many as the environment allows.
+pub fn preview_refusal(
+    settings: &PreviewSettings,
+    history: &[Deployment],
+    project: Uuid,
+    env: Uuid,
+    name: &str,
+) -> Option<String> {
+    let live: Vec<&Deployment> = history
+        .iter()
+        .filter(|d| d.project_id == project && d.environment_id == env && d.is_live_preview())
+        .collect();
+    if live
+        .iter()
+        .any(|d| d.preview.as_ref().is_some_and(|p| p.name == name))
+    {
+        return Some(format!(
+            "the project already has a preview '{name}' here: remove it first, or name this one \
+             otherwise"
+        ));
+    }
+    (live.len() >= settings.max_live as usize).then(|| {
+        format!(
+            "the project keeps {} previews here, as many as the environment allows: remove one \
+             first",
+            live.len()
         )
     })
 }
@@ -768,16 +1301,20 @@ pub struct DeploymentList {
 
 impl DeploymentList {
     /// Put `d` first and trim the history to [`HISTORY`], keeping the latest
-    /// deployment of every project and environment, and every one still
-    /// waiting for a decision.
+    /// deployment of every project and environment (a preview is not what
+    /// runs there), every one still waiting for a decision, and every
+    /// preview not yet removed, which the sweep must still find.
     pub fn record(&mut self, d: Deployment) {
         self.items.retain(|x| x.id != d.id);
         self.items.insert(0, d);
         let mut latest = std::collections::BTreeSet::new();
         let mut kept = 0usize;
         self.items.retain(|x| {
-            let first = latest.insert((x.project_id, x.environment_id));
-            let keep = first || x.state == DeploymentState::AwaitingApproval || kept < HISTORY;
+            let first = x.preview.is_none() && latest.insert((x.project_id, x.environment_id));
+            let keep = first
+                || x.state == DeploymentState::AwaitingApproval
+                || x.is_live_preview()
+                || kept < HISTORY;
             if keep {
                 kept += 1;
             }
@@ -870,7 +1407,9 @@ mod tests {
         EnvironmentInput {
             name: name.into(),
             description: String::new(),
+            kind: EnvironmentKind::Kubernetes,
             connection_id: Uuid::from_u128(7),
+            research: None,
             registry: "ghcr.io/acme/".into(),
             registry_connection_id: None,
             namespace_pattern: None,
@@ -879,6 +1418,7 @@ mod tests {
             protected: false,
             promote_from: None,
             projects: None,
+            previews: None,
         }
     }
 
@@ -904,6 +1444,7 @@ mod tests {
         let stage = env("stage");
         let mut list = EnvironmentList {
             items: vec![stage.clone()],
+            ..Default::default()
         };
         let mut i = input("prod");
         i.promote_from = Some(stage.id);
@@ -1119,6 +1660,7 @@ mod tests {
     fn two_environments_may_not_share_a_name_but_an_edit_keeps_its_own() {
         let list = EnvironmentList {
             items: vec![env("prod")],
+            ..Default::default()
         };
         let id = list.items[0].id;
         assert_eq!(
@@ -1229,6 +1771,8 @@ mod tests {
             reason: None,
             outcome: None,
             pending_chart: None,
+            research: None,
+            preview: None,
         }
     }
 
@@ -1267,5 +1811,412 @@ mod tests {
             image: "acme/api:1 --set x".into(),
         };
         assert!(check_images(&[bad]).is_err());
+    }
+
+    #[test]
+    fn a_research_environment_names_its_project_and_no_registry() {
+        let research = |project: &str| EnvironmentInput {
+            kind: EnvironmentKind::Research,
+            registry: String::new(),
+            research: Some(ResearchTarget {
+                project: project.into(),
+                hardware: Some(" ".into()),
+            }),
+            ..input("research")
+        };
+        let e = checked(
+            &EnvironmentList::default(),
+            None,
+            research(" ml-team "),
+            String::new(),
+            String::new(),
+        )
+        .expect("a research environment");
+        assert_eq!(e.kind, EnvironmentKind::Research);
+        assert_eq!(
+            e.research,
+            Some(ResearchTarget {
+                project: "ml-team".into(),
+                hardware: None
+            })
+        );
+
+        let no_project = checked(
+            &EnvironmentList::default(),
+            None,
+            research(""),
+            String::new(),
+            String::new(),
+        );
+        assert_eq!(no_project.unwrap_err().field, "research");
+        let with_registry = EnvironmentInput {
+            registry: "ghcr.io/acme".into(),
+            ..research("ml-team")
+        };
+        let refused = checked(
+            &EnvironmentList::default(),
+            None,
+            with_registry,
+            String::new(),
+            String::new(),
+        );
+        assert_eq!(refused.unwrap_err().field, "registry");
+        let shared = EnvironmentInput {
+            database: DatabaseMode::Shared,
+            ..research("ml-team")
+        };
+        let refused = checked(
+            &EnvironmentList::default(),
+            None,
+            shared,
+            String::new(),
+            String::new(),
+        );
+        assert_eq!(refused.unwrap_err().field, "database");
+
+        let stray = EnvironmentInput {
+            research: research("x").research,
+            ..input("dev")
+        };
+        let refused = checked(
+            &EnvironmentList::default(),
+            None,
+            stray,
+            String::new(),
+            String::new(),
+        );
+        assert_eq!(refused.unwrap_err().field, "research");
+    }
+
+    #[test]
+    fn an_environment_written_before_kinds_reads_as_a_cluster() {
+        let old = serde_json::json!({
+            "id": Uuid::from_u128(1), "name": "dev", "connection_id": Uuid::from_u128(7),
+            "updated_by": "", "updated_at": "",
+        });
+        let e: Environment = serde_json::from_value(old).unwrap();
+        assert_eq!(e.kind, EnvironmentKind::Kubernetes);
+        assert!(e.research.is_none());
+        assert!(serde_json::to_value(&e).unwrap().get("research").is_none());
+    }
+
+    #[test]
+    fn a_projects_own_environment_is_its_alone_and_never_protected() {
+        let project = Uuid::from_u128(5);
+        let other = Uuid::from_u128(6);
+        let org_dev = env("dev");
+        let mine = checked_for_project(
+            std::slice::from_ref(&org_dev),
+            &[],
+            project,
+            None,
+            input("sandbox"),
+            String::new(),
+            "t".into(),
+        )
+        .unwrap();
+        assert_eq!(mine.project_id, Some(project));
+        assert!(mine.admits(project));
+        assert!(!mine.admits(other));
+        assert_eq!(mine.connections_from(Uuid::from_u128(1)), project);
+        assert_eq!(
+            org_dev.connections_from(Uuid::from_u128(1)),
+            Uuid::from_u128(1)
+        );
+
+        // A name the project already sees, the organization's or its own.
+        let taken = |name: &str| {
+            checked_for_project(
+                std::slice::from_ref(&org_dev),
+                std::slice::from_ref(&mine),
+                project,
+                None,
+                input(name),
+                String::new(),
+                "t".into(),
+            )
+            .unwrap_err()
+            .field
+        };
+        assert_eq!(taken("dev"), "name");
+        assert_eq!(taken("sandbox"), "name");
+
+        let mut protected = input("prod");
+        protected.protected = true;
+        let mut listing = input("qa");
+        listing.projects = Some(vec![other]);
+        for (i, field) in [(protected, "protected"), (listing, "projects")] {
+            assert_eq!(
+                checked_for_project(&[], &[], project, None, i, String::new(), "t".into())
+                    .unwrap_err()
+                    .field,
+                field
+            );
+        }
+
+        // It may take releases from the organization's environment it sees.
+        let mut promoted = input("stage");
+        promoted.promote_from = Some(org_dev.id);
+        assert!(
+            checked_for_project(
+                std::slice::from_ref(&org_dev),
+                &[],
+                project,
+                None,
+                promoted,
+                String::new(),
+                "t".into()
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_build_of_the_repositorys_own_stays_in_the_repository() {
+        let image = |app: &str, dockerfile: &str, context: &str| OwnImage {
+            app: app.into(),
+            name: "shop-api".into(),
+            dockerfile: dockerfile.into(),
+            context: context.into(),
+        };
+        let ok = checked_own_build(OwnBuild {
+            images: vec![image("api", "./api/Dockerfile", "./")],
+            chart: "./chart/shop/".into(),
+        })
+        .unwrap();
+        assert_eq!(ok.images[0].dockerfile, "api/Dockerfile");
+        assert_eq!(ok.images[0].context, ".");
+        assert_eq!(ok.chart, "chart/shop");
+        for bad in [
+            OwnBuild {
+                images: vec![],
+                chart: "chart".into(),
+            },
+            OwnBuild {
+                images: vec![image("api", "../Dockerfile", ".")],
+                chart: "chart".into(),
+            },
+            OwnBuild {
+                images: vec![image("api", "Dockerfile", "/etc")],
+                chart: "chart".into(),
+            },
+            OwnBuild {
+                images: vec![image("API", "Dockerfile", ".")],
+                chart: "chart".into(),
+            },
+            OwnBuild {
+                images: vec![
+                    image("api", "Dockerfile", "."),
+                    image("api", "x/Dockerfile", "."),
+                ],
+                chart: "chart".into(),
+            },
+            OwnBuild {
+                images: vec![image("api", "Dockerfile", ".")],
+                chart: "../chart".into(),
+            },
+        ] {
+            assert!(checked_own_build(bad).is_err());
+        }
+    }
+
+    #[test]
+    fn a_project_environment_may_not_take_the_namespace_of_an_organization_one() {
+        let org_dev = env("dev");
+        let mut i = input("dev2");
+        i.namespace_pattern = Some("{project}-dev".into());
+        let mine = checked_for_project(
+            &[],
+            &[],
+            Uuid::from_u128(5),
+            None,
+            i,
+            String::new(),
+            "t".into(),
+        )
+        .unwrap();
+        let admitted = [org_dev.clone()];
+        assert_eq!(
+            namespace_clash(&mine, &admitted, "Shop").map(|e| e.id),
+            Some(org_dev.id)
+        );
+        let mut elsewhere = mine.clone();
+        elsewhere.connection_id = Uuid::from_u128(8);
+        assert!(namespace_clash(&elsewhere, &admitted, "Shop").is_none());
+    }
+    fn settings() -> PreviewSettings {
+        PreviewSettings {
+            domain: "preview.example.com".into(),
+            ingress_class: None,
+            ttl_hours: PREVIEW_TTL_HOURS,
+            max_live: 2,
+        }
+    }
+
+    fn preview(n: u128, name: &str, expires_at: &str) -> Deployment {
+        let mut d = deployment(n, 1, DeploymentState::Succeeded);
+        d.namespace = format!("p-prod-pv-{name}");
+        d.preview = Some(Preview {
+            name: name.into(),
+            expires_at: expires_at.into(),
+            host: None,
+            connection_id: Uuid::from_u128(7),
+            connections_from: None,
+            removed_at: None,
+            removal_error: None,
+        });
+        d
+    }
+
+    #[test]
+    fn an_environment_takes_previews_only_on_a_cluster_it_does_not_protect() {
+        let with = |f: fn(&mut EnvironmentInput)| {
+            let mut i = input("dev");
+            i.previews = Some(PreviewSettings {
+                domain: " Preview.Example.com. ".into(),
+                ingress_class: Some(" ".into()),
+                ..settings()
+            });
+            f(&mut i);
+            checked(
+                &EnvironmentList::default(),
+                None,
+                i,
+                String::new(),
+                String::new(),
+            )
+        };
+        let ok = with(|_| {}).expect("previews on dev").previews.unwrap();
+        assert_eq!(ok.domain, "preview.example.com");
+        assert_eq!(ok.ingress_class, None);
+        assert_eq!(with(|i| i.protected = true).unwrap_err().field, "previews");
+        assert_eq!(
+            with(|i| {
+                i.kind = EnvironmentKind::Research;
+                i.registry = String::new();
+                i.research = Some(ResearchTarget {
+                    project: "ml".into(),
+                    hardware: None,
+                });
+            })
+            .unwrap_err()
+            .field,
+            "previews"
+        );
+        let field = |f: fn(&mut PreviewSettings)| {
+            let mut i = input("dev");
+            let mut p = settings();
+            f(&mut p);
+            i.previews = Some(p);
+            checked(
+                &EnvironmentList::default(),
+                None,
+                i,
+                String::new(),
+                String::new(),
+            )
+            .unwrap_err()
+            .field
+        };
+        assert_eq!(
+            field(|p| p.domain = "not a domain".into()),
+            "preview_domain"
+        );
+        assert_eq!(field(|p| p.ttl_hours = 0), "preview_ttl_hours");
+        assert_eq!(
+            field(|p| p.ttl_hours = MAX_PREVIEW_TTL_HOURS + 1),
+            "preview_ttl_hours"
+        );
+        assert_eq!(field(|p| p.max_live = 0), "preview_max_live");
+        // Stored before previews existed: none.
+        let old: Environment = serde_json::from_value(serde_json::json!({
+            "id": Uuid::from_u128(1), "name": "dev", "connection_id": Uuid::from_u128(7),
+            "updated_by": "", "updated_at": "",
+        }))
+        .unwrap();
+        assert_eq!(old.previews, None);
+    }
+
+    #[test]
+    fn a_preview_lives_in_a_namespace_of_its_own_under_the_projects() {
+        let id = Uuid::from_u128(0xabcdef12_0000_0000_0000_000000000000);
+        assert_eq!(preview_name(None, id).unwrap(), "pabcdef");
+        assert_eq!(preview_name(Some(" PR-42 "), id).unwrap(), "pr-42");
+        assert_eq!(
+            preview_name(Some("a name"), id).unwrap_err().field,
+            "preview_name"
+        );
+        assert!(preview_name(Some(&"x".repeat(MAX_PREVIEW_NAME + 1)), id).is_err());
+        assert_eq!(
+            preview_namespace("shop-dev", "pr-42").unwrap(),
+            "shop-dev-pv-pr-42"
+        );
+        assert!(preview_namespace(&"s".repeat(50), "pr-42-login-fix").is_err());
+        assert_eq!(
+            preview_host(&settings(), "shop-dev-pv-pr-42").as_deref(),
+            Some("shop-dev-pv-pr-42.preview.example.com")
+        );
+        let none = PreviewSettings {
+            domain: String::new(),
+            ..settings()
+        };
+        assert_eq!(preview_host(&none, "shop-dev-pv-pr-42"), None);
+    }
+
+    #[test]
+    fn a_project_keeps_as_many_previews_as_the_environment_allows_each_name_once() {
+        let env = Uuid::from_u128(9);
+        let project = Uuid::from_u128(1);
+        let mut history = vec![preview(1, "a", "2030-01-01T00:00:00Z")];
+        assert!(preview_refusal(&settings(), &history, project, env, "b").is_none());
+        assert!(preview_refusal(&settings(), &history, project, env, "a").is_some());
+        history.push(preview(2, "b", "2030-01-01T00:00:00Z"));
+        assert!(preview_refusal(&settings(), &history, project, env, "c").is_some());
+        // A removed one makes room, and its name is free again.
+        history[0].preview.as_mut().unwrap().removed_at = Some("x".into());
+        assert!(preview_refusal(&settings(), &history, project, env, "a").is_none());
+        // Another project's previews are its own.
+        assert!(preview_refusal(&settings(), &history, Uuid::from_u128(2), env, "b").is_none());
+    }
+
+    #[test]
+    fn a_preview_is_due_once_it_expires_and_until_it_is_removed() {
+        let now = time::OffsetDateTime::parse(
+            "2026-10-30T12:00:00Z",
+            &time::format_description::well_known::Rfc3339,
+        )
+        .unwrap();
+        assert!(preview(1, "a", "2026-10-30T11:59:59Z").preview_due(now));
+        assert!(!preview(1, "a", "2026-10-30T12:00:01Z").preview_due(now));
+        assert!(preview(1, "a", "garbled").preview_due(now));
+        let mut removed = preview(1, "a", "2026-10-30T11:00:00Z");
+        removed.preview.as_mut().unwrap().removed_at = Some("x".into());
+        assert!(!removed.preview_due(now));
+        assert!(!removed.is_live_preview());
+        assert!(!deployment(1, 1, DeploymentState::Succeeded).preview_due(now));
+        // A failed install leaves its namespace: still to remove.
+        let mut failed = preview(1, "a", "2026-10-30T11:00:00Z");
+        failed.state = DeploymentState::Failed;
+        assert!(failed.preview_due(now));
+    }
+
+    #[test]
+    fn the_history_keeps_every_live_preview_and_a_preview_is_not_what_runs_there() {
+        let mut list = DeploymentList::default();
+        list.record(deployment(1, 1, DeploymentState::Succeeded));
+        list.record(preview(2, "a", "2030-01-01T00:00:00Z"));
+        for n in 0..(HISTORY as u128 + 10) {
+            list.record(deployment(100 + n, 3, DeploymentState::Succeeded));
+        }
+        assert!(list.items.iter().any(|d| d.id == Uuid::from_u128(1)));
+        assert!(list.items.iter().any(|d| d.id == Uuid::from_u128(2)));
+        let mut removed = preview(3, "b", "2030-01-01T00:00:00Z");
+        removed.preview.as_mut().unwrap().removed_at = Some("x".into());
+        let mut list = DeploymentList::default();
+        list.record(removed);
+        for n in 0..(HISTORY as u128 + 10) {
+            list.record(deployment(100 + n, 3, DeploymentState::Succeeded));
+        }
+        assert!(!list.items.iter().any(|d| d.id == Uuid::from_u128(3)));
     }
 }

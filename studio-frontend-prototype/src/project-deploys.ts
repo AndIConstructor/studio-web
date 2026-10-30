@@ -5,11 +5,40 @@ import type { Deployment, DeployEnvironment } from "./api";
 import type { IdeBuild } from "./builds";
 
 /** The newest deployment of the project in each environment, whatever its
- *  state: the server lists them newest first. */
+ *  state: the server lists them newest first. A preview is not what runs
+ *  there (ADR-0055), so it is not one. */
 export function latestByEnvironment(deployments: readonly Deployment[]): Map<string, Deployment> {
   const out = new Map<string, Deployment>();
-  for (const d of deployments) if (!out.has(d.environment_id)) out.set(d.environment_id, d);
+  for (const d of deployments) if (!d.preview && !out.has(d.environment_id)) out.set(d.environment_id, d);
   return out;
+}
+
+/** The project's previews in an environment that are not removed yet,
+ *  newest first (ADR-0055). */
+export function livePreviews(deployments: readonly Deployment[], environment: string): Deployment[] {
+  return deployments.filter((d) => d.environment_id === environment && !!d.preview && !d.preview.removed_at);
+}
+
+/** A name for a preview of `build`, as the namespace takes it: the build's
+ *  chart version or id, lowercase letters, digits and `-`, at most 20. */
+export function previewNameFor(build: Pick<IdeBuild, "chartVersion" | "buildId">): string {
+  const raw = (build.chartVersion ?? build.buildId ?? "")
+    .toLowerCase()
+    .replace(/[^a-z0-9-]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  const tail = raw.slice(-20).replace(/^-+/, "");
+  return tail || "preview";
+}
+
+/** How long until a preview expires, as a person reads it: "expires in 2 d",
+ *  "expires in 5 h", "expiring". */
+export function expiresIn(expiresAt: string, now: number = Date.now()): string {
+  const ms = Date.parse(expiresAt) - now;
+  if (!Number.isFinite(ms) || ms <= 0) return "expiring";
+  const hours = Math.round(ms / 3_600_000);
+  if (hours >= 48) return `expires in ${Math.round(hours / 24)} d`;
+  if (hours >= 1) return `expires in ${hours} h`;
+  return `expires in ${Math.max(1, Math.round(ms / 60_000))} min`;
 }
 
 /** The profiles bound to an environment, as the line under it says them. */
@@ -17,21 +46,41 @@ export function profilesBoundTo(bindings: readonly { profile: string; environmen
   return bindings.filter((b) => b.environment_id === environment).map((b) => b.profile);
 }
 
-/** The builds a deploy can name: passed, with a published chart (ADR-0048). */
-export function deployableBuilds(builds: readonly IdeBuild[]): IdeBuild[] {
-  return builds.filter((b) => b.status === "passed" && b.chartRef && b.chartVersion);
+/** The builds a deploy can name: passed, with a published chart (ADR-0048);
+ *  or, for a Constructor Research environment, made in Research, which runs
+ *  only images it built and keeps no chart (ADR-0049 §3). Without an
+ *  environment, any build some environment could take. */
+export function deployableBuilds(builds: readonly IdeBuild[], env?: Pick<DeployEnvironment, "kind">): IdeBuild[] {
+  const charted = (b: IdeBuild) => !!(b.chartRef && b.chartVersion);
+  const research = (b: IdeBuild) => b.where === "research";
+  return builds.filter(
+    (b) => b.status === "passed" && (env ? (env.kind === "research" ? research(b) : charted(b)) : charted(b) || research(b)),
+  );
 }
 
 /** What a rollback in an environment installs again: the newest succeeded
  *  install there before the latest one, with a published chart -- an
- *  uploaded one is not kept. `null` when there is none. */
+ *  uploaded one is not kept -- or, in Research, another build. `null` when
+ *  there is none. */
 export function rollbackTarget(deployments: readonly Deployment[], environment: string): Deployment | null {
   const installs = deployments.filter(
-    (d) => d.environment_id === environment && d.state === "succeeded" && (d.action ?? "install") === "install",
+    (d) => d.environment_id === environment && !d.preview && d.state === "succeeded" && (d.action ?? "install") === "install",
   );
   const [latest, ...earlier] = installs;
   if (!latest) return null;
-  return earlier.find((d) => d.chart_ref && !(d.chart_ref === latest.chart_ref && d.chart_version === latest.chart_version)) ?? null;
+  return (
+    earlier.find((d) =>
+      d.chart_ref
+        ? !(d.chart_ref === latest.chart_ref && d.chart_version === latest.chart_version)
+        : !latest.chart_ref && !!d.build && d.build !== latest.build,
+    ) ?? null
+  );
+}
+
+/** Where a product a deploy started opens: the addresses its outcome names
+ *  (a Research deploy ends "… runs in Constructor Research: https://…"). */
+export function productUrls(outcome: string | null | undefined): string[] {
+  return (outcome ?? "").match(/https?:\/\/[^\s,;]+/g) ?? [];
 }
 
 /** Whether the release runs in the environment now, so it can be taken out. */
@@ -51,6 +100,7 @@ export function promotionGap(
   const ran = deployments.some(
     (d) =>
       d.environment_id === env.promote_from &&
+      !d.preview &&
       d.state === "succeeded" &&
       (d.action ?? "install") === "install" &&
       d.build === build.buildId,

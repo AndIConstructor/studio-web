@@ -65,7 +65,7 @@ export const TypeCell: React.FC<TypeCellProps> = ({
       )}
     </>
   );
-  if (!row.typeEditable) return <span>{label}</span>;
+  if (!row.typeEditable) return <span className={styles.type}>{label}</span>;
 
   const decide = (decision: DecideBindingDto): void =>
     requestTypeDecision({ projectId, workspaceId, bindingId: row.id, name: row.name, decision });
@@ -76,6 +76,7 @@ export const TypeCell: React.FC<TypeCellProps> = ({
     if (type?.proposed && value === type.key) decide({ action: 'confirm' });
     else if (value === current) return;
     else if (value === UNKNOWN) decide({ action: 'reset' });
+    else if (value === REJECTED) decide({ action: 'reject' });
     else decide({ action: 'set', type_key: value });
   };
 
@@ -86,6 +87,7 @@ export const TypeCell: React.FC<TypeCellProps> = ({
           <Button
             variant="ghost"
             size="sm"
+            className={styles.trigger}
             aria-label={t('type_change', { name: row.name })}
             loading={pending}
             end={<ChevronDown size={14} strokeWidth={1.5} />}
@@ -118,8 +120,10 @@ export const TypeCell: React.FC<TypeCellProps> = ({
           <DropdownMenuRadioItem closeOnClick value={UNKNOWN} onClick={() => pick(UNKNOWN)}>
             {t('type_unknown')}
           </DropdownMenuRadioItem>
-          {/* *Not a specification* comes back with the filters (#878): a rejected row leaves
-              the list, and only the *Not specifications* filter brings it back. */}
+          {/* A rejected row leaves the default view; the *Not specifications* filter brings it back. */}
+          <DropdownMenuRadioItem closeOnClick value={REJECTED} onClick={() => pick(REJECTED)}>
+            {t('type_reject')}
+          </DropdownMenuRadioItem>
         </DropdownMenuRadioGroup>
       </DropdownMenuContent>
     </DropdownMenu>

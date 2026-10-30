@@ -10,6 +10,7 @@ import {
   fixesFrom,
   nextStep,
   plainText,
+  productionFixes,
   recommended,
   rowShortlist,
   type FlowState,
@@ -61,6 +62,42 @@ describe("fixes from the engine's completion", () => {
     expect(applyFix(["a"], {}, add).picks).toEqual(["a", "rg-tr-plugin"]);
     expect(applyFix(["a", "dead"], { dead: { x: 1 } }, remove)).toEqual({ picks: ["a"], config: {} });
     expect(applyFix(["a"], {}, config).config).toEqual({ "keycloak-idp-plugin": { vendor: "cf" } });
+  });
+
+  it("asks for a picked gear's settings instead of taking it out", () => {
+    const [setup] = fixesFrom(["oidc"], {}, {
+      gears: ["oidc"],
+      changes: [{ gear: "oidc", added: false, reason: "needs configuration: jwt", needs: ["jwt"] }],
+    });
+    expect(setup).toEqual({ kind: "setup", gear: "oidc", fields: ["jwt"], reason: "needs configuration: jwt" });
+    expect(applyFix(["oidc"], {}, setup)).toEqual({ picks: ["oidc"], config: {} });
+  });
+});
+
+describe("a production rule the product breaks", () => {
+  const acceptAll = {
+    code: "GBX0325",
+    severity: "error",
+    message:
+      "profile `prod` breaks a production rule: `static-authn-plugin` in `accept_all` mode authenticates every request (ADR-0011 section 3)",
+  };
+  const picks = ["cf-gears-authn-resolver", "cf-gears-static-authn-plugin"];
+
+  it("offers OIDC in place of static sign-in, named as the catalogue names it", () => {
+    const [fix] = productionFixes(picks, [acceptAll]);
+    expect(fix).toMatchObject({ kind: "replace", gear: "cf-gears-static-authn-plugin", with: "cf-gears-oidc-authn-plugin" });
+    expect(applyFix(picks, { "cf-gears-static-authn-plugin": { mode: "accept_all" } }, fix)).toEqual({
+      picks: ["cf-gears-authn-resolver", "cf-gears-oidc-authn-plugin"],
+      config: {},
+    });
+  });
+
+  it("only takes static sign-in out when OIDC is already there, and nothing without the error", () => {
+    expect(productionFixes([...picks, "cf-gears-oidc-authn-plugin"], [acceptAll])).toMatchObject([
+      { kind: "remove", gear: "cf-gears-static-authn-plugin" },
+    ]);
+    expect(productionFixes(picks, [{ ...acceptAll, severity: "warning" }])).toEqual([]);
+    expect(productionFixes(["cf-gears-authn-resolver"], [acceptAll])).toEqual([]);
   });
 });
 
@@ -121,7 +158,7 @@ describe("the next step", () => {
     const gap = nextStep({ ...base, open: 2 });
     expect(gap.tone).toBe("warn");
     expect(gap.text).toContain("2 capabilities the specs ask for are not closed yet.");
-    expect(nextStep({ ...base, written: true }).action).toBe("open");
+    expect(nextStep({ ...base, written: true }).action).toBe("builds");
   });
 });
 

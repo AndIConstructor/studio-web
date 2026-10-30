@@ -1,9 +1,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { BringsWithIt } from "./gear-brings-view";
-import { BeyondGears } from "./project-checks-view";
 import {
   api,
+  descriptionConflictOf,
   matchReason,
+  type ProductDescription,
+  type ProductDescriptionConflict,
   type Candidate,
   type DeclaredCapability,
   type GearConfig,
@@ -58,6 +60,7 @@ import {
   codeFor,
   codeGears,
   fixesFrom,
+  productionFixes,
   nextStep,
   productSteps,
   type ProductStep,
@@ -74,6 +77,7 @@ export function ProjectKits({
   projectName,
   workspaceId,
   section = "components",
+  onOpenTab,
 }: {
   token: string;
   projectId: string;
@@ -84,6 +88,8 @@ export function ProjectKits({
   /** Which tab this is: the specs-to-product journey, or the project's kits.
    *  One component, because both read the project's IDE repositories. */
   section?: "components" | "kits";
+  /** Open another tab of the project: Builds, once the product is written. */
+  onOpenTab?: (tab: "builds") => void;
 }) {
   /** Which part of the journey is shown. */
   const [pane, setPane] = useState<ProductPane>("needs");
@@ -290,7 +296,7 @@ export function ProjectKits({
     inCode: code.report ? codeGears(code.report).length : null,
     resolves: verdict.resolves,
     fixes: verdict.fixes,
-    written: !!product.record?.written && verdict.resolves !== null,
+    written: !!(product.record?.written || product.record?.description) && verdict.resolves !== null,
     composing: product.composing,
   };
   const steps = productSteps(flowState);
@@ -309,6 +315,9 @@ export function ProjectKits({
         onAct={(action) => {
           if (action === "add-recommended") {
             product.setPicks((current) => [...current, ...flow.recommended.filter((n) => !current.includes(n))]);
+          } else if (action === "builds") {
+            if (onOpenTab) onOpenTab("builds");
+            else setPane("build");
           } else {
             setPane(action === "build" || action === "open" ? "build" : "product");
             setCommand({ kind: action, at: Date.now() });
@@ -345,17 +354,15 @@ export function ProjectKits({
           onFlow={setFlow}
         />
       </div>
-      <div hidden={pane !== "needs"}>
-        <details className="psteps-more">
-          <summary>Beyond gears — the services and applications in the repositories that are not gears</summary>
-          <BeyondGears token={token} projectId={projectId} />
-        </details>
-      </div>
+      <p className="hint" hidden={pane !== "needs"} style={{ fontSize: 12 }}>
+        The services and applications in the repositories that are not gears, and everything else the project has: Parts.
+      </p>
       {product.composing && (
         <section className="card pstep-build" hidden={pane !== "build"}>
-          <h2>3 · Build it in Studio-ide</h2>
+          <h2>3 · Open it in Studio-ide</h2>
           <p className="subtitle">
-            Building saves <code>product.gdl</code> to the repository and opens the desktop Studio on it, in its Gearbox view.
+            Saves <code>product.gdl</code> in Studio if it changed, and opens the desktop Studio on it, in its Gearbox view,
+            where it is built.
           </p>
           {verdict.resolves !== true ? (
             <p>
@@ -367,18 +374,15 @@ export function ProjectKits({
           ) : (
             <div className="dm-actions">
               <button type="button" className="primary" onClick={() => setCommand({ kind: "build", at: Date.now() })}>
-                {product.record?.written ? "Build it again →" : "Build it in Studio-ide →"}
+                Open in Studio-ide →
               </button>
-              {product.record?.written && (
-                <button type="button" className="ghost" onClick={() => setCommand({ kind: "open", at: Date.now() })}>
-                  Open in Studio-ide
-                </button>
-              )}
-              {product.record?.written && (
+              {product.record?.description ? (
+                <span className="hint">Saved in Studio as revision {product.record.description.revision}.</span>
+              ) : product.record?.written ? (
                 <span className="hint">
                   Built on <code>{product.record.written.branch}</code>.
                 </span>
-              )}
+              ) : null}
             </div>
           )}
         </section>
@@ -608,8 +612,9 @@ function NextStepBar({ step, onAct }: { step: NextStep; onAct: (action: NextActi
     "take-from-code": "Take the product from the code",
     preview: "Check it",
     fix: "Show the fixes",
-    build: "Build it in Studio-ide →",
+    build: "Open in Studio-ide →",
     open: "Open in Studio-ide",
+    builds: "Builds →",
   };
   return (
     <div
@@ -1443,6 +1448,10 @@ function ProductCard({
   const cardRef = useRef<HTMLElement | null>(null);
   /** The engine's completion of a product that does not resolve, as fixes. */
   const [fixes, setFixes] = useState<Fix[] | null>(null);
+  /** The ⋯ menu's "Old product branches", by the time it was asked. */
+  const [showBranches, setShowBranches] = useState(0);
+  /** A gear whose settings a fix asks for, opened on the map. */
+  const [focus, setFocus] = useState<{ name: string; at: number } | null>(null);
   /** "Take the product from the code" is open. */
   const [fromCode, setFromCode] = useState(false);
   /** A fix was applied: preview again once the product has changed. */
@@ -1463,24 +1472,50 @@ function ProductCard({
   // The crate behind an engine id, for linking a resolved gear to its page.
   const crateOf = (id: string) => preview?.gears.find((g) => g.id === id)?.crate_name ?? `cf-gears-${id}`;
 
-  const run = async (write: boolean): Promise<ProductPreview | null> => {
+  /** A save refused because the description changed since this tab read it
+   *  (ADR-0053 §1): both texts, for the person to choose. */
+  const [conflict, setConflict] = useState<ProductDescriptionConflict | null>(null);
+  /** The text of the revision Studio keeps, to tell a changed product from a saved one. */
+  const [keptText, setKeptText] = useState<string | null>(null);
+  useEffect(() => {
+    let live = true;
+    api
+      .productDescription(token, projectId)
+      .then((d) => live && setKeptText(d.latest?.text ?? null))
+      .catch(() => undefined);
+    return () => {
+      live = false;
+    };
+  }, [token, projectId]);
+
+  /** `write` saves the composed description as the project's next revision,
+   *  which Studio keeps (ADR-0053); `publish` also writes it to the
+   *  repository. `base` overrides the revision the save is made against --
+   *  "keep mine" after a conflict. */
+  const run = async (write: boolean, publish = false, base?: number): Promise<ProductPreview | null> => {
     setBusy(write ? "save" : "preview");
     setError(null);
     try {
+      const baseRevision = base ?? record?.description?.revision;
       const result = await api.previewProduct(token, projectId, {
         product_id: productId,
         name: projectName,
         gears: picks,
         profile,
         config: product.config,
-        ...(write ? { write: true } : {}),
+        ...(write ? { write: true, ...(baseRevision !== undefined ? { base_revision: baseRevision } : {}) } : {}),
+        ...(write && publish ? { publish: true } : {}),
       });
       setPreview(result);
       setAsked(question);
+      setConflict(null);
+      if (write && result.description_revision) setKeptText(result.product_gdl);
       await product.refresh();
       return result;
     } catch (cause) {
-      setError(errText(cause));
+      const stale = descriptionConflictOf(cause);
+      if (stale) setConflict(stale);
+      else setError(errText(cause));
       return null;
     } finally {
       setBusy(null);
@@ -1488,24 +1523,21 @@ function ProductCard({
   };
 
   /** The last step of the page, and the first of the desktop's: the product's
-   *  description saved to the project's repository, then the desktop Studio
-   *  opened on the project -- it clones the sources and opens product.gdl in
-   *  the Gearbox perspective, bringing in the branch it was saved on. A web
-   *  session cannot take this on: Gearbox is the desktop's. A product already
-   *  saved and unchanged is opened as it is. */
+   *  description saved in Studio, then the desktop Studio opened on the
+   *  project -- it clones the sources, writes the latest revision into the
+   *  checkout and opens product.gdl in the Gearbox perspective (ADR-0053 §2).
+   *  A web session cannot take this on: Gearbox is the desktop's. A product
+   *  already saved and unchanged is opened as it is. */
   const desktop = useDesktopLauncher();
-  const openOnDesktop = (branch: string | undefined) =>
-    desktop.launch(
-      desktopLink({ id: projectId, name: projectName, product: record?.written?.path ?? "product.gdl", branch }),
-    );
+  const savedPath = record?.description?.path ?? record?.written?.path ?? "product.gdl";
+  const isSaved = !!(record?.description || record?.written);
+  const openOnDesktop = () => desktop.launch(desktopLink({ id: projectId, name: projectName, product: savedPath }));
   const buildInTheia = async () => {
-    let branch = record?.written?.branch;
-    if (!branch || stale || !preview) {
+    if (!isSaved || stale || !preview) {
       const saved = await run(true);
-      if (!saved?.written) return;
-      branch = saved.written.branch;
+      if (!saved?.description_revision && !saved?.written) return;
     }
-    openOnDesktop(branch);
+    openOnDesktop();
   };
 
   // Completion replaced the picks: show at once what the engine makes of them.
@@ -1524,11 +1556,12 @@ function ProductCard({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [product.loaded, picks.length]);
 
-  // A fix changed the product: check it again.
+  // The product changed -- a pick, a setting, a fix, the profile: check it
+  // again. There is no button for it; the verdict is always the current one.
   useEffect(() => {
-    if (!recheck.current || picks.length === 0) return;
+    if (!product.loaded || !asked0.current || picks.length === 0) return;
     recheck.current = false;
-    const timer = setTimeout(() => void run(false), 450);
+    const timer = setTimeout(() => void run(false), 600);
     return () => clearTimeout(timer);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [question]);
@@ -1543,8 +1576,8 @@ function ProductCard({
     let live = true;
     api
       .completeProduct(token, picks, product.config)
-      .then((done) => live && setFixes(fixesFrom(picks, product.config, done)))
-      .catch(() => live && setFixes([]));
+      .then((done) => live && setFixes([...fixesFrom(picks, product.config, done), ...productionFixes(picks, preview.diagnostics)]))
+      .catch(() => live && setFixes(productionFixes(picks, preview.diagnostics)));
     return () => {
       live = false;
     };
@@ -1557,6 +1590,14 @@ function ProductCard({
 
   const applyOne = (fix: Fix) => {
     recheck.current = true;
+    if (fix.kind === "setup") {
+      setFocus({ name: fix.gear, at: Date.now() });
+      setTimeout(
+        () => document.querySelector(`[data-gear-config] [data-gear="${fix.gear}"]`)?.scrollIntoView({ behavior: "smooth", block: "center" }),
+        100,
+      );
+      return;
+    }
     if (fix.kind === "config") product.setField(fix.gear, fix.field, fix.value);
     else if (fix.kind === "remove") product.toggle(fix.gear);
     else product.setPicks((current) => applyFix(current, product.config, fix).picks);
@@ -1569,7 +1610,7 @@ function ProductCard({
     if (command.kind === "preview") void run(false);
     if (command.kind === "fix" && fixes && fixes.length > 0) document.getElementById("product-fixes")?.focus();
     if (command.kind === "build") void buildInTheia();
-    if (command.kind === "open") openOnDesktop(record?.written?.branch);
+    if (command.kind === "open") openOnDesktop();
     if (command.kind === "take-from-code") setFromCode(true);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [command?.at]);
@@ -1584,11 +1625,11 @@ function ProductCard({
 
   const inCode = code.report ? codeGears(code.report) : [];
   const diff = codeDiff(picks, inCode);
-  const resolvesNow = !!preview?.ok && !stale;
+  // Unsaved: the product.gdl on screen is not the revision Studio keeps.
+  const changed = !isSaved || (preview !== null && !stale && keptText !== null && preview.product_gdl !== keptText);
 
   const errors = preview?.diagnostics.filter((d) => d.severity === "error").length ?? 0;
   const warnings = preview?.diagnostics.filter((d) => d.severity === "warning").length ?? 0;
-  const last = record?.last_preview;
 
   return (
     <section className="card" style={{ marginBottom: 16 }} ref={cardRef}>
@@ -1599,8 +1640,7 @@ function ProductCard({
           </h2>
           <p className="subtitle">
             The components this project ships as one product, composed and checked by the Gearbox
-            engine. Make it resolve, then build it in Studio-ide: that saves <code>product.gdl</code> to
-            the repository and opens the desktop Studio on it, in its Gearbox view.
+            engine, which checks it on every change. Save it, then open it in Studio-ide to build it.
           </p>
         </div>
         <span className="hint" style={{ fontSize: 11 }}>
@@ -1624,6 +1664,7 @@ function ProductCard({
           kept={kept}
           running={running}
           productAt={{ commit: record?.written?.commit_sha, updatedAt: record?.updated_at }}
+          focus={focus}
         />
       ) : (
         <>
@@ -1681,6 +1722,14 @@ function ProductCard({
         </div>
       )}
       {product.saveError && <div className="error">Not saved: {product.saveError}</div>}
+      {diff.add.length > 0 && !fromCode && (
+        <p className="hint" style={{ fontSize: 12, margin: "8px 0 0" }} data-from-code>
+          The code uses {diff.add.length} gear{diff.add.length === 1 ? "" : "s"} the product does not have.{" "}
+          <button type="button" className="link" onClick={() => setFromCode(true)}>
+            See them
+          </button>
+        </p>
+      )}
 
       <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap", marginTop: 12 }}>
         <select value={profile} onChange={(e) => product.setProfile(e.target.value)} aria-label="Deployment profile">
@@ -1690,50 +1739,57 @@ function ProductCard({
             </option>
           ))}
         </select>
-        <button className="primary" disabled={busy !== null || picks.length === 0} onClick={() => void run(false)}>
-          {busy === "preview" ? "Resolving…" : "Preview product"}
-        </button>
-        <button
-          className="ghost"
-          disabled={busy !== null || picks.length === 0}
-          title="Take out what the catalogue shows cannot run, add the plugins and hosts that are missing, then preview"
-          onClick={() => void product.complete()}
-        >
-          Make it resolve
-        </button>
-        {inCode.length > 0 && (
-          <button
-            className="ghost"
-            aria-expanded={fromCode}
-            title="The gears the project's code already depends on, read from its Cargo.toml files"
-            onClick={() => setFromCode((v) => !v)}
-          >
-            From the code ({inCode.length})
-          </button>
-        )}
-        <button
-          className={resolvesNow ? "primary" : "ghost"}
-          disabled={busy !== null || picks.length === 0}
-          title="Save product.gdl to the repository and open the desktop Studio on it: it clones the project and opens the product in the Gearbox view"
-          onClick={() => void buildInTheia()}
-          style={{ marginLeft: "auto" }}
-        >
-          {busy === "save" ? "Saving…" : "Build it in Studio-ide →"}
-        </button>
-        {desktop.missing && <DesktopMissingHint />}
-        {!preview && last && (
-          <span style={{ fontSize: 12 }}>
-            <span className={`badge ${last.ok ? "ok" : "failed"}`}>
-              {last.ok ? `resolved for ${last.profile}` : `did not resolve for ${last.profile}`}
-            </span>{" "}
-            <span style={{ opacity: 0.7 }}>
-              {last.errors} error{last.errors === 1 ? "" : "s"} · {last.warnings} warning
-              {last.warnings === 1 ? "" : "s"}
-              {last.applications.length > 0 ? ` · ${last.applications.join(", ")}` : ""}
-              {record?.updated_at ? ` · ${new Date(record.updated_at).toLocaleString()}` : ""}
+        <span style={{ fontSize: 12 }} data-product-verdict>
+          {busy === "preview" ? (
+            <span className="badge">checking…</span>
+          ) : preview && !stale ? (
+            <span className={`badge ${preview.ok ? "ok" : "failed"}`}>
+              {preview.ok ? `resolves for ${preview.profile}` : `${errors} error${errors === 1 ? "" : "s"}`}
             </span>
-          </span>
-        )}
+          ) : null}
+        </span>
+        <span style={{ marginLeft: "auto", display: "flex", gap: 8, alignItems: "center" }}>
+          <button
+            className={changed ? "primary" : "ghost"}
+            disabled={busy !== null || picks.length === 0 || !preview || stale || !changed}
+            title="Keep this product.gdl in Studio as the project's next revision: builds and the desktop take it from there. Nothing is written to the repository."
+            onClick={() => void run(true)}
+            data-product-save
+          >
+            {busy === "save" ? "Saving…" : changed ? "Save" : "Saved"}
+          </button>
+          <button
+            className={changed ? "ghost" : "primary"}
+            disabled={busy !== null || picks.length === 0}
+            title="Open the desktop Studio on this project, in its Gearbox view; an unsaved product is saved first"
+            onClick={() => void buildInTheia()}
+            data-product-open
+          >
+            Open in Studio-ide →
+          </button>
+          <details className="menu" style={{ position: "relative" }} data-product-more>
+            <summary className="ghost" aria-label="More" style={{ listStyle: "none", cursor: "pointer", padding: "4px 8px" }}>
+              ⋯
+            </summary>
+            <div
+              className="card"
+              style={{ position: "absolute", right: 0, zIndex: 5, padding: 6, minWidth: 220, display: "grid", gap: 4 }}
+            >
+              <button
+                className="ghost"
+                disabled={busy !== null || !preview || stale}
+                title="Save it, and write it to the repository too: onto one branch per product with one pull request, or onto the base branch when the repository takes changes that way (Sources tab)"
+                onClick={() => void run(true, true)}
+              >
+                Publish to the repository
+              </button>
+              <button className="ghost" onClick={() => setShowBranches((n) => n + 1)}>
+                Old product branches
+              </button>
+            </div>
+          </details>
+        </span>
+        {desktop.missing && <DesktopMissingHint />}
       </div>
       {error && <div className="error">{error}</div>}
 
@@ -1797,6 +1853,17 @@ function ProductCard({
         </div>
       )}
 
+      {preview && !preview.ok && !stale && (
+        <ul className="error" style={{ fontSize: 12, margin: "10px 0 0", paddingLeft: 18 }} data-product-errors>
+          {preview.diagnostics
+            .filter((d) => d.severity === "error")
+            .map((d, i) => (
+              <li key={`${d.code}-${i}`}>
+                <code>{d.code}</code> {d.message}
+              </li>
+            ))}
+        </ul>
+      )}
       {fixes && fixes.length > 0 && (
         <div
           id="product-fixes"
@@ -1805,11 +1872,19 @@ function ProductCard({
         >
           <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
             <b>
-              How to make it resolve — {fixes.length} fix{fixes.length === 1 ? "" : "es"} from the engine
+              To make it resolve — {fixes.length} fix{fixes.length === 1 ? "" : "es"}
             </b>
-            <button className="primary" style={{ marginLeft: "auto" }} disabled={busy !== null} onClick={() => void product.complete()}>
-              Apply all
-            </button>
+            {fixes.some((f) => f.kind !== "setup") && (
+              <button
+                className="primary"
+                style={{ marginLeft: "auto" }}
+                disabled={busy !== null}
+                // Each as listed: what is applied is what was read.
+                onClick={() => fixes.filter((f) => f.kind !== "setup").forEach(applyOne)}
+              >
+                Apply all
+              </button>
+            )}
           </div>
           <ul style={{ listStyle: "none", padding: 0, margin: 0 }}>
             {fixes.map((f) => (
@@ -1828,6 +1903,16 @@ function ProductCard({
                       Take out <ComponentLink nav={nav} name={f.gear} />
                     </>
                   )}
+                  {f.kind === "replace" && (
+                    <>
+                      Replace <ComponentLink nav={nav} name={f.gear} /> with <ComponentLink nav={nav} name={f.with} />
+                    </>
+                  )}
+                  {f.kind === "setup" && (
+                    <>
+                      Set up <ComponentLink nav={nav} name={f.gear} />: {f.fields.map((x) => <code key={x}>{x} </code>)}
+                    </>
+                  )}
                   {f.kind === "config" && (
                     <>
                       Set <code>{gearLabel(f.gear)}</code> · <code>{f.field}</code> ={" "}
@@ -1837,7 +1922,7 @@ function ProductCard({
                   <span style={{ opacity: 0.7 }}> — {f.reason}</span>
                 </span>
                 <button className="ghost" style={{ marginLeft: "auto" }} disabled={busy !== null} onClick={() => applyOne(f)}>
-                  Apply
+                  {f.kind === "setup" ? "Set up" : "Apply"}
                 </button>
               </li>
             ))}
@@ -1987,27 +2072,66 @@ function ProductCard({
         </div>
       )}
 
-      {(preview || record?.written) && (
-        <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap", marginTop: 8 }}>
-          {preview && (
-            <>
-              <button className="ghost" disabled={busy !== null || stale} onClick={() => void run(true)}>
-                {busy === "save" ? "Saving…" : "Save product.gdl to the repository"}
-              </button>
-            </>
-          )}
-          {record?.written && (
+      {conflict && (
+        <div className="error" data-description-conflict style={{ fontSize: 12 }}>
+          <p style={{ margin: "0 0 6px" }}>
+            The product&apos;s description changed since this page read it: revision {conflict.latest.revision} is the
+            latest ({conflict.latest.source === "studio" ? "saved" : conflict.latest.source}{" "}
+            <When iso={conflict.latest.created_at} />
+            ). Keep yours, or take it.
+          </p>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+            <div>
+              <b>Yours</b>
+              <pre style={{ fontSize: 11, maxHeight: 240, overflow: "auto" }}>{conflict.yours}</pre>
+            </div>
+            <div>
+              <b>Revision {conflict.latest.revision}</b>
+              <pre style={{ fontSize: 11, maxHeight: 240, overflow: "auto" }}>{conflict.latest.text}</pre>
+            </div>
+          </div>
+          <div style={{ display: "flex", gap: 8 }}>
+            <button className="ghost" disabled={busy !== null} onClick={() => void run(true, false, conflict.latest.revision)}>
+              Keep mine
+            </button>
             <button
               className="ghost"
-              title="Opens the desktop Studio on this project with the product in the Gearbox perspective: resolution, graph, lock and conflicts, and the GDL language checking the file as you edit"
-              onClick={() => openOnDesktop(record.written?.branch)}
+              disabled={busy !== null}
+              onClick={() => {
+                setConflict(null);
+                void product.refresh();
+              }}
             >
-              Open in Studio-ide
+              Take revision {conflict.latest.revision}
             </button>
-          )}
+          </div>
         </div>
       )}
-      {record?.written && (
+      {record?.description && (
+        <p className="hint" style={{ fontSize: 12 }} data-description-revision>
+          Studio keeps product.gdl as revision {record.description.revision}; builds and the desktop take it from
+          there, with the code of the branch they build.
+          {record.published ? (
+            <>
+              {" "}
+              Revision {record.published.revision} is published on <code>{record.published.branch}</code>
+              {record.published.pr_url ? (
+                <>
+                  {" "}
+                  in{" "}
+                  <a href={record.published.pr_url} target="_blank" rel="noreferrer">
+                    its pull request
+                  </a>
+                </>
+              ) : null}
+              .
+            </>
+          ) : (
+            " It is not in the repository until you publish it."
+          )}
+        </p>
+      )}
+      {!record?.description && record?.written && (
         <p className="hint" style={{ fontSize: 12 }}>
           {record.written.pr_url ? (
             <>
@@ -2021,14 +2145,141 @@ function ProductCard({
               product.gdl is committed on <code>{record.written.branch}</code> as{" "}
               <code>{record.written.commit_sha.slice(0, 7)}</code>.
             </>
-          )}{" "}
-          {record.written.branch.startsWith("product/")
-            ? "The repository takes changes as pull requests (Sources tab), so the description is on its own branch; the desktop Studio switches to it when it opens the product."
-            : "The desktop Studio opens it on the branch it checks out."}
+          )}
         </p>
       )}
+      <DescriptionInRepository
+        token={token}
+        projectId={projectId}
+        onTaken={() => void product.refresh()}
+        showBranches={showBranches}
+      />
       <p className="hint" data-deploys-moved>Where the product runs and its deploys: the project's Deploys tab.</p>
     </section>
+  );
+}
+
+/** The description in the repository (ADR-0053 §3, §5): a change merged into
+ *  the published file, offered as a new revision, and the `product/*`
+ *  branches from before Studio kept the description, which the project may
+ *  delete -- Studio deletes none. */
+function DescriptionInRepository({
+  token,
+  projectId,
+  onTaken,
+  showBranches,
+}: {
+  token: string;
+  projectId: string;
+  onTaken: () => void;
+  /** The ⋯ menu asked for the old `product/*` branches. */
+  showBranches: number;
+}) {
+  const [described, setDescribed] = useState<ProductDescription | null>(null);
+  const [branches, setBranches] = useState<{ branch: string; pr_url?: string | null; held: boolean }[] | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  useEffect(() => {
+    let live = true;
+    api
+      .productDescription(token, projectId)
+      .then((d) => live && setDescribed(d))
+      .catch(() => live && setDescribed(null));
+    return () => {
+      live = false;
+    };
+  }, [token, projectId]);
+  const change = described?.repository_change;
+  const take = async () => {
+    if (!change) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await api.saveProductDescription(token, projectId, {
+        base_revision: described?.latest?.revision ?? null,
+        text: change.text,
+        from_repository: true,
+      });
+      setDescribed(await api.productDescription(token, projectId));
+      onTaken();
+    } catch (cause) {
+      const stale = descriptionConflictOf(cause);
+      setError(stale ? `${stale.message}. Reload the page to compare again.` : errText(cause));
+    } finally {
+      setBusy(false);
+    }
+  };
+  const list = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      setBranches((await api.oldProductBranches(token, projectId)).items);
+    } catch (cause) {
+      setError(errText(cause));
+    } finally {
+      setBusy(false);
+    }
+  };
+  useEffect(() => {
+    if (showBranches > 0) void list();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [showBranches]);
+  if (!described) return null;
+  return (
+    <div data-description-repository style={{ fontSize: 12 }}>
+      {change && (
+        <div className="hint" data-description-repository-change>
+          <p style={{ margin: "4px 0" }}>
+            <code>{change.path}</code> on <code>{change.branch}</code> was changed in the repository since Studio
+            published it.
+          </p>
+          <details>
+            <summary style={{ cursor: "pointer" }}>Compare</summary>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+              <div>
+                <b>In the repository</b>
+                <pre style={{ fontSize: 11, maxHeight: 240, overflow: "auto" }}>{change.text}</pre>
+              </div>
+              <div>
+                <b>Revision {described.latest?.revision ?? "—"} in Studio</b>
+                <pre style={{ fontSize: 11, maxHeight: 240, overflow: "auto" }}>{described.latest?.text ?? ""}</pre>
+              </div>
+            </div>
+          </details>
+          <button className="ghost" disabled={busy} onClick={() => void take()}>
+            Take the repository&apos;s as revision {(described.latest?.revision ?? 0) + 1}
+          </button>
+        </div>
+      )}
+      {described.latest && (
+        <p className="hint" style={{ margin: "4px 0" }}>
+          {branches === null ? null : branches.length === 0 ? (
+            "No old product/* branches in the repository."
+          ) : (
+            <>
+              Branches from before Studio kept the description; delete them in the repository when you no longer
+              need them -- Studio deletes none:{" "}
+              {branches.map((b, i) => (
+                <span key={b.branch}>
+                  {i > 0 ? ", " : ""}
+                  <code>{b.branch}</code>
+                  {b.held ? " (Studio holds its description)" : ""}
+                  {b.pr_url ? (
+                    <>
+                      {" "}
+                      <a href={b.pr_url} target="_blank" rel="noreferrer">
+                        PR
+                      </a>
+                    </>
+                  ) : null}
+                </span>
+              ))}
+            </>
+          )}
+        </p>
+      )}
+      {error && <div className="error">{error}</div>}
+    </div>
   );
 }
 

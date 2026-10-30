@@ -644,6 +644,10 @@ pub struct BuildReportRequest {
     pub chart_ref: Option<String>,
     #[serde(default)]
     pub chart_version: Option<String>,
+    /// The revision of the product description it was built with, which
+    /// Studio keeps (ADR-0053 §2).
+    #[serde(default)]
+    pub description_revision: Option<i64>,
 }
 
 /// One image a build published.
@@ -782,10 +786,12 @@ async fn upsert_build(
         finished_at: req.finished_at,
         failure: req.failure,
         failure_step: req.failure_step,
+        step: None,
         outputs: req.outputs,
         images: req.images.into_iter().map(|i| (i.app, i.image)).collect(),
         chart_ref: req.chart_ref,
         chart_version: req.chart_version,
+        description_revision: req.description_revision,
     };
     let workspace = workspace.map(|w| w.to_string());
     let node = svc

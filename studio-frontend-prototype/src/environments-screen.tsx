@@ -22,6 +22,8 @@ import {
   type DeploymentStatus,
   type EnvironmentBinding,
   type ProjectTargets,
+  type ResearchHardware,
+  type ResearchProject,
   type Tenant,
 } from "./api";
 import {
@@ -36,6 +38,7 @@ import {
   environmentInput,
   environmentProblems,
   registryConnections,
+  researchConnections,
   namespaceFor,
   shortCommit,
   stateTone,
@@ -133,14 +136,161 @@ function StatusButton({ token, org, d }: { token: string; org: string; d: Deploy
   );
 }
 
-/** Add or change one environment. */
-function EnvironmentForm({
+/** A Research environment's place: the organization's Research connection,
+ *  one of its projects and, optionally, a hardware configuration, as the
+ *  integration service lists them (ADR-0049 §2). Typed by hand when Research
+ *  cannot be asked. */
+function ResearchFields({
   token,
   org,
+  input,
+  researches,
+  set,
+  shown,
+}: {
+  token: string;
+  org: string;
+  input: DeployEnvironmentInput;
+  researches: Connection[];
+  set: <K extends keyof DeployEnvironmentInput>(k: K, v: DeployEnvironmentInput[K]) => void;
+  shown: (f: EnvironmentField) => string | null;
+}) {
+  const [projects, setProjects] = useState<ResearchProject[] | null>(null);
+  const [hardware, setHardware] = useState<ResearchHardware[] | null>(null);
+  const [unreachable, setUnreachable] = useState<string | null>(null);
+  const connection = input.connection_id;
+  const project = input.research_project ?? "";
+  useEffect(() => {
+    if (!connection) return;
+    let live = true;
+    setProjects(null);
+    setUnreachable(null);
+    api
+      .researchProjects(token, org, connection)
+      .then((r) => live && setProjects(r.items))
+      .catch((e) => live && (setProjects([]), setUnreachable(errText(e))));
+    return () => {
+      live = false;
+    };
+  }, [token, org, connection]);
+  useEffect(() => {
+    if (!connection || !project || unreachable) return;
+    let live = true;
+    setHardware(null);
+    api
+      .researchHardware(token, org, connection, project)
+      .then((r) => live && setHardware(r.items))
+      .catch(() => live && setHardware([]));
+    return () => {
+      live = false;
+    };
+  }, [token, org, connection, project, unreachable]);
+  const typed = unreachable !== null || (projects !== null && projects.length === 0);
+  return (
+    <>
+      <label className="field">
+        Constructor Research connection
+        <select
+          value={connection}
+          onChange={(e) => set("connection_id", e.target.value)}
+          aria-label="Constructor Research connection"
+          aria-invalid={shown("connection_id") ? true : undefined}
+          data-research-connection
+        >
+          <option value="">{researches.length === 0 ? "No Research connection yet" : "Choose a connection"}</option>
+          {researches.map((c) => (
+            <option key={c.id} value={c.id}>
+              {c.label}
+            </option>
+          ))}
+        </select>
+        <span className="sub">
+          Your own sign-in to Research (Connections): builds and deploys run there with it, in your Research.
+        </span>
+        {shown("connection_id") && <span className="env-field-error">{shown("connection_id")}</span>}
+      </label>
+      {connection && (
+        <label className="field">
+          Research project
+          {typed ? (
+            <input
+              value={project}
+              onChange={(e) => set("research_project", e.target.value)}
+              placeholder="the Research project's id"
+              aria-label="Research project"
+              aria-invalid={shown("research_project") ? true : undefined}
+              data-research-project
+            />
+          ) : (
+            <select
+              value={project}
+              onChange={(e) => {
+                set("research_project", e.target.value);
+                set("research_hardware", null);
+              }}
+              aria-label="Research project"
+              aria-invalid={shown("research_project") ? true : undefined}
+              data-research-project
+            >
+              <option value="">{projects === null ? "Asking Research…" : "Choose a project"}</option>
+              {(projects ?? []).map((p) => (
+                <option key={p.id} value={p.id}>
+                  {p.name || p.id}
+                </option>
+              ))}
+            </select>
+          )}
+          <span className="sub">
+            Each Studio project runs there as one application per environment, named{" "}
+            <code>{"{project}-" + (input.name || "env")}</code>.
+          </span>
+          {unreachable && <span className="hint">Research could not list the projects ({unreachable}); type the id.</span>}
+          {shown("research_project") && <span className="env-field-error">{shown("research_project")}</span>}
+        </label>
+      )}
+      {connection && project && (
+        <label className="field">
+          Hardware
+          {hardware && hardware.length > 0 ? (
+            <select
+              value={input.research_hardware ?? ""}
+              onChange={(e) => set("research_hardware", e.target.value || null)}
+              aria-label="Hardware"
+              data-research-hardware
+            >
+              <option value="">Research&apos;s default</option>
+              {hardware.map((h) => (
+                <option key={h.id} value={h.id}>
+                  {h.name || h.id}
+                  {h.trial ? " — trial: Research ends what runs on it by its own rules" : ""}
+                </option>
+              ))}
+            </select>
+          ) : (
+            <input
+              value={input.research_hardware ?? ""}
+              onChange={(e) => set("research_hardware", e.target.value || null)}
+              placeholder="Research's default"
+              aria-label="Hardware"
+              data-research-hardware
+            />
+          )}
+        </label>
+      )}
+    </>
+  );
+}
+
+/** Add or change one environment. */
+export function EnvironmentForm({
+  token,
+  org,
+  ownedBy,
   editing,
   others,
   clusters,
   registries,
+  researches,
   projects,
   onDone,
   onCancel,
@@ -149,6 +299,10 @@ function EnvironmentForm({
 }: {
   token: string;
   org: string;
+  /** A project's own environment (ADR-0054): saved with the project, by its
+   *  members, never protected and listing no projects. Absent: the
+   *  organization's. */
+  ownedBy?: { projectId: string; projectName: string };
   /** The cluster a new environment starts on: the one selected above. */
   initialCluster?: string;
   editing: DeployEnvironment | null;
@@ -156,6 +310,8 @@ function EnvironmentForm({
   clusters: Connection[];
   /** The organization's registry connections (ADR-0048). */
   registries: Connection[];
+  /** The organization's Constructor Research connections (ADR-0049). */
+  researches: Connection[];
   projects: Tenant[];
   onDone: () => void;
   onCancel: () => void;
@@ -164,7 +320,9 @@ function EnvironmentForm({
   const [input, setInput] = useState<DeployEnvironmentInput>(() =>
     editing
       ? environmentInput(editing)
-      : { ...emptyEnvironment(), connection_id: initialCluster || (clusters.length === 1 ? clusters[0].id : "") },
+      : researches.some((c) => c.id === initialCluster)
+        ? { ...emptyEnvironment(), kind: "research", connection_id: initialCluster ?? "" }
+        : { ...emptyEnvironment(), connection_id: initialCluster || (clusters.length === 1 ? clusters[0].id : "") },
   );
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -180,18 +338,32 @@ function EnvironmentForm({
   const touch = (f: EnvironmentField) => setTouched((t) => (t.has(f) ? t : new Set(t).add(f)));
   const set = <K extends keyof DeployEnvironmentInput>(k: K, v: DeployEnvironmentInput[K]) => {
     setInput((i) => ({ ...i, [k]: v }));
-    if (k !== "description" && k !== "database" && k !== "protected" && k !== "database_image" && k !== "promote_from")
+    if (
+      k !== "description" &&
+      k !== "database" &&
+      k !== "protected" &&
+      k !== "database_image" &&
+      k !== "promote_from" &&
+      k !== "kind" &&
+      k !== "research_hardware"
+    )
       touch(k as EnvironmentField);
   };
   const patternIsDefault = (input.namespace_pattern ?? "").trim() === "" || input.namespace_pattern === DEFAULT_NAMESPACE_PATTERN;
-  const examples = (projects.length > 0 ? projects.slice(0, 3).map((p) => p.name) : ["Studio Web"]).map((p) =>
+  const examples = (
+    ownedBy ? [ownedBy.projectName] : projects.length > 0 ? projects.slice(0, 3).map((p) => p.name) : ["Studio Web"]
+  ).map((p) =>
     namespaceFor(input.namespace_pattern ?? "", p, input.name || "dev"),
   );
   const save = async () => {
     setBusy(true);
     setError(null);
     try {
-      if (editing) await api.updateEnvironment(token, org, editing.id, input);
+      if (ownedBy) {
+        const own = { ...input, protected: false, projects: null };
+        if (editing) await api.updateProjectEnvironment(token, ownedBy.projectId, editing.id, own);
+        else await api.createProjectEnvironment(token, ownedBy.projectId, own);
+      } else if (editing) await api.updateEnvironment(token, org, editing.id, input);
       else await api.createEnvironment(token, org, input);
       onDone();
     } catch (e) {
@@ -201,6 +373,20 @@ function EnvironmentForm({
     }
   };
   const restricted = input.projects != null;
+  const research = input.kind === "research";
+  // Switching what runs the products starts its own fields over: a cluster's
+  // registry means nothing to Research, and Research's project nothing to a cluster.
+  const runOn = (kind: "kubernetes" | "research") =>
+    setInput((i) => ({
+      ...i,
+      kind,
+      connection_id: kind === "research" ? (researches.length === 1 ? researches[0].id : "") : clusters.length === 1 ? clusters[0].id : "",
+      registry: "",
+      registry_connection_id: null,
+      research_project: null,
+      research_hardware: null,
+      database: i.database === "shared" ? "none" : i.database,
+    }));
   return (
     <form
       className="card env-form"
@@ -211,7 +397,7 @@ function EnvironmentForm({
         if (!problem) void save();
       }}
     >
-      <h3>{editing ? `Change ${editing.name}` : "Add an environment"}</h3>
+      <h3>{editing ? `Change ${editing.name}` : ownedBy ? `Add an environment of ${ownedBy.projectName}'s own` : "Add an environment"}</h3>
       <label className="field">
         Name
         <input
@@ -227,6 +413,25 @@ function EnvironmentForm({
         Description
         <input value={input.description} onChange={(e) => set("description", e.target.value)} placeholder="optional" />
       </label>
+      <label className="field">
+        Runs on
+        <select
+          value={research ? "research" : "kubernetes"}
+          onChange={(e) => runOn(e.target.value as "kubernetes" | "research")}
+          aria-label="Runs on"
+          data-environment-kind
+        >
+          <option value="kubernetes">
+            {ownedBy
+              ? "A Kubernetes cluster: the project's own, or one the organization opened to its projects"
+              : "A Kubernetes cluster of the organization"}
+          </option>
+          <option value="research">Constructor Research: its hardware, its registry, its addresses</option>
+        </select>
+      </label>
+      {research && <ResearchFields token={token} org={org} input={input} researches={researches} set={set} shown={shown} />}
+      {!research && (
+      <>
       <label className="field">
         Cluster
         <select
@@ -255,7 +460,7 @@ function EnvironmentForm({
       {connecting && (
         <AddCluster
           token={token}
-          org={org}
+          org={ownedBy?.projectId ?? org}
           onCancel={() => setConnecting(false)}
           onAdded={(c) => {
             setConnecting(false);
@@ -304,7 +509,7 @@ function EnvironmentForm({
       {connectingRegistry && (
         <AddRegistry
           token={token}
-          org={org}
+          org={ownedBy?.projectId ?? org}
           onCancel={() => setConnectingRegistry(false)}
           onAdded={(c) => {
             setConnectingRegistry(false);
@@ -334,6 +539,8 @@ function EnvironmentForm({
           {shown("namespace_pattern") && <span className="env-field-error">{shown("namespace_pattern")}</span>}
         </label>
       </details>
+      </>
+      )}
       <label className="field">
         Database
         <select
@@ -342,8 +549,14 @@ function EnvironmentForm({
           aria-label="Database"
         >
           <option value="none">None: the product brings its own</option>
-          <option value="namespace">A Postgres of the product&apos;s own, in its namespace, with the databases its gears keep</option>
-          <option value="shared">The environment&apos;s shared Postgres — recorded only, not handed to the chart yet</option>
+          <option value="namespace">
+            {research
+              ? "A Postgres service of the product's own in its Research application, with the databases its gears keep"
+              : "A Postgres of the product's own, in its namespace, with the databases its gears keep"}
+          </option>
+          {!research && (
+            <option value="shared">The environment&apos;s shared Postgres — recorded only, not handed to the chart yet</option>
+          )}
         </select>
       </label>
       {input.database === "namespace" && (
@@ -373,15 +586,80 @@ function EnvironmentForm({
             ))}
         </select>
       </label>
-      <label className="env-check">
-        <input type="checkbox" checked={input.protected} onChange={(e) => set("protected", e.target.checked)} /> Protected: a
-        deploy waits for an organization administrator&apos;s approval
-      </label>
-      <label className="env-check">
-        <input type="checkbox" checked={!restricted} onChange={(e) => set("projects", e.target.checked ? null : [])} /> Every
-        project of the organization may deploy here
-      </label>
-      {restricted && (
+      {!research && (
+        <div className="field" data-environment-previews-settings>
+          <label className="env-check">
+            <input
+              type="checkbox"
+              checked={!!input.previews}
+              onChange={(e) => set("previews", e.target.checked ? { domain: "", ingress_class: null, ttl_hours: 72, max_live: 3 } : null)}
+            />{" "}
+            Previews: a project may try a build here in a namespace of its own, removed when it expires
+          </label>
+          {input.previews && (
+            <div
+              className="env-previews"
+              style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))", gap: 8 }}
+            >
+              <label className="field">
+                Preview domain
+                <input
+                  value={input.previews.domain}
+                  onChange={(e) => input.previews && set("previews", { ...input.previews, domain: e.target.value })}
+                  placeholder="preview.example.com — a wildcard DNS record to the cluster's ingress; empty: no address"
+                />
+              </label>
+              <label className="field">
+                Ingress class
+                <input
+                  value={input.previews.ingress_class ?? ""}
+                  onChange={(e) => input.previews && set("previews", { ...input.previews, ingress_class: e.target.value || null })}
+                  placeholder="the cluster's default"
+                />
+              </label>
+              <label className="field">
+                Lives for, hours
+                <input
+                  type="number"
+                  min={1}
+                  max={336}
+                  value={input.previews.ttl_hours ?? 72}
+                  onChange={(e) => input.previews && set("previews", { ...input.previews, ttl_hours: Number(e.target.value) })}
+                />
+              </label>
+              <label className="field">
+                At once, per project
+                <input
+                  type="number"
+                  min={1}
+                  max={20}
+                  value={input.previews.max_live ?? 3}
+                  onChange={(e) => input.previews && set("previews", { ...input.previews, max_live: Number(e.target.value) })}
+                />
+              </label>
+            </div>
+          )}
+          {shown("previews") && <span className="env-field-error">{shown("previews")}</span>}
+        </div>
+      )}
+      {ownedBy ? (
+        <p className="sub" data-own-environment-note>
+          Only {ownedBy.projectName} sees and deploys to it. An environment whose deploys need approval is the
+          organization&apos;s: ask an organization administrator for one.
+        </p>
+      ) : (
+        <>
+          <label className="env-check">
+            <input type="checkbox" checked={input.protected} onChange={(e) => set("protected", e.target.checked)} /> Protected:
+            a deploy waits for an organization administrator&apos;s approval
+          </label>
+          <label className="env-check">
+            <input type="checkbox" checked={!restricted} onChange={(e) => set("projects", e.target.checked ? null : [])} />{" "}
+            Every project of the organization may deploy here
+          </label>
+        </>
+      )}
+      {!ownedBy && restricted && (
         <ul className="env-projects">
           {projects.length === 0 && <li className="hint">No projects found.</li>}
           {projects.map((p) => (
@@ -421,6 +699,7 @@ function EnvironmentForm({
 export function OrgEnvironments({ token, org, workspaceIds }: { token: string; org: { id: string; name: string }; workspaceIds: string[] }) {
   const [environments, setEnvironments] = useState<DeployEnvironment[] | null>(null);
   const [mayManage, setMayManage] = useState(false);
+  const [openClusters, setOpenClusters] = useState<string[]>([]);
   const [connections, setConnections] = useState<Connection[]>([]);
   const [deployments, setDeployments] = useState<Deployment[]>([]);
   const [projects, setProjects] = useState<Tenant[]>([]);
@@ -463,6 +742,7 @@ export function OrgEnvironments({ token, org, workspaceIds }: { token: string; o
         if (!live) return;
         setEnvironments(envs.items);
         setMayManage(envs.may_manage);
+        setOpenClusters(envs.open_clusters?.connection_ids ?? []);
         setConnections(conns.items);
         setDeployments(deps.items);
       })
@@ -489,7 +769,10 @@ export function OrgEnvironments({ token, org, workspaceIds }: { token: string; o
 
   const clusters = useMemo(() => clusterConnections(connections), [connections]);
   const registries = useMemo(() => registryConnections(connections), [connections]);
-  const cards = useMemo(() => clusterCards(clusters, environments ?? [], deployments), [clusters, environments, deployments]);
+  const researches = useMemo(() => researchConnections(connections), [connections]);
+  // A Research connection is a place products run, beside the clusters.
+  const places = useMemo(() => [...clusters, ...researches], [clusters, researches]);
+  const cards = useMemo(() => clusterCards(places, environments ?? [], deployments), [places, environments, deployments]);
   const current: ClusterCard | null = cards.find((c) => c.id === selected) ?? cards[0] ?? null;
   const check = useCallback(
     (id: string) => {
@@ -744,6 +1027,7 @@ export function OrgEnvironments({ token, org, workspaceIds }: { token: string; o
               others={environments ?? []}
               clusters={clusters}
               registries={registries}
+              researches={researches}
               projects={projects}
               initialCluster={current.id}
               onCancel={() => setEditing(null)}
@@ -829,7 +1113,7 @@ export function OrgEnvironments({ token, org, workspaceIds }: { token: string; o
             What runs here
           </h4>
           {current.running.length === 0 ? (
-            <p className="empty">Nothing deployed to this cluster yet. A deploy is asked for from the desktop, after Generate.</p>
+            <p className="empty">Nothing deployed to this cluster yet. A project deploys from its Deploys tab, or from the desktop after Generate.</p>
           ) : (
             <ul className="env-list">
               {current.running.map((d) => (
@@ -855,12 +1139,99 @@ export function OrgEnvironments({ token, org, workspaceIds }: { token: string; o
           )}
         </section>
       )}
+      {clusters.length > 0 && (
+        <OpenClusters
+          key={openClusters.join(",")}
+          token={token}
+          org={org.id}
+          clusters={clusters}
+          open={openClusters}
+          mayManage={mayManage}
+          onSaved={(ids) => setOpenClusters(ids)}
+        />
+      )}
     </div>
   );
 }
 
+/** Which of the organization's clusters its projects may put environments of
+ *  their own on (ADR-0054 §2). A project may always use a cluster it holds. */
+function OpenClusters({
+  token,
+  org,
+  clusters,
+  open,
+  mayManage,
+  onSaved,
+}: {
+  token: string;
+  org: string;
+  clusters: Connection[];
+  open: string[];
+  mayManage: boolean;
+  onSaved: (ids: string[]) => void;
+}) {
+  const [picked, setPicked] = useState<string[]>(open);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const changed = [...picked].sort().join(",") !== [...open].sort().join(",");
+  const save = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      onSaved((await api.saveOpenClusters(token, org, picked)).connection_ids);
+    } catch (e) {
+      setError(errText(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <section className="card" data-open-clusters>
+      <h3>Clusters projects may use</h3>
+      <p className="sub">
+        A project adds environments of its own on these, with its own registry and namespaces, without an administrator. It
+        may always use a cluster it connected itself.
+      </p>
+      <ul className="env-projects">
+        {clusters.map((c) => (
+          <li key={c.id}>
+            <label>
+              <input
+                type="checkbox"
+                disabled={!mayManage}
+                checked={picked.includes(c.id)}
+                onChange={(e) => setPicked((p) => (e.target.checked ? [...p, c.id] : p.filter((id) => id !== c.id)))}
+                data-open-cluster={c.label}
+              />{" "}
+              {c.label} <span className="sub">{c.base_url}</span>
+            </label>
+          </li>
+        ))}
+      </ul>
+      {error && <div className="error">{error}</div>}
+      {mayManage && (
+        <button type="button" className="primary" disabled={busy || !changed} onClick={() => void save()}>
+          Save
+        </button>
+      )}
+    </section>
+  );
+}
+
 /** A project's environments, on its product card: bindings and deployments. */
-export function ProjectEnvironments({ token, projectId, profiles }: { token: string; projectId: string; profiles: readonly string[] }) {
+export function ProjectEnvironments({
+  token,
+  projectId,
+  profiles,
+  title = "Environments",
+}: {
+  token: string;
+  projectId: string;
+  profiles: readonly string[];
+  /** The heading: where the bindings sit decides what they are called. */
+  title?: string;
+}) {
   const [targets, setTargets] = useState<ProjectTargets | null>(null);
   const [bindings, setBindings] = useState<EnvironmentBinding[]>([]);
   const [deployments, setDeployments] = useState<Deployment[]>([]);
@@ -912,7 +1283,7 @@ export function ProjectEnvironments({ token, projectId, profiles }: { token: str
     <div className="envs env-project" data-project-environments>
       <style>{ENV_CSS}</style>
       <div className="card-head">
-        <h3>Environments</h3>
+        <h3>{title}</h3>
       </div>
       {error && <div className="error">{error}</div>}
       {targets === null ? (

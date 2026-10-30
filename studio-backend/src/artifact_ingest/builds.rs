@@ -20,12 +20,13 @@ use serde_json::{Map, Value, json};
 use crate::connectors::sdk::ownership::NotOwned;
 
 /// Where a build ran. `ci` is a pipeline's build, recorded from the
-/// `studio-build.json` it uploaded (ADR-0048 §4).
-pub const WHERE: [&str; 4] = ["desktop", "session", "ci", "studio"];
+/// `studio-build.json` it uploaded (ADR-0048 §4); `research` one Studio
+/// prepared and Constructor Research compiled (ADR-0049 §3).
+pub const WHERE: [&str; 5] = ["desktop", "session", "ci", "studio", "research"];
 
 /// Where only Studio records a build from: a pipeline's manifest, or a build
 /// it ran in the organization's cluster. Nobody reports one through REST.
-pub const RECORDED_BY_STUDIO: [&str; 2] = ["ci", "studio"];
+pub const RECORDED_BY_STUDIO: [&str; 3] = ["ci", "studio", "research"];
 
 /// The workflow artifact a product's pipeline uploads its manifest in, and
 /// the file inside it.
@@ -65,6 +66,9 @@ pub struct BuildReport {
     pub failure: Option<String>,
     /// The step it failed in (`protoc`, `compile`, `link`).
     pub failure_step: Option<String>,
+    /// The step it is in while it runs: a Studio build's `prepare`, `build`
+    /// or `publish`. Dropped once it ends.
+    pub step: Option<String>,
     /// The images it built, `name:tag` or with a digest.
     pub outputs: Vec<String>,
     /// The images it published, by application: `(app, image)`, the image
@@ -73,6 +77,9 @@ pub struct BuildReport {
     /// The chart it published: `oci://…` and its version.
     pub chart_ref: Option<String>,
     pub chart_version: Option<String>,
+    /// The revision of the product description it was built with, which
+    /// Studio keeps (ADR-0053 §2), beside `commit`.
+    pub description_revision: Option<i64>,
 }
 
 /// The id of a pipeline's build: its run's.
@@ -91,6 +98,8 @@ struct Manifest {
     #[serde(default)]
     images: Vec<ManifestImage>,
     chart: Option<ManifestChart>,
+    /// The description revision a CI build fetched from Studio (ADR-0053 §2).
+    description_revision: Option<i64>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -131,10 +140,12 @@ pub fn manifest_report(
         finished_at: None,
         failure: None,
         failure_step: None,
+        step: None,
         outputs: m.images.iter().map(|i| i.image.clone()).collect(),
         images: m.images.into_iter().map(|i| (i.app, i.image)).collect(),
         chart_ref: m.chart.as_ref().map(|c| c.reference.clone()),
         chart_version: m.chart.map(|c| c.version),
+        description_revision: m.description_revision,
     })
 }
 
@@ -436,6 +447,14 @@ pub fn record(
             None
         }),
     );
+    put(
+        "step",
+        json!(if finished {
+            None
+        } else {
+            clean(report.step.as_deref(), "step", 100)?
+        }),
+    );
     if !outputs.is_empty() {
         put("outputs", json!(outputs));
     }
@@ -443,6 +462,16 @@ pub fn record(
         put("images", json!(images));
     }
     put("chart", json!(chart));
+    // The description beside the code (ADR-0053 §2): what the start named,
+    // unless the end names it again.
+    put(
+        "description_revision",
+        json!(report.description_revision.filter(|r| *r > 0).or_else(|| {
+            earlier
+                .and_then(|e| e.get("description_revision"))
+                .and_then(Value::as_i64)
+        })),
+    );
     // Who started it stays who started it: the end may come from the same
     // person on another connection, never from someone else's report.
     put(

@@ -53,6 +53,9 @@ use tracing::warn;
 pub const CORPUS_SOURCE_ID: &str = "gears-rust";
 
 const DEFAULT_CORPUS_REF: &str = "main";
+
+/// Previews run one at a time; see [`Gearbox::preview`].
+static PREVIEW_TURNS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
 const DEFAULT_REFRESH: Duration = Duration::from_secs(600);
 /// How often the platform's gear repositories are listed again. A list read
 /// is one metadata row; a change is checked out on the next use.
@@ -547,6 +550,9 @@ pub struct Change {
     pub gear: String,
     pub added: bool,
     pub reason: String,
+    /// A picked gear kept with configuration it has yet to be given: the
+    /// fields to set. Not a change made -- the product's to make.
+    pub needs: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -680,9 +686,27 @@ impl EngineCatalogue {
     /// when something it must share a binary with is, or — for a host — when
     /// every plugin it could take is.
     fn dead(&self) -> BTreeMap<String, Dead> {
+        self.dead_given(&BTreeSet::new(), &GearConfig::new())
+    }
+
+    /// [`dead`](Self::dead) for one product: a gear it picked is not ruled
+    /// out for configuration it has yet to be given -- picking it is the
+    /// product's word that it will be configured, and dropping it again on
+    /// every completion takes away what the product asked for (an OIDC
+    /// sign-in, say, leaving none) -- and the fields the product does set
+    /// are not missing.
+    fn dead_given(&self, picked: &BTreeSet<String>, config: &GearConfig) -> BTreeMap<String, Dead> {
         let mut dead: BTreeMap<String, Dead> = BTreeMap::new();
         for g in self.gears.values() {
-            let unset = self.unset_config(g);
+            let set_here = config.get(&self.pick_name(g));
+            let unset: Vec<String> = if picked.contains(&g.id) {
+                Vec::new()
+            } else {
+                self.unset_config(g)
+                    .into_iter()
+                    .filter(|f| !set_here.is_some_and(|c| c.contains_key(f)))
+                    .collect()
+            };
             if !unset.is_empty() {
                 dead.insert(g.id.clone(), Dead::NeedsConfig(unset));
             } else if g.fills.is_some() && self.host_of(g).is_none() {
@@ -795,7 +819,12 @@ fn dead_reason(catalogue: &EngineCatalogue, why: &Dead) -> String {
 /// product is for. The engine still has the last word — the caller resolves
 /// the result.
 pub fn complete(catalogue: &EngineCatalogue, picked: &[String], config: &GearConfig) -> Completion {
-    let dead = catalogue.dead();
+    let chosen: BTreeSet<String> = picked
+        .iter()
+        .filter_map(|n| catalogue.find(n.trim()))
+        .map(|g| g.id.clone())
+        .collect();
+    let dead = catalogue.dead_given(&chosen, config);
     let mut config = config.clone();
     let crate_of = |id: &str| catalogue.pick_name_of(id);
     let mut changes: Vec<Change> = Vec::new();
@@ -812,6 +841,7 @@ pub fn complete(catalogue: &EngineCatalogue, picked: &[String], config: &GearCon
                     gear: name.to_string(),
                     added: false,
                     reason: "no gear.gdl describes it yet, so it cannot be composed".to_string(),
+                    needs: Vec::new(),
                 });
             }
             continue;
@@ -821,8 +851,26 @@ pub fn complete(catalogue: &EngineCatalogue, picked: &[String], config: &GearCon
                 gear: catalogue.pick_name(g),
                 added: false,
                 reason: dead_reason(catalogue, why),
+                needs: Vec::new(),
             });
             continue;
+        }
+        let unset: Vec<String> = catalogue
+            .unset_config(g)
+            .into_iter()
+            .filter(|f| {
+                !config
+                    .get(&catalogue.pick_name(g))
+                    .is_some_and(|c| c.contains_key(f))
+            })
+            .collect();
+        if !unset.is_empty() {
+            changes.push(Change {
+                gear: catalogue.pick_name(g),
+                added: false,
+                reason: format!("needs configuration: {} — set it below", unset.join(", ")),
+                needs: unset,
+            });
         }
         if !set.contains(&g.id) {
             set.push(g.id.clone());
@@ -859,6 +907,7 @@ pub fn complete(catalogue: &EngineCatalogue, picked: &[String], config: &GearCon
                             "{} needs a plugin; this one runs with no configuration",
                             crate_of(host_id)
                         ),
+                        needs: Vec::new(),
                     });
                     added = true;
                 }
@@ -882,6 +931,7 @@ pub fn complete(catalogue: &EngineCatalogue, picked: &[String], config: &GearCon
                     gear: catalogue.pick_name(h),
                     added: true,
                     reason: "the REST gears need a REST host to serve their routes".to_string(),
+                    needs: Vec::new(),
                 });
                 added = true;
             }
@@ -927,6 +977,7 @@ pub fn complete(catalogue: &EngineCatalogue, picked: &[String], config: &GearCon
                     crate_of(host_id),
                     plugin_vendor(p, None).unwrap_or_default()
                 ),
+                needs: Vec::new(),
             });
         }
     }
@@ -1432,16 +1483,19 @@ fn answer_gdl(result: &Value) -> anyhow::Result<String> {
 /// request, shut down. Returns the request's whole response. Blocking.
 fn rpc_once(
     bin: &Path,
-    root: &Path,
+    roots: &[&Path],
     workspace: &Path,
     method: &str,
     params: Value,
 ) -> anyhow::Result<Value> {
     use std::io::{BufRead, BufReader, Write};
 
-    let mut child = Command::new(bin)
-        .args(["rpc", "--stdio", "--root"])
-        .arg(root)
+    let mut cmd = Command::new(bin);
+    cmd.args(["rpc", "--stdio"]);
+    for root in roots {
+        cmd.arg("--root").arg(root);
+    }
+    let mut child = cmd
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -1512,7 +1566,7 @@ fn rpc_once(
     let outcome = (|| {
         send(
             serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
-                "roots": [root.to_string_lossy()],
+                "roots": roots.iter().map(|r| r.to_string_lossy()).collect::<Vec<_>>(),
                 "workspace": workspace.to_string_lossy(),
                 "allow_writes": true,
             }}),
@@ -1790,10 +1844,13 @@ pub fn render_product_gdl_from(
          \x20   # Where the gears that keep data keep it: one Postgres per profile\n\
          \x20   # (GDL 1.1). The password is only ever a `${{NAME}}` the deployment\n\
          \x20   # sets; change the host and user to the server you run.\n\
+         \x20   # `dev` and `local` run on a machine: development profiles, so the\n\
+         \x20   # production rules (accept-all sign-in, ...) warn there instead of\n\
+         \x20   # failing. `prod` is held to them.\n\
          \x20   profiles = [\n\
-         \x20       embedded(id = \"dev\",\n\
+         \x20       embedded(id = \"dev\", development = True,\n\
          \x20                database = {local_db}),\n\
-         \x20       self_hosted(id = \"local\", host = {id}, worker_discovery = \"directory\",\n\
+         \x20       self_hosted(id = \"local\", development = True, host = {id}, worker_discovery = \"directory\",\n\
          \x20                   target_dir = \"target\",\n\
          \x20                   database = {local_db}),\n\
          \x20       kubernetes(id = \"prod\", discovery = \"static\", namespace = {id},\n\
@@ -2047,6 +2104,90 @@ pub struct Preview {
     pub composition: Composition,
     pub resolution: Resolution,
     pub corpus_commit: Option<String>,
+    /// What the resolved gears run on besides the product's own binaries.
+    pub infrastructure: Vec<Technology>,
+}
+
+/// Something a product's gears need running beside them: the profile's
+/// Postgres, an identity provider, a store of their own.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct Technology {
+    /// `postgres`, `oidc`, `keycloak`, `clickhouse`, ...
+    pub id: String,
+    pub name: String,
+    /// What it is for, in one line.
+    pub why: String,
+    /// The gears that need it, by crate name.
+    pub gears: Vec<String>,
+}
+
+/// Plugins that talk to a service of their own, by the end of their crate
+/// name. A gear says it keeps data (`db`, the profile's Postgres) in its
+/// gear.gdl; a service a plugin talks to it says only in its configuration,
+/// so these are named here.
+const PLUGIN_SERVICES: &[(&str, &str, &str, &str)] = &[
+    (
+        "oidc-authn-plugin",
+        "oidc",
+        "OIDC identity provider",
+        "signs people in: the issuer whose tokens the product trusts",
+    ),
+    (
+        "keycloak-idp-plugin",
+        "keycloak",
+        "Keycloak",
+        "keeps tenants and users, through its admin API",
+    ),
+    (
+        "clickhouse-usage-collector-plugin",
+        "clickhouse",
+        "ClickHouse",
+        "stores usage records",
+    ),
+    (
+        "timescaledb-usage-collector-plugin",
+        "timescaledb",
+        "TimescaleDB",
+        "stores usage records",
+    ),
+];
+
+/// What `gears` (engine ids, as a resolution lists them) need running beside
+/// the product: the profile's Postgres for every gear that keeps data, and
+/// the services the plugins among them talk to.
+pub fn infrastructure(catalogue: &EngineCatalogue, gears: &[String]) -> Vec<Technology> {
+    let mut out: Vec<Technology> = Vec::new();
+    let mut add =
+        |id: &str, name: &str, why: &str, gear: String| match out.iter_mut().find(|t| t.id == id) {
+            Some(t) if !t.gears.contains(&gear) => t.gears.push(gear),
+            Some(_) => {}
+            None => out.push(Technology {
+                id: id.to_string(),
+                name: name.to_string(),
+                why: why.to_string(),
+                gears: vec![gear],
+            }),
+        };
+    for id in gears {
+        let Some(g) = catalogue.gears.get(id).or_else(|| catalogue.find(id)) else {
+            continue;
+        };
+        let crate_name = catalogue.pick_name(g);
+        if g.runtime_caps.iter().any(|c| c == "db") {
+            add(
+                "postgres",
+                "PostgreSQL",
+                "the profile's database: each gear that keeps data has its own schema there",
+                crate_name.clone(),
+            );
+        }
+        for (suffix, tid, name, why) in PLUGIN_SERVICES {
+            if crate_name.ends_with(suffix) {
+                add(tid, name, why, crate_name.clone());
+            }
+        }
+    }
+    out
 }
 
 #[derive(Debug, Clone)]
@@ -2617,8 +2758,9 @@ pub struct Gearbox {
     /// `gearbox --version`, asked once: the binary does not change under a
     /// running process, and the status page asked it on every load.
     version: std::sync::OnceLock<String>,
-    /// Recent previews' answers.
-    evaluations: std::sync::Mutex<Evaluations>,
+    /// Recent previews' answers, shared with the engine task that keeps one
+    /// after its request is gone.
+    evaluations: Arc<std::sync::Mutex<Evaluations>>,
 }
 
 /// A project's own product description, as its repository holds it.
@@ -2703,7 +2845,7 @@ impl Gearbox {
             checkouts: Arc::new(std::sync::Mutex::new(HashMap::new())),
             project_files: std::sync::Mutex::new(HashMap::new()),
             version: std::sync::OnceLock::new(),
-            evaluations: std::sync::Mutex::new(Evaluations::default()),
+            evaluations: Arc::new(std::sync::Mutex::new(Evaluations::default())),
         }
     }
 
@@ -3360,7 +3502,7 @@ impl Gearbox {
                 "destination_dir": scratch.join("gear").to_string_lossy(),
                 "dry_run": true,
             });
-            let answer = rpc_once(&bin, &root, &scratch, "gearbox/gear/scaffold", params);
+            let answer = rpc_once(&bin, &[&root], &scratch, "gearbox/gear/scaffold", params);
             let _ = std::fs::remove_dir_all(&scratch);
             answer
         })
@@ -3383,6 +3525,14 @@ impl Gearbox {
                 PROFILES.join(", ")
             );
         }
+        // One preview at a time: a product of some sixty gears takes about
+        // 1.5 GB to resolve, and the Product page asks again as picks change,
+        // so two at once took the backend past its 4 GiB limit on dev
+        // (OOMKilled). The next waits; a repeat is answered from `evaluations`.
+        let turn = PREVIEW_TURNS
+            .acquire()
+            .await
+            .context("the preview queue is closed")?;
         let started = Instant::now();
         let loaded = self.ensure(scope).await?;
         let corpus_ms = started.elapsed().as_millis();
@@ -3451,6 +3601,7 @@ impl Gearbox {
                 composition,
                 resolution: Resolution::default(),
                 corpus_commit: commit,
+                infrastructure: Vec::new(),
             });
         }
 
@@ -3483,18 +3634,24 @@ impl Gearbox {
                 let product_id = input.product_id.clone();
                 let product_path = input.product_path.clone();
                 let profile = input.profile.clone();
-                let r = tokio::task::spawn_blocking(move || {
-                    evaluate(&bin, &named, &product_id, &product_path, &gdl, &profile)
+                let evaluations = Arc::clone(&self.evaluations);
+                // The engine outlives a request the gateway gave up on (its
+                // limit is 30 s; a product of sixty gears can take longer):
+                // the run keeps its turn and its answer, so the person's
+                // retry is answered from `evaluations` instead of starting over.
+                tokio::task::spawn_blocking(move || {
+                    let _turn = turn;
+                    let r = evaluate(&bin, &named, &product_id, &product_path, &gdl, &profile)?;
+                    if let Some(k) = key {
+                        evaluations
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .put(k, r.clone());
+                    }
+                    anyhow::Ok(r)
                 })
                 .await
-                .context("engine task")??;
-                if let Some(k) = key {
-                    self.evaluations
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner())
-                        .put(k, r.clone());
-                }
-                r
+                .context("engine task")??
             }
         };
         tracing::info!(
@@ -3504,18 +3661,22 @@ impl Gearbox {
             gears = input.gears.len(),
             "gearbox: preview evaluated"
         );
+        let gears: Vec<String> = resolution.gears.iter().map(|g| g.id.clone()).collect();
+        let infrastructure = infrastructure(catalogue, &gears);
         Ok(Preview {
             product_gdl,
             composition,
             resolution,
             corpus_commit: commit,
+            infrastructure,
         })
     }
 }
 
 /// Where the image records the engine's commit: the `gearbox` stage writes it
-/// beside the binary it builds, because `gearbox --version` says only the
-/// crate's version, which has stayed `0.1.0` across every commit.
+/// beside the binary it downloads (the release's commit), because
+/// `gearbox --version` says only the crate's version, which has stayed `0.1.0`
+/// across every commit.
 const ENGINE_REVISION_FILE: &str = "/usr/local/share/gearbox/REVISION";
 
 /// The engine's commit: `STUDIO_GEARBOX_REV`, else the image's record.
@@ -3535,7 +3696,7 @@ pub fn engine_pin() -> (String, Option<String>) {
         .ok()
         .map(|s| s.trim().to_owned())
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "https://github.com/MikeFalcon77/gearbox.git".to_owned());
+        .unwrap_or_else(|| "https://github.com/constructorfabric/gearbox".to_owned());
     (repo, engine_revision())
 }
 
@@ -3583,67 +3744,68 @@ fn evaluate(
         if let Some(dir) = product_file.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        let mut root_args: Vec<String> = Vec::new();
+        let mut links: Vec<PathBuf> = Vec::new();
         for (id, dir) in roots {
             let link = scratch.join(id);
             link_dir(dir, &link)?;
-            root_args.push("--root".into());
-            root_args.push(link.to_string_lossy().into_owned());
+            links.push(link);
         }
         std::fs::write(&product_file, gdl)?;
-        let product = product_file.to_string_lossy().into_owned();
-
-        let mut args: Vec<String> = vec!["validate".into()];
-        args.extend(root_args.iter().cloned());
-        args.extend([
-            "--product".into(),
-            product.clone(),
-            "--format".into(),
-            "json".into(),
-        ]);
-        let mut resolve_args: Vec<String> = vec!["resolve".into()];
-        resolve_args.extend(root_args);
-        resolve_args.extend([
-            "--product".into(),
-            product,
-            "--profile".into(),
-            profile.into(),
-            "--format".into(),
-            "json".into(),
-        ]);
-        // One engine run at a time: both work in `scratch`, and two at once
-        // double the engine's peak memory inside the backend's own limit.
-        let validate = run_engine(bin, &args, Some(&scratch))?;
-        let parsed: Value = serde_json::from_str(&validate.stdout).with_context(|| {
-            format!(
-                "the engine's validation is not JSON: {}",
-                validate.stderr_tail()
-            )
-        })?;
-        let diagnostics = parse_diagnostics(&parsed, &scratch);
-        let diagnostics = relabel(diagnostics);
-        if diagnostics.iter().any(EngineDiagnostic::is_error) {
-            return Ok(Resolution {
-                diagnostics,
-                ..Resolution::default()
-            });
-        }
-
-        let resolve = run_engine(bin, &resolve_args, Some(&scratch))?;
-        let parsed: Value = serde_json::from_str(&resolve.stdout).with_context(|| {
-            format!(
-                "the engine's resolution is not JSON: {}",
-                resolve.stderr_tail()
-            )
-        })?;
-        let mut resolution = parse_resolution(&parsed, &scratch);
-        let mut all = diagnostics;
-        all.extend(relabel(resolution.diagnostics));
-        resolution.diagnostics = all;
-        Ok(resolution)
+        // One session, one request: `gearbox/product/resolve` answers what
+        // `validate` and then `resolve` did, from one scan of the roots. The
+        // scan is nearly all of the time (some 15 s for studio-web's roots);
+        // the two commands each made their own.
+        let links: Vec<&Path> = links.iter().map(PathBuf::as_path).collect();
+        let answer = rpc_once(
+            bin,
+            &links,
+            &scratch,
+            "gearbox/product/resolve",
+            serde_json::json!({
+                "path": product_file.to_string_lossy(),
+                "profile": profile,
+            }),
+        )?;
+        resolution_of(&answer, &scratch)
     })();
     let _ = std::fs::remove_dir_all(&scratch);
     result
+}
+
+/// A `gearbox/product/resolve` response as a resolution: `product` is what
+/// `gearbox resolve` prints, and `diagnostics` beside it every finding,
+/// validation's as well. A product the engine cannot evaluate is an error that
+/// still carries its diagnostics.
+fn resolution_of(answer: &Value, scratch: &Path) -> anyhow::Result<Resolution> {
+    if let Some(error) = answer.get("error") {
+        let Some(found) = error.pointer("/data/diagnostics") else {
+            bail!(
+                "the engine did not resolve the product: {}",
+                error
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("no message")
+            );
+        };
+        return Ok(Resolution {
+            diagnostics: relabel(parse_diagnostics(found, scratch)),
+            ..Resolution::default()
+        });
+    }
+    let result = answer
+        .get("result")
+        .ok_or_else(|| anyhow!("the engine's resolution has no result"))?;
+    let product = result
+        .get("product")
+        .ok_or_else(|| anyhow!("the engine's resolution has no product"))?;
+    let mut resolution = parse_resolution(product, scratch);
+    resolution.diagnostics = relabel(
+        result
+            .get("diagnostics")
+            .map(|d| parse_diagnostics(d, scratch))
+            .unwrap_or_default(),
+    );
+    Ok(resolution)
 }
 
 /// The scratch product file is `<id>/product.gdl`; the person knows it as the
@@ -4216,6 +4378,8 @@ mod tests {
             c.gears,
             [
                 "cf-gears-types-registry",
+                // picked, so kept: it is to be given its `mode`, not dropped
+                "cf-gears-event-broker",
                 "cf-gears-tenant-resolver",
                 // the host's plugin: rg-tr has the best priority but must run
                 // with resource-group, which needs authz-resolver, which
@@ -4234,15 +4398,16 @@ mod tests {
             .map(|ch| (ch.gear.as_str(), (ch.added, ch.reason.as_str())))
             .collect();
         assert!(!why["cf-gears-ledger"].0);
+        let broker = c
+            .changes
+            .iter()
+            .find(|ch| ch.gear == "cf-gears-event-broker")
+            .unwrap();
+        assert_eq!(broker.needs, ["mode"], "a default is not a missing field");
         assert!(
             why["cf-gears-resource-group"]
                 .1
                 .contains("cf-gears-authz-resolver")
-        );
-        assert!(why["cf-gears-event-broker"].1.contains("mode"));
-        assert!(
-            !why["cf-gears-event-broker"].1.contains("retention"),
-            "a default is not a missing field"
         );
         assert!(
             why["cf-gears-account-management"]
@@ -4251,6 +4416,42 @@ mod tests {
         );
         assert!(why["cf-gears-static-tr-plugin"].0);
         assert!(why["cf-gears-api-gateway"].1.contains("REST host"));
+    }
+
+    #[test]
+    fn a_product_needs_postgres_for_its_gears_that_keep_data_and_the_services_of_its_plugins() {
+        let c = corpus();
+        let ids: Vec<String> = c
+            .gears
+            .values()
+            .filter(|g| {
+                g.runtime_caps.iter().any(|x| x == "db")
+                    || g.package.crate_name.ends_with("oidc-authn-plugin")
+            })
+            .map(|g| g.id.clone())
+            .collect();
+        let t = infrastructure(&c, &ids);
+        let ids: Vec<&str> = t.iter().map(|t| t.id.as_str()).collect();
+        assert!(ids.contains(&"oidc"), "{t:?}");
+        let oidc = t.iter().find(|t| t.id == "oidc").unwrap();
+        assert_eq!(oidc.gears, ["cf-gears-oidc-authn-plugin"]);
+        assert!(infrastructure(&c, &[]).is_empty());
+    }
+
+    #[test]
+    fn a_picked_gear_is_configured_not_dropped_and_what_the_product_sets_counts() {
+        let picks = names(&["cf-gears-event-broker"]);
+        let c = complete(&corpus(), &picks, &GearConfig::new());
+        assert!(c.gears.contains(&"cf-gears-event-broker".to_string()));
+        assert_eq!(c.changes[0].needs, ["mode"]);
+        let mut config = GearConfig::new();
+        config
+            .entry("cf-gears-event-broker".into())
+            .or_default()
+            .insert("mode".into(), Value::String("kafka".into()));
+        let c = complete(&corpus(), &picks, &config);
+        assert!(c.gears.contains(&"cf-gears-event-broker".to_string()));
+        assert!(c.changes.iter().all(|ch| ch.needs.is_empty()));
     }
 
     #[test]
@@ -4530,8 +4731,12 @@ mod tests {
         assert!(gdl.contains("id = \"my-shop\""));
         assert!(gdl.contains("name = \"My \\\"Shop\\\"\""));
         assert!(gdl.contains("source(id = \"gears-rust\", at = path(\"../gears-rust\"))"));
-        assert!(gdl.contains("embedded(id = \"dev\","));
-        assert!(gdl.contains("self_hosted(id = \"local\", host = \"my-shop\""));
+        assert!(gdl.contains("embedded(id = \"dev\", development = True,"));
+        assert!(gdl.contains("self_hosted(id = \"local\", development = True, host = \"my-shop\""));
+        assert!(
+            gdl.contains("kubernetes(id = \"prod\", discovery"),
+            "prod stays a production profile"
+        );
         assert!(gdl.contains("kubernetes(id = \"prod\""));
         // Every profile names its Postgres (GBX0306 otherwise), with the
         // password as a reference only.
@@ -5128,6 +5333,44 @@ mod tests {
     }
 
     #[test]
+    fn one_rpc_answer_carries_every_finding_and_a_broken_product_still_says_why() {
+        let scratch = Path::new("/tmp/studio-gearbox-x");
+        let finding = |code: &str, severity: &str, uri: &str| {
+            json!({ "code": code, "severity": severity, "message": code,
+                    "location": { "uri": uri, "range": { "start": { "line": 3 } } } })
+        };
+        let answer = json!({ "result": {
+            "diagnostics": [
+                finding("GBX0215", "warning", "file:///var/lib/roots/a/gear.gdl"),
+                finding("GBX0325", "error", "file:///tmp/studio-gearbox-x/shop/product.gdl"),
+            ],
+            "product": {
+                "applications": [{ "name": "host", "kind": "host", "gears": ["a"] }],
+                "diagnostics": [finding("GBX0325", "error", "file:///tmp/studio-gearbox-x/shop/product.gdl")],
+            },
+        }});
+        let r = resolution_of(&answer, scratch).expect("a resolution");
+        assert_eq!(r.applications.len(), 1);
+        let codes: Vec<_> = r.diagnostics.iter().map(|d| d.code.as_str()).collect();
+        assert_eq!(
+            codes,
+            ["GBX0215", "GBX0325"],
+            "validation's findings too, once each"
+        );
+        assert_eq!(r.diagnostics[1].file.as_deref(), Some("product.gdl"));
+        assert_eq!(r.diagnostics[1].line, Some(4));
+
+        let broken = json!({ "error": { "code": -32053, "message": "could not be evaluated",
+            "data": { "diagnostics": [finding("GBX0102", "error", "file:///tmp/studio-gearbox-x/shop/product.gdl")] } } });
+        let r = resolution_of(&broken, scratch).expect("its findings");
+        assert!(r.applications.is_empty());
+        assert_eq!(r.diagnostics[0].code, "GBX0102");
+
+        let refused = json!({ "error": { "code": -32600, "message": "no session" } });
+        assert!(resolution_of(&refused, scratch).is_err());
+    }
+
+    #[test]
     fn a_catalogue_is_reused_while_every_root_is_at_the_commit_it_was_read_at() {
         let before = [checked_out("a", Some("1")), checked_out("b", Some("2"))];
         assert!(same_checkouts(&before, &before, true));
@@ -5196,5 +5439,118 @@ mod tests {
         }
         assert_eq!(kept.entries.len(), EVALUATIONS_KEPT, "bounded");
         assert!(kept.get(&k).is_none(), "the oldest answer went first");
+    }
+
+    /// The engine the images pin, run for real over a gear corpus and read
+    /// the way the portal reads it: the catalogue, a description Studio
+    /// writes, its validation and resolution in every profile, and a
+    /// scaffold. The parsers above take what they find and default the rest,
+    /// so an engine whose output changed shape shows up as empty fields, not
+    /// as an error; this asserts the fields are there.
+    ///
+    /// Ignored: it needs the engine and a checkout of the corpus. Run it when
+    /// the pin moves, with `GEARBOX_E2E_BIN` the release's `gearbox` and
+    /// `GEARBOX_E2E_CORPUS` a gears-rust checkout in a directory named
+    /// `gears-rust`: `cargo test pinned_engine -- --ignored`.
+    #[test]
+    #[ignore = "needs GEARBOX_E2E_BIN and GEARBOX_E2E_CORPUS"]
+    fn the_pinned_engine_reads_the_corpus_and_resolves_what_studio_writes() {
+        let var = |k: &str| PathBuf::from(std::env::var(k).unwrap_or_else(|_| panic!("{k}")));
+        let bin = var("GEARBOX_E2E_BIN");
+        let corpus = var("GEARBOX_E2E_CORPUS");
+        let roots = vec![(CORPUS_SOURCE_ID.to_string(), corpus.clone())];
+
+        let args: Vec<String> = vec![
+            "catalogue".into(),
+            "--root".into(),
+            corpus.to_string_lossy().into_owned(),
+            "--format".into(),
+            "json".into(),
+        ];
+        let out = run_engine(&bin, &args, None).expect("the engine runs");
+        let raw: Value = serde_json::from_str(&out.stdout)
+            .unwrap_or_else(|e| panic!("the catalogue is not JSON ({e}): {}", out.stderr_tail()));
+        let catalogue: EngineCatalogue =
+            serde_json::from_value(raw).expect("the catalogue has the expected shape");
+        assert!(
+            catalogue.unreadable_root(&roots).is_none(),
+            "{:?}",
+            catalogue.unreadable_root(&roots)
+        );
+        assert!(
+            catalogue.gears.len() > 20,
+            "{} gears",
+            catalogue.gears.len()
+        );
+        let gateway = &catalogue.gears["api-gateway"];
+        assert!(!gateway.package.crate_name.is_empty());
+        assert_eq!(gateway.source.as_deref(), Some(CORPUS_SOURCE_ID));
+        let plugin = &catalogue.gears["static-tr-plugin"];
+        assert_eq!(
+            catalogue.host_of(plugin).map(|g| g.id.as_str()),
+            Some("tenant-resolver")
+        );
+
+        // A sign-in a production profile accepts: static-authn-plugin in
+        // `accept_all` mode is refused there (GBX0325), as it should be.
+        let picked = names(&["api-gateway", "simple-user-settings", "oidc-authn-plugin"]);
+        let composition = compose(&catalogue, &picked);
+        for profile in PROFILES {
+            let gdl = render_product_gdl(
+                "my-shop",
+                "product.gdl",
+                "My Shop",
+                &composition,
+                profile,
+                None,
+                &BTreeMap::new(),
+            );
+            let resolution = evaluate(&bin, &roots, "my-shop", "product.gdl", &gdl, profile)
+                .expect("the engine evaluates the description");
+            assert!(
+                !resolution
+                    .diagnostics
+                    .iter()
+                    .any(EngineDiagnostic::is_error),
+                "{profile}: {:#?}\n{gdl}",
+                resolution.diagnostics
+            );
+            assert!(
+                !resolution.applications.is_empty(),
+                "{profile}: no applications"
+            );
+            assert!(
+                resolution
+                    .applications
+                    .iter()
+                    .all(|a| !a.name.is_empty() && !a.kind.is_empty() && !a.gears.is_empty()),
+                "{profile}: {:#?}",
+                resolution.applications
+            );
+            let resolved = resolution
+                .gears
+                .iter()
+                .find(|g| g.id == "api-gateway")
+                .unwrap_or_else(|| panic!("{profile}: api-gateway is not resolved"));
+            assert!(!resolved.crate_name.is_empty(), "{profile}");
+            assert!(!resolved.reasons.is_empty(), "{profile}");
+        }
+
+        let scratch = std::env::temp_dir().join(format!("gearbox-e2e-{}", uuid::Uuid::new_v4()));
+        let root = scratch.join(CORPUS_SOURCE_ID);
+        std::fs::create_dir_all(&root).expect("scratch");
+        let params = json!({
+            "id": "my-gear",
+            "name": "My gear",
+            "version": "0.1.0",
+            "kind": "service",
+            "plugin": null,
+            "destination_dir": scratch.join("gear").to_string_lossy(),
+            "dry_run": true,
+        });
+        let answer = rpc_once(&bin, &[&root], &scratch, "gearbox/gear/scaffold", params);
+        let _ = std::fs::remove_dir_all(&scratch);
+        let gdl = answer_gdl(&answer.expect("the engine answers")).expect("a scaffold");
+        assert!(gdl.contains("my-gear"), "{gdl}");
     }
 }

@@ -3,7 +3,7 @@ import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 
-import { checkoutOfFile, fileOnBranch, worktreeDirName } from "./product-branch";
+import { checkoutOfFile, descriptionFromBranch, fileOnBranch, isProductBranch, worktreeDirName } from "./product-branch";
 
 const BRANCH = "product/studioweb-77a0da49";
 
@@ -88,6 +88,49 @@ describe("a product saved on its own branch", () => {
     expect(main?.branch).toBe("main");
     expect(main?.worktreeOf).toBeUndefined();
     expect(await checkoutOfFile(path.join(scratch, "nowhere.gdl"))).toBeUndefined();
+  });
+
+  it("lends only the description of a product branch: the checkout keeps its branch and code (ADR-0053 §4)", async () => {
+    const file = await descriptionFromBranch(workspace, BRANCH, "product.gdl");
+    expect(file).toBe(path.join(checkout, "product.gdl"));
+    expect(fs.readFileSync(file as string, "utf8")).toBe("product studioweb {}");
+    expect(sh(checkout, "branch", "--show-current")).toBe("main");
+    expect(fs.existsSync(besides)).toBe(false);
+    expect(isProductBranch(BRANCH)).toBe(true);
+    expect(isProductBranch("release/1")).toBe(false);
+    // A copy edited here is the person's, and stays.
+    fs.writeFileSync(file as string, "product mine {}");
+    sh(checkout, "add", "product.gdl");
+    expect(await descriptionFromBranch(workspace, BRANCH, "product.gdl")).toBe(file);
+    expect(fs.readFileSync(file as string, "utf8")).toBe("product mine {}");
+    expect(await descriptionFromBranch(workspace, BRANCH, "nowhere.gdl")).toBeUndefined();
+  });
+
+  it("moves a checkout an earlier desktop left on the product branch back onto main, with only the description", async () => {
+    await fileOnBranch(workspace, BRANCH, "product.gdl", { inPlace: true });
+    expect(sh(checkout, "branch", "--show-current")).toBe(BRANCH);
+    // main moved on since the product was saved; a build left files untracked.
+    const origin = path.join(scratch, "origin");
+    fs.writeFileSync(path.join(origin, "README.md"), "studio-web, today");
+    sh(origin, "commit", "--quiet", "-am", "today");
+    fs.mkdirSync(path.join(checkout, ".gearbox"));
+    fs.writeFileSync(path.join(checkout, ".gearbox", "out"), "generated");
+
+    const file = await descriptionFromBranch(workspace, BRANCH, "product.gdl");
+    expect(file).toBe(path.join(checkout, "product.gdl"));
+    expect(sh(checkout, "branch", "--show-current")).toBe("main");
+    expect(fs.readFileSync(path.join(checkout, "README.md"), "utf8")).toBe("studio-web, today");
+    expect(fs.readFileSync(file as string, "utf8")).toBe("product studioweb {}");
+    expect(fs.existsSync(path.join(checkout, ".gearbox", "out"))).toBe(true);
+  });
+
+  it("keeps a checkout on the product branch when a tracked file there is changed", async () => {
+    await fileOnBranch(workspace, BRANCH, "product.gdl", { inPlace: true });
+    fs.writeFileSync(path.join(checkout, "README.md"), "edited");
+    const file = await descriptionFromBranch(workspace, BRANCH, "product.gdl");
+    expect(file).toBe(path.join(checkout, "product.gdl"));
+    expect(sh(checkout, "branch", "--show-current")).toBe(BRANCH);
+    expect(fs.readFileSync(path.join(checkout, "README.md"), "utf8")).toBe("edited");
   });
 
   it("leaves a desktop's checkout with uncommitted work alone", async () => {

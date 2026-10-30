@@ -11,9 +11,11 @@
 // distinct locks -- and every difference visible without editing anything, which
 // is the property `profiles = [...]` as a data field exists to buy.
 
-import { codicon, ReactWidget } from "@theia/core/lib/browser";
+import { codicon, ContextMenuRenderer, ReactWidget } from "@theia/core/lib/browser";
 import { CommandRegistry } from "@theia/core/lib/common";
+import { QuickInputService, type QuickPickItem } from "@theia/core/lib/common/quick-pick-service";
 import { inject, injectable, postConstruct } from "@theia/core/shared/inversify";
+import { Widget, WidgetManager } from "@theia/core/lib/browser";
 import React from "@theia/core/shared/react";
 
 import type { Choice } from "../../common/generated/Choice";
@@ -30,7 +32,6 @@ import { staleCorpusSource, type CorpusCopy } from "../create/corpus-source";
 import {
   DiagnosticsList,
   errorsIn,
-  summarise,
   worstFirst,
   worstOf,
 } from "../diagnostics/diagnostics-list";
@@ -53,11 +54,9 @@ import {
 } from "../shell/product-session-service";
 import {
   ADD_GEAR,
-  CLOSE_PRODUCT,
   NEW_GEAR,
   NEW_PRODUCT,
   OPEN_PRODUCT,
-  SHOW_CONFLICTS,
   SHOW_GENERATE,
 } from "../shell/session-command-ids";
 import { EngineConnectionService } from "../shell/engine-connection-service";
@@ -66,29 +65,31 @@ import { ProductEmptyState, emptyStateLists } from "./product-empty-state";
 import {
   ProductStatusStrip,
   draftStateOf,
+  healthLabel,
+  plural,
   productStatusOf,
-  type StripAction,
+  type ProductStatusBadge,
 } from "./product-status-strip";
+import { nextStepOf, profileLabel } from "./product-summary";
+import { GearboxMenus } from "../menus";
+import type { OpeningStage } from "../shell/opening-outcome";
 import { RevealPathLink } from "../reveal-link";
 import { RevealService } from "../reveal-service";
 import { SelectionService, type Selection } from "../shell/selection-service";
 import type { GearDescriptor } from "../../common/generated/GearDescriptor";
+import type { GearSelection } from "../../common/generated/GearSelection";
+import type { InclusionReason } from "../../common/generated/InclusionReason";
+import { pointKey, pointsOf } from "../../common/extension-points";
 import type { Message } from "@theia/core/shared/@lumino/messaging";
 
-/**
- * The stages of a product, in the order they are worked through.
- *
- * `generate` is deliberately absent: it is a view, and a tab that duplicated its
- * file plan and its Apply button would be a second place to answer the same
- * question. The strip links to it.
- */
-export type ProductSection = "overview" | "composition" | "topology" | "validation";
-
+/** One product workspace; old section names remain accepted by command adapters. */
+export type ProductSection = "composition" | "topology" | "checks" | "generate" | "settings";
+export type ProductSectionInput = ProductSection | "overview" | "validation";
 const SECTIONS: readonly { readonly id: ProductSection; readonly label: string }[] = [
-  { id: "overview", label: "Overview" },
   { id: "composition", label: "Composition" },
   { id: "topology", label: "Topology" },
-  { id: "validation", label: "Validation" },
+  { id: "checks", label: "Checks" },
+  { id: "generate", label: "Generate" },
 ];
 
 @injectable()
@@ -105,6 +106,14 @@ export class ProductWidget extends ReactWidget {
   // Read only. Overview reports whether a plan exists; it never asks for one --
   // see `renderGenerationStatus`.
   @inject(GenerateService) protected readonly generate!: GenerateService;
+  /**
+   * Constructor Studio: Generate is a section of this view, and the section is
+   * the Generate widget itself -- its plan, Apply, Build and Run, Deploy --
+   * attached here rather than rewritten as a component, so the one view keeps
+   * every path it has (`mountGenerate`).
+   */
+  @inject(WidgetManager) protected readonly widgets!: WidgetManager;
+  protected generateWidget: Widget | undefined;
   // For the `explain` control on a diagnostic row: `Diagnostic.subject` names a
   // graph node so that a client can select it, and the Inspector is what answers
   // about a selection.
@@ -115,6 +124,9 @@ export class ProductWidget extends ReactWidget {
   // Constructor Studio: Apply needs the engine, and the strip says so.
   @inject(EngineConnectionService) protected readonly engine!: EngineConnectionService;
   @inject(GearboxService) protected readonly gearbox!: GearboxService;
+  // Constructor Studio: the head's "⋯" menu and its profile switch.
+  @inject(ContextMenuRenderer) protected readonly contextMenu!: ContextMenuRenderer;
+  @inject(QuickInputService) protected readonly quickInput!: QuickInputService;
 
   /** Constructor Studio: the corpus copy Studio adopted, asked once per open product. */
   protected corpusCopy: CorpusCopy | undefined;
@@ -138,7 +150,8 @@ export class ProductWidget extends ReactWidget {
    * different things -- a topology branch is an application, a composition host
    * is a gear -- and one id can legitimately be both.
    */
-  protected foldedHosts = new Set<string>();
+  protected expandedHosts = new Set<string>();
+  protected generateVisited = false;
   /**
    * What the Composition pane is about.
    *
@@ -197,7 +210,7 @@ export class ProductWidget extends ReactWidget {
         // about a gear they had merely looked up. The wrong *explanation* was
         // the first half of that defect; this is the other half -- independence
         // of the two selections, not just honesty about them.
-        if (current?.kind === "gear" || current?.kind === "plugin") {
+        if (current === undefined || current.kind === "gear" || current.kind === "plugin") {
           this.productSelection = current;
         }
         this.update();
@@ -217,7 +230,7 @@ export class ProductWidget extends ReactWidget {
       }),
     );
     this.toDispose.push(this.edits.onDraftChanged(() => this.update()));
-    // Constructor Studio: the status strip's Apply and its Resolve / Close follow
+    // Constructor Studio: the status strip's Apply and the head's actions follow
     // the engine and the registry, and Theia re-asks neither on its own.
     this.toDispose.push(this.engine.onDidChange(() => this.update()));
     this.toDispose.push(this.commands.onCommandsChanged(() => this.update()));
@@ -276,6 +289,9 @@ export class ProductWidget extends ReactWidget {
     if (path !== this.stagedFor) {
       this.stagedFor = path;
       this.section = "composition";
+      this.productSelection = undefined;
+      this.expandedHosts.clear();
+      this.generateVisited = false;
     }
   }
 
@@ -314,19 +330,14 @@ export class ProductWidget extends ReactWidget {
       );
     }
     if (diagnostics.length === 0) return undefined;
-    const worst = worstOf(diagnostics) ?? "info";
-    return (
-      <span
-        className={`gbx-stage-count gbx-stage-count-${worst}`}
-        data-validation-count={diagnostics.length}
-        data-validation-worst={worst}
-        // The words, because the colour alone cannot say which of four
-        // severities this is -- the same rule the config fields follow.
-        title={summarise(diagnostics.length, errorsIn(diagnostics))}
-      >
-        {diagnostics.length}
-      </span>
-    );
+    const errors = errorsIn(diagnostics);
+    const warnings = diagnostics.filter(d => d.severity === "warning").length;
+    return <span className="gbx-check-counts" data-validation-count={diagnostics.length}
+      data-validation-worst={worstOf(diagnostics) ?? "info"}>
+      {errors > 0 && <span className="gbx-stage-count gbx-stage-count-error" aria-label={plural(errors, "error", "errors")}>{plural(errors, "error", "errors")}</span>}
+      {warnings > 0 && <span className="gbx-stage-count gbx-stage-count-warning" aria-label={plural(warnings, "warning", "warnings")}>{plural(warnings, "warning", "warnings")}</span>}
+      {errors === 0 && warnings === 0 && <span className="gbx-stage-count gbx-stage-count-info">{plural(diagnostics.length, "note", "notes")}</span>}
+    </span>;
   }
 
   /**
@@ -337,7 +348,7 @@ export class ProductWidget extends ReactWidget {
    * here the thing being hidden is the reason the line exists.
    */
   protected showConflicts(): void {
-    void this.commands.executeCommand(SHOW_CONFLICTS.id);
+    this.showSection("checks");
   }
 
   /** New Gear with destination under this product, then Add Gear for selection. */
@@ -376,49 +387,116 @@ export class ProductWidget extends ReactWidget {
   }
 
   /**
-   * Constructor Studio: Resolve and Close, as the registry describes them -- the
-   * header's rule that it cannot name a command that does not exist, nor drift
-   * from the menu. Ids rather than imports: `RESOLVE_PRODUCT` lives with the view
-   * contributions, which import this widget.
+   * Constructor Studio: the product's health, as the head's pill and the
+   * summary band both draw it -- one call, so the two cannot disagree.
    */
-  protected stripActions(): StripAction[] {
-    const actions: StripAction[] = [];
-    for (const id of ["gearbox.product.resolve", CLOSE_PRODUCT.id]) {
-      const command = this.commands.getCommand(id);
-      if (command === undefined) continue;
-      actions.push({
-        id,
-        label: command.shortTitle ?? command.label ?? id,
-        title: command.label ?? id,
-        enabled: this.commands.isEnabled(id),
-      });
-    }
-    return actions;
+  protected statusBadge(): ProductStatusBadge {
+    const state = this.store.current;
+    return productStatusOf(
+      state.status,
+      errorsIn(state.diagnostics),
+      state.resolution?.product?.product?.lock_hash !== undefined,
+      state.diagnostics.filter((d) => d.severity === "warning").length,
+      state.stale !== undefined,
+    );
   }
 
-  /** Constructor Studio: the product's state and the draft -- see `product-status-strip.tsx`. */
+  /**
+   * Constructor Studio: the product's health and the draft -- see
+   * `product-status-strip.tsx`. Resolve and Close used to sit beside them as
+   * buttons; they are in the "⋯" menu now (`openProductMenu`), so no actions.
+   */
   protected renderStatusStrip(): React.ReactNode {
     const state = this.store.current;
     return (
       <ProductStatusStrip
-        status={productStatusOf(
-          state.status,
-          errorsIn(state.diagnostics),
-          state.resolution?.product?.product?.lock_hash !== undefined,
-        )}
+        status={this.statusBadge()}
         draft={draftStateOf({
           count: this.edits.draftEdits().length,
           writeUnknown: state.stale?.writeUnknown === true,
           engineConnected: this.engine.isConnected,
           busy: state.status === "loading" || state.status === "resolving",
         })}
-        actions={this.stripActions()}
+        actions={[]}
         onApply={() => void this.edits.applyDraft()}
         onDiscard={() => this.edits.discardDraft()}
         onShowConflicts={() => this.showConflicts()}
         onRun={(id) => void this.commands.executeCommand(id)}
       />
     );
+  }
+
+  /**
+   * The "⋯" menu: a registered Theia menu (`GearboxMenus.PRODUCT_ACTIONS`),
+   * drawn by `ContextMenuRenderer` under the button.
+   *
+   * It replaces a `<details>` popup of plain buttons, which neither the
+   * keyboard nor a screen reader treated as a menu, and which stayed open
+   * after a click unless each button remembered to close it. Theia's renderer
+   * gives arrow keys, Escape, icons and separators, and on the desktop the
+   * native menu where Theia uses one.
+   */
+  protected openProductMenu(anchor: HTMLElement): void {
+    const rect = anchor.getBoundingClientRect();
+    this.contextMenu.render({
+      menuPath: GearboxMenus.PRODUCT_ACTIONS,
+      anchor: { x: rect.left, y: rect.bottom },
+      context: anchor,
+      includeAnchorArg: false,
+    });
+  }
+
+  /**
+   * The profile switch, as a quick pick rather than a native `<select>`.
+   *
+   * A pick is keyboard-first and wide enough to say what each profile *is* --
+   * `local · processes on one host`, the portal's words -- where the select had
+   * room for the id alone. It also ends with Add profile, which is where a
+   * person looking for a profile that is not there already is.
+   */
+  protected async pickProfile(): Promise<void> {
+    const intent = this.store.current.intent;
+    if (intent === undefined) return;
+    const current = this.store.current.profile;
+    type Item = QuickPickItem & { readonly profile?: string; readonly add?: true };
+    const profiles: Item[] = Object.entries(intent.profiles).map(([id, decl]) => ({
+      label: profileLabel(id, decl.profile),
+      description: [id === intent.default_profile ? "default" : "", id === current ? "current" : ""]
+        .filter((word) => word !== "")
+        .join(", "),
+      profile: id,
+    }));
+    const chosen = await this.quickInput.showQuickPick<Item>(
+      [...profiles, { type: "separator" }, { label: "Add profile…", add: true }],
+      {
+        placeholder: "Deployment profile",
+        activeItem: profiles.find((item) => item.profile === current),
+      },
+    );
+    if (chosen === undefined) return;
+    if (chosen.add) {
+      this.startAddProfile();
+      return;
+    }
+    if (chosen.profile !== undefined && chosen.profile !== current) {
+      await this.store.setProfile(chosen.profile);
+    }
+  }
+
+  /** Open the Add profile form, on the settings stage where profiles are edited. */
+  public startAddProfile(): void {
+    this.addingProfile = true;
+    this.newProfileId = "";
+    this.newProfileKind = "embedded";
+    this.newProfileHost = "";
+    this.newProfileDiscovery = "static";
+    this.showSection("settings");
+  }
+
+  /** The open product's description, in the editor. */
+  public openDescription(): void {
+    const path = this.store.current.open?.path;
+    if (path !== undefined) void this.reveals.revealPath(path);
   }
 
   /**
@@ -479,22 +557,33 @@ export class ProductWidget extends ReactWidget {
    * portal saved on its own branch is brought into a worktree beside a
    * checkout that has uncommitted work, and then the two differ -- the bar
    * said `main*` while the product came from `product/…`.
+   *
+   * **A chip, and the worktree's story in its tooltip.** The sentence that used
+   * to follow the branch -- which worktree, beside which checkout, and why the
+   * status bar disagrees -- is true and rarely wanted, and it read as a
+   * paragraph in the product's title line. The chip says where; hovering it
+   * says why.
    */
   protected renderCheckout(): React.ReactNode {
     const checkout = this.checkout;
     if (checkout === undefined) return null;
     const base = (p: string) => p.replace(/\\/g, "/").split("/").filter(Boolean).pop() ?? p;
+    const worktreeOf = checkout.worktreeOf;
+    const title =
+      worktreeOf === undefined
+        ? `On branch ${checkout.branch}`
+        : `On branch ${checkout.branch}, in the worktree ${base(checkout.root)} beside ${base(worktreeOf)}. ` +
+          `The status bar shows ${base(worktreeOf)}'s own branch.`;
     return (
-      <div className="gbx-product-checkout" data-product-branch={checkout.branch}>
-        on branch <code>{checkout.branch}</code>
-        {checkout.worktreeOf !== undefined && (
-          <>
-            {" "}
-            in <code data-product-worktree>{base(checkout.root)}</code>, a worktree beside{" "}
-            <code>{base(checkout.worktreeOf)}</code> -- the status bar shows {base(checkout.worktreeOf)}&apos;s own branch
-          </>
+      <span className="gbx-product-checkout gbx-meta-chip" data-product-branch={checkout.branch} title={title}>
+        <span className="codicon codicon-git-branch" aria-hidden />
+        <span>{checkout.branch}</span>
+        {worktreeOf !== undefined && (
+          <span className="gbx-product-worktree" data-product-worktree={base(checkout.root)}>
+            · worktree
+          </span>
         )}
-      </div>
+      </span>
     );
   }
 
@@ -636,158 +725,91 @@ export class ProductWidget extends ReactWidget {
             neither: it pinned a strip in the middle of a header whose other
             halves still left. */}
         <div className="gbx-product-head">
-        {/* **The id, on the panel, as a marker.** Which *kind* of context is
-            current is on the toolbar (`data-context`), but which product is
-            open was nowhere a reader could ask -- the display name is prose and
-            the path is long. The id is the thing the description names itself
-            by, so it is the thing to expose. */}
-        <div className="gbx-detail-title" data-product-name={intent?.id}>
-          {intent?.display_name ?? state.open.label}{" "}
-          <span className="gbx-id">{intent?.id}</span>
-        </div>
-
-        {this.renderCheckout()}
-        {this.renderStaleCorpus()}
-        {this.renderStatusStrip()}
-
-        <div className="gbx-product-actions">
-          <button
-            type="button"
-            className="gbx-start-primary"
-            data-add-gear
-            onClick={() => void this.commands.executeCommand(ADD_GEAR.id)}
-          >
-            Add Gear
-          </button>
-          <button
-            type="button"
-            className="gbx-start-primary gbx-start-secondary"
-            data-create-gear
-            onClick={() => this.createGearForProduct()}
-          >
-            Create Gear
-          </button>
-        </div>
-
-        {/* The stages, and a link to the fifth. `role="tablist"` with the same
-            keyboard behaviour as the Graph's view switch, because two panels in
-            one application should not invent two ways to do this. */}
-        <div className="gbx-product-nav" role="tablist" aria-label="Product">
-          {SECTIONS.map((section) => (
-            <button
-              type="button"
-              key={section.id}
-              role="tab"
-              aria-selected={this.section === section.id}
-              className={`gbx-view-tab ${this.section === section.id ? "gbx-view-tab-on" : ""}`}
-              data-product-section={section.id}
-              onClick={() => {
-                this.section = section.id;
-                this.update();
-              }}
-            >
-              {section.label}
-              {/* **The signpost that was missing.** Validation already renders
-                  the whole list with its counts, one click away, and nothing
-                  said so: the strip drew four bare labels, and the only visible
-                  affordance sent people to a second panel at the bottom
-                  instead. The count is on the tab because that is where a
-                  person looks to decide which stage to open. */}
-              {section.id === "validation" &&
-                this.renderStageCount(state.diagnostics, state.stale)}
-            </button>
-          ))}
-          {/* **Still a link out, now a visible one.** That it navigates rather
-              than being a fifth stage is deliberate and unchanged -- "a tab
-              holding a file plan and an Apply button would be a second answer to
-              a question the Generate view already answers". What changes is the
-              weight: `gbx-start-link` drew the last step of composing a product
-              as body text in link colour, at the end of a row of four tabs. */}
-          {/* **Not offered while the screen is not current.** Generation reads
-              the resolution, and the Generate view's own gate is
-              `EngineConnectionService.isConnected` -- so with a dead engine this
-              was a button that led to a refusal one click away. A control that
-              cannot do its job says so where it is. */}
-          <button
-            type="button"
-            className="gbx-view-tab gbx-view-tab-next"
-            data-product-section-generate
-            disabled={state.stale !== undefined}
-            title={
-              state.stale === undefined
-                ? undefined
-                : "Not available: this product has not been re-read since the engine stopped."
-            }
-            onClick={() => this.showGenerate()}
-          >
-            Generate →
-          </button>
-        </div>
-
-        {/* **Above the strip, on every stage.** The profile switch has to be
-            reachable while a resolution is in flight -- §9 keeps it out of the
-            resolved tree for exactly that reason -- and a person on Topology
-            switching profiles is the ordinary way to compare two topologies. The
-            per-profile *fields* are a different thing and live in Overview,
-            because editing them is describing the product rather than reading
-            it. */}
-        {intent && (
-            <div className="gbx-kv">
-              <span>profile</span>
-              <span className="gbx-profiles">
-                {Object.keys(intent.profiles).map((id) => (
-                  <button
-                    type="button"
-                    className={`gbx-choice ${id === state.profile ? "gbx-choice-on" : ""}`}
-                    key={id}
-                    aria-pressed={id === state.profile}
-                    data-profile={id}
-                    onClick={() => void this.store.setProfile(id)}
-                  >
-                    {id}
-                    {id === intent.default_profile ? " (default)" : ""}
+          {/* **One card: who the product is on the left, what state it is in
+              and what to do about it on the right.** The head was four rows of
+              equal weight -- the name, a profile select, a sentence about the
+              branch, the status strip -- and none of them read as the title. */}
+          <div className="gbx-product-card gbx-product-context">
+            {/* The id stays as the marker (`data-product-name`); the name opens
+                another product, the way Gearbox Studio's switches one. */}
+            <div className="gbx-product-identity">
+              <button type="button" className="gbx-product-name" data-product-name={intent?.id}
+                title="Open another product"
+                onClick={() => void this.commands.executeCommand(OPEN_PRODUCT.id)}>
+                {intent?.display_name ?? state.open.label}<span className="codicon codicon-chevron-down" aria-hidden />
+              </button>
+              {/* The meta line: which profile, which branch. Muted, under the
+                  name, because both qualify the product rather than compete
+                  with it. */}
+              <div className="gbx-product-meta">
+                {intent && state.profile !== undefined && (
+                  <button type="button" className="gbx-meta-chip gbx-profile-pill" data-product-profile={state.profile}
+                    aria-label={`Deployment profile: ${state.profile}`} aria-haspopup="listbox"
+                    title="Switch the deployment profile"
+                    onClick={() => void this.pickProfile()}>
+                    <span className="codicon codicon-server-environment" aria-hidden />
+                    <span>{profileLabel(state.profile, intent.profiles[state.profile]?.profile)}</span>
+                    <span className="codicon codicon-chevron-down" aria-hidden />
                   </button>
-                ))}
-                <button
-                  type="button"
-                  className="gbx-choice"
-                  data-add-profile
-                  onClick={() => {
-                    this.addingProfile = true;
-                    this.newProfileId = "";
-                    this.newProfileKind = "embedded";
-                    // All four fields belong to one proposal: a host typed for
-                    // the last self_hosted profile is not this one's answer.
-                    this.newProfileHost = "";
-                    this.newProfileDiscovery = "static";
-                    this.update();
-                  }}
-                >
-                  Add profile…
-                </button>
-              </span>
+                )}
+                {this.renderCheckout()}
+              </div>
             </div>
-        )}
+            <div className="gbx-product-card-actions">
+              {/* Constructor Studio: the product's health and its draft's Apply
+                  and Discard, on every section -- the strip Gearbox Studio's
+                  bottom draft bar answers too; one of the two, so there is one
+                  Apply. */}
+              {this.renderStatusStrip()}
+              {this.catalogue.engineCapabilities?.generate !== false && (
+                <button type="button" className="gbx-start-primary gbx-product-generate" data-product-generate
+                  title="Generate the product's code from its description"
+                  onClick={() => this.showSection("generate")}>
+                  <span className="codicon codicon-run-all" aria-hidden /> Generate
+                </button>
+              )}
+              <button type="button" className="gbx-icon-button" aria-label="Product menu" aria-haspopup="menu"
+                data-product-menu title="More actions"
+                onClick={(event) => this.openProductMenu(event.currentTarget)}>
+                <span className="codicon codicon-ellipsis" aria-hidden />
+              </button>
+            </div>
+          </div>
+          {this.renderStaleCorpus()}
+          <div className="gbx-product-nav" role="tablist" aria-label="Product"
+            onKeyDown={event => {
+              const tabs = Array.from(event.currentTarget.querySelectorAll<HTMLButtonElement>('[role="tab"]'));
+              const index = tabs.indexOf(document.activeElement as HTMLButtonElement);
+              let next = index;
+              if (event.key === "ArrowRight") next = (index + 1) % tabs.length;
+              else if (event.key === "ArrowLeft") next = (index - 1 + tabs.length) % tabs.length;
+              else if (event.key === "Home") next = 0;
+              else if (event.key === "End") next = tabs.length - 1;
+              else return;
+              event.preventDefault(); tabs[next]?.focus(); tabs[next]?.click();
+            }}>
+            {SECTIONS.filter(section => section.id !== "generate" || this.catalogue.engineCapabilities?.generate !== false).map(section =>
+              <button type="button" key={section.id} role="tab" aria-selected={this.section === section.id}
+                tabIndex={this.section === section.id || (this.section === "settings" && section.id === "composition") ? 0 : -1}
+                className={`gbx-view-tab ${this.section === section.id ? "gbx-view-tab-on" : ""}`}
+                data-product-section={section.id} data-product-section-generate={section.id === "generate" ? true : undefined}
+                onClick={() => this.showSection(section.id)}>
+                {section.label}{section.id === "checks" && this.renderStageCount(state.diagnostics, state.stale)}
+              </button>)}
+          </div>
         </div>
 
         <div
           className={`gbx-product-body${this.section === "composition" ? " gbx-product-body-fill" : ""}`}
         >
         {intent && this.addingProfile && this.renderAddProfile()}
-        {intent &&
-          this.section === "overview" &&
-          state.profile !== undefined &&
-          this.renderProfileEdit(
-            intent.profiles[state.profile],
-            state.profile,
-            intent.default_profile,
-          )}
+
 
         {/* Addressable, because a claim drives this state on purpose now: the
             RPC seam holds the answer to `resolve` so the moment lasts. */}
         {state.status === "resolving" && (
           <div className="gbx-progress" data-product-resolving>
-            resolving…
+            Checking the product…
           </div>
         )}
 
@@ -803,21 +825,29 @@ export class ProductWidget extends ReactWidget {
         {/* Composition and Validation render from the intent and the
             diagnostics, so they survive a resolution that did not arrive.
             Overview and Topology are views *of* a resolution and wait for one. */}
-        {this.section === "composition"
-          ? this.renderComposition()
-          : this.section === "validation"
-            ? this.renderValidation()
-            : product && this.renderSection(product)}
-
-        {/* The summary line stays on every section **except Validation**. It is
-            one line, it is the only thing on this panel that says something is
-            wrong, and a person who has navigated to Topology is exactly the
-            person who needs to know that the resolution complained. On Validation
-            it would be a second, smaller copy of the summary that stage now opens
-            with, next to a button duplicating the link below it -- which is the
-            pair a UX pass called two nearly identical buttons. */}
-        {this.section !== "validation" &&
-          renderDiagnosticsSummary(state.diagnostics, () => this.showConflicts())}
+        {this.section === "composition" ? this.renderComposition()
+          : this.section === "checks" ? this.renderValidation()
+          : this.section === "settings" ? <section className="gbx-product-settings">
+              <button type="button" className="gbx-choice" onClick={() => this.showSection("composition")}>← Back to composition</button>
+              <div className="gbx-settings-head">
+                <h2>Product settings</h2>
+                {/* The markers the old Product menu's buttons carried, on the
+                    controls that do the same here, where profiles are edited. */}
+                {intent && !this.addingProfile && <button type="button" className="gbx-choice" data-add-profile
+                  onClick={() => this.startAddProfile()}>
+                  <span className="codicon codicon-add" aria-hidden /> Add profile…
+                </button>}
+                <button type="button" className="gbx-choice" data-open-product-gdl onClick={() => this.openDescription()}>
+                  <span className="codicon codicon-go-to-file" aria-hidden /> Open GDL
+                </button>
+              </div>
+              {intent && state.profile && this.renderProfileEdit(intent.profiles[state.profile], state.profile, intent.default_profile)}
+              {product && this.renderOverview(product)}
+            </section>
+          : this.section === "topology" && product ? this.renderTopology(product) : undefined}
+        {/* No React children: the Generate widget's own node is attached here. */}
+        {this.generateVisited && <div className="gbx-embedded-generate" hidden={this.section !== "generate"}
+          ref={(host) => this.mountGenerate(host)} />}
         </div>
       </div>
     );
@@ -884,9 +914,38 @@ export class ProductWidget extends ReactWidget {
     );
   }
 
+  /**
+   * Attach the Generate widget to the section's host. Taken out of any other
+   * parent first: a layout saved before Generate moved here may still hold it
+   * in the shell, and Lumino attaches only a widget without one.
+   */
+  protected mountGenerate(host: HTMLDivElement | null): void {
+    if (host === null) return;
+    const widget = this.generateWidget;
+    if (widget === undefined || widget.isDisposed) {
+      void this.widgets.getOrCreateWidget(GENERATE_WIDGET_ID).then((created) => {
+        if (this.isDisposed) return;
+        this.generateWidget = created;
+        this.update();
+      });
+      return;
+    }
+    if (widget.node.parentElement === host) return;
+    if (widget.parent !== null) widget.parent = null;
+    else if (widget.isAttached) Widget.detach(widget);
+    Widget.attach(widget, host);
+  }
+
+  override dispose(): void {
+    const widget = this.generateWidget;
+    if (widget !== undefined && !widget.isDisposed && widget.isAttached && widget.parent === null) Widget.detach(widget);
+    super.dispose();
+  }
+
   /** Move to a stage, from somewhere other than the strip. */
-  public showSection(section: ProductSection): void {
-    this.section = section;
+  public showSection(section: ProductSectionInput): void {
+    this.section = section === "overview" ? "settings" : section === "validation" ? "checks" : section;
+    if (this.section === "generate") this.generateVisited = true;
     this.update();
   }
 
@@ -899,17 +958,116 @@ export class ProductWidget extends ReactWidget {
     // profile field (Overview) and a provider option (Topology) queue into the
     // same draft as a gear's settings here.
     return <>
-      <Composition state={state} descriptors={this.catalogue.current.rows.flatMap(row => row.kind === "projected" ? [row.gear] : [])}
+      {this.renderSummaryBand()}
+      <Composition state={state} loadingLabel={this.openingLabel()} descriptors={this.catalogue.current.rows.flatMap(row => row.kind === "projected" ? [row.gear] : [])}
         selection={selection} select={selected => { this.selection.select(selected); this.update(); }}
         add={(host, point) => void this.commands.executeCommand(ADD_GEAR.id, { host, point })}
         remove={(host, index) => void this.edits.removeComposition(host, index).then(ok => { if (ok) this.selection.select(undefined); })}
         settings={this.renderSettings(selection)} reveals={this.reveals}
-        folded={this.foldedHosts}
+        expanded={this.expandedHosts}
+        create={() => this.createGearForProduct()}
         toggleFold={host => {
-          if (!this.foldedHosts.delete(host)) this.foldedHosts.add(host);
+          if (!this.expandedHosts.delete(host)) this.expandedHosts.add(host);
           this.update();
         }} />
     </>;
+  }
+
+  /**
+   * The product at a glance, above both Composition columns: its gears and
+   * applications, its health, its last Generate, and the one step to take next.
+   *
+   * **Always there, not only with nothing selected.** These figures used to be
+   * the right-hand pane's empty state, so they vanished at the first click on a
+   * gear -- which is when a person starts changing the things they count.
+   *
+   * It degrades rather than disappears: with no resolution yet the gear count
+   * is the description's own and the rest says it is waiting; after the engine
+   * stopped the band is marked as from before; after a refused resolve the next
+   * step is the retry, beside the error `renderRecovery` draws above it.
+   */
+  protected renderSummaryBand(): React.ReactNode {
+    const state = this.store.current;
+    if (state.open === undefined) return undefined;
+    const product = state.resolution?.product ?? undefined;
+    const stale = state.stale !== undefined;
+    const status = this.statusBadge();
+    const step = nextStepOf({
+      status: state.status,
+      stale,
+      failed: state.error !== undefined,
+      conflicts: errorsIn(state.diagnostics),
+      pending: this.edits.draftEdits().length,
+      gears: state.intent?.selected_gears.length ?? 0,
+      canGenerate: this.catalogue.engineCapabilities?.generate !== false,
+    });
+    const act = (): void => {
+      switch (step.kind) {
+        case "reconnect":
+          void this.session.reconnect();
+          return;
+        case "retry":
+          void this.store.reload();
+          return;
+        case "checks":
+          this.showSection("checks");
+          return;
+        case "apply":
+          void this.edits.applyDraft();
+          return;
+        case "add-gear":
+          void this.commands.executeCommand(ADD_GEAR.id);
+          return;
+        case "generate":
+          this.showSection("generate");
+          return;
+        case "wait":
+          return;
+      }
+    };
+    return (
+      <section className="gbx-summary-band" data-product-summary-band aria-label="Product summary"
+        {...(stale ? { "data-summary-stale": true } : {})}>
+        {product !== undefined ? (
+          this.renderShape(product)
+        ) : (
+          // No resolution: the description still says what was asked for.
+          <div className="gbx-overview-figures" data-overview-figures>
+            <div className="gbx-figure gbx-figure-static" data-figure="gears">
+              <span className="gbx-figure-value">{state.intent?.selected_gears.length ?? "—"}</span>
+              <span className="gbx-figure-label">gears asked for — the rest once the product is checked</span>
+            </div>
+          </div>
+        )}
+        <div className="gbx-overview-figures">
+          <button type="button" className="gbx-figure" data-figure="health" onClick={() => this.showSection("checks")}>
+            <span className="gbx-figure-value gbx-figure-value-text" data-summary-health={status?.kind ?? "none"}>
+              {healthLabel(status)}
+            </span>
+            <span className="gbx-figure-label">{stale ? "from before the connection was lost" : "health"}</span>
+          </button>
+          <button type="button" className="gbx-figure" data-figure="generate" title={this.generationSummary()} onClick={() => this.showSection("generate")}
+            hidden={this.catalogue.engineCapabilities?.generate === false}>
+            <span className="gbx-figure-value gbx-figure-value-text" data-summary-generate={this.generate.current.status}>
+              {this.generationSummary()}
+            </span>
+            <span className="gbx-figure-label">last Generate</span>
+          </button>
+        </div>
+        <div className={`gbx-next-step gbx-next-step-${step.kind}`} data-next-step={step.kind}>
+          <span className="gbx-next-step-label">Next step</span>
+          <span className="gbx-next-step-title">{step.title}</span>
+          <span className="gbx-next-step-detail">{step.detail}</span>
+          {"action" in step && (
+            <button type="button" className={step.kind === "generate" || step.kind === "apply" ? "gbx-start-primary" : "gbx-choice"}
+              data-next-step-action onClick={act}
+              disabled={step.kind === "apply" && !this.engine.isConnected}>
+              {step.action}
+            </button>
+          )}
+        </div>
+      </section>
+    );
   }
 
   /**
@@ -923,6 +1081,14 @@ export class ProductWidget extends ReactWidget {
    * Keyed on the draft epoch for the same reason the Inspector keys them: a
    * Discard or an Apply must take the scratch boxes with it.
    */
+  /** What the open is doing now, when this product is the one opening. */
+  protected openingLabel(): string | undefined {
+    const opening = this.session.openingProgress;
+    if (opening.status !== "opening") return undefined;
+    if (opening.product.path !== this.store.current.open?.path) return undefined;
+    return openingSentence(opening.stage);
+  }
+
   protected renderSettings(selection: Selection | undefined): React.ReactNode {
     const state = this.store.current;
     const descriptorFor = (id: string): GearDescriptor | undefined => {
@@ -963,10 +1129,24 @@ export class ProductWidget extends ReactWidget {
     // catalogue is not a request to stop configuring the one in front of you.
     // The Inspector is where a catalogue row is answered, and it opens itself
     // for exactly that act.
+    if (!state.intent && (state.status === "loading" || state.status === "resolving")) {
+      return <div className="gbx-empty" role="status">{this.openingLabel() ?? "Reading the product…"}</div>;
+    }
     return (
-      <div className="gbx-empty">
-        Select a gear or a plugin connection in the tree to configure it.
-      </div>
+      <section className="gbx-product-summary" data-composition-summary>
+        <h2>{state.intent?.display_name ?? state.open?.label}</h2>
+        <p>Select a gear to configure it. Add gears to extend your product.</p>
+        {/* The figures, the health and the next step are the summary band's
+            now, above both columns; this pane keeps what the band does not
+            say -- where the description lives and what it reads from. */}
+        <div className="gbx-kv">
+          <span>description file</span>
+          <span className="gbx-links">
+            <RevealPathLink reveals={this.reveals} path={state.open?.path ?? ""} label={state.open?.label ?? "—"} />
+          </span>
+        </div>
+        {this.renderSources()}
+      </section>
     );
   }
 
@@ -996,12 +1176,25 @@ export class ProductWidget extends ReactWidget {
       this.selection.select({ kind: "gear", id: gear });
       this.update();
     };
-    const heading = (
-      <>
-        <GearHeading id={id} descriptor={descriptor} />
+    const heading = <GearHeading id={id} descriptor={descriptor} />;
+    // **Overview first, as one captioned block**: what the gear is, where to
+    // read more, and why it is in this product -- the facts, before the
+    // controls. The blocks below follow the same caption style, so the pane
+    // reads as sections rather than as one long form.
+    const overview = (reasons: readonly InclusionReason[], openGdl: boolean): React.ReactNode => (
+      <section className="gbx-block" data-gear-overview>
+        <h3 className="gbx-block-caption">Overview</h3>
         <GearBlurb descriptor={descriptor} />
         <GearDocs descriptor={descriptor} reveals={this.reveals} />
-      </>
+        <div className="gbx-block-row">
+          <InclusionReasons reasons={reasons} onSelectGear={selectGear} />
+          {openGdl && (
+            <button type="button" className="gbx-link" data-open-gear-gdl onClick={() => this.openDescription()}>
+              <span className="codicon codicon-go-to-file" aria-hidden /> Open product GDL
+            </button>
+          )}
+        </div>
+      </section>
     );
 
     // Asked for by name: the one case with a `use_gear` entry to write into.
@@ -1009,7 +1202,7 @@ export class ProductWidget extends ReactWidget {
       return (
         <div className="gbx-detail" data-settings-for={id}>
           {heading}
-          <InclusionReasons reasons={resolved?.selected_by ?? []} onSelectGear={selectGear} />
+          {overview(resolved?.selected_by ?? [], true)}
           {descriptor === undefined ? (
             <div className="gbx-empty">
               No catalogue descriptor for <code>{id}</code> yet. It stays in your product;
@@ -1023,8 +1216,10 @@ export class ProductWidget extends ReactWidget {
               edits={this.edits}
               sources={{ edits: this.edits, products: this.store }}
               profileKind={state.resolution?.product?.product.profile_kind}
+              viewingProfile={state.profile}
             />
           )}
+          {this.renderGearPlugins(picked)}
         </div>
       );
     }
@@ -1042,7 +1237,7 @@ export class ProductWidget extends ReactWidget {
       return (
         <div className="gbx-detail" data-pulled-in-settings={id}>
           {heading}
-          <InclusionReasons reasons={resolved.selected_by} onSelectGear={selectGear} />
+          {overview(resolved.selected_by, false)}
           <div className="gbx-empty">
             It has no <code>use_gear</code> entry of its own, so what it is set to is the
             business of whatever requires it.
@@ -1090,17 +1285,78 @@ export class ProductWidget extends ReactWidget {
     );
   }
 
+  /**
+   * The Plugins block: what this gear carries, each one a way to its own
+   * settings. Nothing for a gear with no plugin and nowhere to put one -- an
+   * empty block about plugins on a gear that takes none says nothing.
+   */
+  protected renderGearPlugins(picked: GearSelection): React.ReactNode {
+    const state = this.store.current;
+    const plugins = picked.plugins ?? [];
+    const descriptor = this.catalogue.current.rows.find((row) => row.kind === "projected" && row.gear.id === picked.gear);
+    const points = descriptor?.kind === "projected" ? pointsOf(descriptor.gear) : [];
+    if (plugins.length === 0 && points.length === 0) return undefined;
+    const nameOf = (gear: string): string => {
+      const row = this.catalogue.current.rows.find((r) => r.kind === "projected" && r.gear.id === gear);
+      return row?.kind === "projected" ? row.gear.display_name || gear : gear;
+    };
+    return (
+      <section className="gbx-block" data-gear-plugins>
+        <h3 className="gbx-block-caption">Plugins{plugins.length > 0 && ` · ${plugins.length}`}</h3>
+        {plugins.length === 0 && <p className="gbx-empty">No plugins yet.</p>}
+        {plugins.map((plugin) => (
+          <button
+            type="button"
+            key={plugin.entry_index}
+            className="gbx-block-item"
+            data-gear-plugin={plugin.gear}
+            onClick={() => {
+              this.selection.select({
+                kind: "plugin",
+                host: picked.gear,
+                id: plugin.gear,
+                entryIndex: plugin.entry_index,
+                path: state.open?.path ?? "",
+              });
+              this.update();
+            }}
+          >
+            <span className="codicon codicon-extensions" aria-hidden />
+            <span>{nameOf(plugin.gear)}</span>
+            <span className="gbx-block-item-note">{plugin.profiles?.join(", ") || "All profiles"}</span>
+          </button>
+        ))}
+        {points.length > 0 && (
+          <button
+            type="button"
+            className="gbx-choice"
+            data-add-plugin-for={`${picked.gear}:${points.length === 1 ? pointKey(points[0]!) : ""}`}
+            onClick={() =>
+              void this.commands.executeCommand(ADD_GEAR.id, {
+                host: picked.gear,
+                point: points.length === 1 ? pointKey(points[0]!) : undefined,
+              })
+            }
+          >
+            Add compatible plugin
+          </button>
+        )}
+      </section>
+    );
+  }
+
   /** Whichever stage is selected, rendered from the same resolution. */
   protected renderSection(product: ResolvedProduct): React.ReactNode {
     switch (this.section) {
-      case "overview":
+      case "settings":
         return this.renderOverview(product);
       case "topology":
         return this.renderTopology(product);
       // Both are rendered by `render` before it reaches here, because both work
       // without a resolution and this method is only called once there is one.
       case "composition":
-      case "validation":
+      case "checks":
+      case "generate":
         return undefined;
     }
   }
@@ -1358,7 +1614,7 @@ export class ProductWidget extends ReactWidget {
               What the panel knows, in the order it knows it: the connection is
               gone, so these results are stale, and the last one that *did* answer
               was for this profile. */}
-          <span>{stale === undefined ? "resolved" : "connection lost"}</span>
+          <span>{stale === undefined ? "up to date" : "connection lost"}</span>
           {/* The profile is taken from the *resolved header*, not from the switch
               above. They should agree, and stating both is what makes a
               disagreement visible instead of leaving the panel labelled one way
@@ -1480,6 +1736,25 @@ export class ProductWidget extends ReactWidget {
   }
 
   /**
+   * The last Generate, in one phrase, as the Overview row and the summary band
+   * both say it. Read from the cache, like the row below -- never planned.
+   */
+  protected generationSummary(): string {
+    const generate = this.generate.current;
+    const plans = generate.plan?.plans ?? [];
+    const writes = plans.filter((plan) => plan.action !== "unchanged").length;
+    return generate.status === "planning"
+      ? "planning…"
+      : generate.status === "error"
+        ? (generate.error ?? "the last plan failed")
+        : generate.plan === undefined
+          ? "not planned for this resolution yet"
+          : writes === 0
+            ? `${plural(plans.length, "file", "files")}, all unchanged`
+            : `${writes} of ${plural(plans.length, "file", "files")} would change`;
+  }
+
+  /**
    * Whether a generated tree exists for this resolution.
    *
    * **Read from the cache, never planned from here.** `GenerateService.ensurePlan`
@@ -1490,18 +1765,7 @@ export class ProductWidget extends ReactWidget {
    */
   protected renderGenerationStatus(): React.ReactNode {
     const generate = this.generate.current;
-    const plans = generate.plan?.plans ?? [];
-    const writes = plans.filter((plan) => plan.action !== "unchanged").length;
-    const summary =
-      generate.status === "planning"
-        ? "planning…"
-        : generate.status === "error"
-          ? (generate.error ?? "the last plan failed")
-          : generate.plan === undefined
-            ? "not planned for this resolution yet"
-            : writes === 0
-              ? `${plans.length} files, all unchanged`
-              : `${writes} of ${plans.length} files would change`;
+    const summary = this.generationSummary();
     return (
       <div className="gbx-kv">
         <span>generated tree</span>
@@ -1567,6 +1831,9 @@ export class ProductWidget extends ReactWidget {
 
     return (
       <>
+        <div className="gbx-topology-head"><h2>Deployment topology</h2>
+          <button type="button" className="gbx-choice" onClick={() => void this.commands.executeCommand("gearbox.graph.toggle")}>Open graph</button>
+        </div>
         {this.renderBranch(
           "applications",
           "server-process",
@@ -1598,37 +1865,12 @@ export class ProductWidget extends ReactWidget {
             <div className="gbx-empty">No gear here requests a cluster primitive.</div>
           ) : (
             <>
-              {cluster.map((binding) => (
-                <div className="gbx-kv" key={`${binding.scope}/${binding.primitive}`}>
-                  <span>
-                    {binding.scope}/{binding.primitive}
-                  </span>
-                  <span>
-                    {/* Asked-for beside resolved, as §9 requires: the two differ
-                        whenever nothing was declared for this profile, and a panel
-                        showing only the outcome hides that the SDK default is
-                        standing in for a provider nobody chose. */}
-                    asked {describeChoice(binding.selected.selected)} · got{" "}
-                    <code>{describeClusterResolution(binding.resolved)}</code>
-                    {" · for "}
-                    {binding.requesters.join(", ")}
-                    {/* `options` is deliberately not rendered. It carries whatever
-                        the description passed -- connection strings among them --
-                        and a panel that prints it wholesale is one schema change
-                        away from putting a credential on screen
-                        (`cpt-gearbox-fr-no-secrets-in-values`). The reference to
-                        externally managed credentials is safe to name, because it
-                        is a reference and never a credential. */}
-                    {binding.secret_ref !== null && binding.secret_ref !== undefined && (
-                      <>
-                        {" · secret "}
-                        <code>{binding.secret_ref}</code>
-                      </>
-                    )}
-                  </span>
-                  {this.renderProviderOptions(binding)}
-                </div>
-              ))}
+              {cluster.map(binding => <details className="gbx-cluster-details" key={`${binding.scope}/${binding.primitive}`}>
+                <summary>{binding.scope}/{binding.primitive} <span className="gbx-id">for {binding.requesters.join(", ")}</span></summary>
+                <p>Requested {describeChoice(binding.selected.selected)} · resolved <code>{describeClusterResolution(binding.resolved)}</code>
+                  {binding.secret_ref && <> · secret <code>{binding.secret_ref}</code></>}</p>
+                {this.renderProviderOptions(binding)}
+              </details>)}
             </>
           ),
         )}
@@ -1828,7 +2070,7 @@ export class ProductWidget extends ReactWidget {
     return (
       <div className="gbx-validation" data-product-validation>
         <div className="gbx-validation-head">
-          <span className="gbx-conflicts-summary">{summarise(diagnostics.length, errors)}</span>
+          <span className="gbx-conflicts-summary">{errors > 0 ? `${errors} blocking errors` : "No blocking errors"}</span>
           <div className="gbx-kv">
             <span>errors</span>
             <span data-validation-errors={errors}>{errors}</span>
@@ -1882,7 +2124,7 @@ export class ProductWidget extends ReactWidget {
               className="gbx-choice"
               data-validation-open-conflicts
               title="The same list in the bottom panel, readable beside the tree"
-              onClick={() => this.showConflicts()}
+              onClick={() => void this.commands.executeCommand("gearbox.conflicts.show")}
             >
               Open beside the tree
             </button>
@@ -2006,7 +2248,7 @@ export class ProductWidget extends ReactWidget {
         {/* The gears are listed rather than counted because they may overlap
             another application: co-location is a closure, not a partition, and a
             count hides the gear that is linked into two binaries. */}
-        <span className="gbx-application-gears">{application.gears.join(", ")}</span>
+        <span className="gbx-application-gears">{selected ? application.gears.join(", ") : `${application.gears.length} gears`}</span>
       </div>
     );
   }
@@ -2050,6 +2292,7 @@ export class ProductWidget extends ReactWidget {
         {/* `mode` is derived from placement and never configured, so showing it
             beside the transport is showing a conclusion, not an echo of the
             description (`cpt-gearbox-fr-derive-binding-from-placement`). */}
+        {selected && <>
         <span className="gbx-badge" data-mode={binding.mode}>
           {binding.mode}
         </span>
@@ -2070,6 +2313,7 @@ export class ProductWidget extends ReactWidget {
               asked {describeChoice(binding.selected.selected)} · {binding.selected.downgraded_by}
             </span>
           )}
+        </>}
       </div>
     );
   }
@@ -2213,6 +2457,14 @@ const STEP_ICON: Readonly<Record<StepState, string>> = {
   waiting: codicon("circle-large-outline"),
   failed: codicon("error"),
 };
+
+/** `GenerateWidget.ID`, named rather than imported: that view imports this one's commands. */
+const GENERATE_WIDGET_ID = "gearbox.generate";
+
+function openingSentence(stage: OpeningStage): string {
+  const label = OPENING_LABEL[stage];
+  return `${label.charAt(0).toUpperCase()}${label.slice(1)}…`;
+}
 
 function renderOpening(
   opening: Exclude<OpeningState, { status: "idle" }>,

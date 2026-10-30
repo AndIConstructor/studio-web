@@ -113,6 +113,14 @@ pub struct AccessToken {
     pub rotated: Option<String>,
 }
 
+/// What a finished sign-in is kept as ([`ConnectorDriver::signed_in`]).
+pub struct SignedIn {
+    /// The credential stored for the connection.
+    pub stored: String,
+    /// The credential the connection is tested with right away.
+    pub token: String,
+}
+
 /// One repository as the provider describes it.
 #[derive(Debug, Clone)]
 pub struct RemoteRepo {
@@ -652,6 +660,28 @@ pub trait ConnectorDriver: Send + Sync + 'static {
             "{} is not signed in to -- its credential is pasted",
             self.display_name()
         ))
+    }
+
+    /// What the connection keeps from a sign-in's tokens: by default the
+    /// refresh token, traded for an access token on every use
+    /// ([`Self::access_token`]). `base_url` is the connection's address.
+    async fn signed_in(
+        &self,
+        base_url: &str,
+        tokens: super::oauth::Tokens,
+    ) -> anyhow::Result<SignedIn> {
+        let _ = base_url;
+        let Some(refresh) = tokens.refresh_token.filter(|t| !t.is_empty()) else {
+            return Err(anyhow::anyhow!(
+                "{} gave no lasting sign-in (no refresh token); its client needs \
+                 the offline_access scope",
+                self.display_name()
+            ));
+        };
+        Ok(SignedIn {
+            stored: refresh,
+            token: tokens.access_token,
+        })
     }
 
     /// The credential a call is made with, from the one stored. A pasted
@@ -1230,6 +1260,42 @@ pub trait ConnectorDriver: Send + Sync + 'static {
         }
         Err(anyhow::anyhow!(
             "{} cannot delete files through this connection",
+            self.display_name()
+        ))
+    }
+
+    /// One commit of `files` on top of `base_branch`, and `branch` pointed at
+    /// it: created, or moved there by force when it exists. What publishing a
+    /// product's description writes (ADR-0053 §3) -- one branch per product,
+    /// recreated from the base each time, so a pull request open from it stays
+    /// the same request. Returns the commit.
+    async fn commit_replacing_branch(
+        &self,
+        auth: &ConnectionAuth,
+        repo_full_path: &str,
+        base_branch: &str,
+        branch: &str,
+        files: &[FileToWrite],
+        message: &str,
+    ) -> anyhow::Result<String> {
+        let _ = (auth, repo_full_path, base_branch, branch, files, message);
+        Err(anyhow::anyhow!(
+            "{} cannot recreate branches through this connection",
+            self.display_name()
+        ))
+    }
+
+    /// The branches whose names start with `prefix` (`product/`), each with
+    /// the commit it points at.
+    async fn branches_with_prefix(
+        &self,
+        auth: &ConnectionAuth,
+        repo_full_path: &str,
+        prefix: &str,
+    ) -> anyhow::Result<Vec<(String, String)>> {
+        let _ = (auth, repo_full_path, prefix);
+        Err(anyhow::anyhow!(
+            "{} cannot list branches through this connection",
             self.display_name()
         ))
     }

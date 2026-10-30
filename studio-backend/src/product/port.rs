@@ -43,6 +43,73 @@ pub trait ProjectProducts: Send + Sync + 'static {
         ctx: &SecurityContext,
         project_id: &str,
     ) -> anyhow::Result<Option<Vec<String>>>;
+
+    /// Where the Product step last committed the product's description:
+    /// its path in the repository, and the branch, `None` when it went onto
+    /// the repository's own. `None` before it was ever written. A build that
+    /// names nothing builds this.
+    async fn saved_description(
+        &self,
+        _ctx: &SecurityContext,
+        _project_id: &str,
+    ) -> anyhow::Result<Option<SavedDescription>> {
+        Ok(None)
+    }
+
+    /// The latest revision of the project's description, which Studio keeps
+    /// (ADR-0053): what a build lays at the product's path before it
+    /// generates. `None` before anything was saved, or in a deployment that
+    /// keeps none -- the build then reads the file in the checkout.
+    async fn latest_description(
+        &self,
+        _ctx: &SecurityContext,
+        _project_id: Uuid,
+    ) -> anyhow::Result<Option<DescriptionRevision>> {
+        Ok(None)
+    }
+}
+
+/// [`ProjectProducts::latest_description`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DescriptionRevision {
+    pub revision: i64,
+    pub text: String,
+    /// Where it goes in the repository, when the record says.
+    pub path: Option<String>,
+}
+
+/// [`ProjectProducts::saved_description`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SavedDescription {
+    pub path: String,
+    pub branch: Option<String>,
+}
+
+/// The `written` of a product record, as a [`SavedDescription`]; for a
+/// record with only a Studio revision (ADR-0053), its path and no branch.
+pub fn saved_of(record: &Value) -> Option<SavedDescription> {
+    let Some(written) = record.get("written") else {
+        let path = record
+            .pointer("/description/path")
+            .and_then(Value::as_str)
+            .filter(|p| !p.trim().is_empty())?;
+        return Some(SavedDescription {
+            path: path.to_owned(),
+            branch: None,
+        });
+    };
+    let text = |k: &str| {
+        written
+            .get(k)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+    };
+    Some(SavedDescription {
+        path: text("path").unwrap_or_else(|| "product.gdl".to_owned()),
+        branch: text("branch"),
+    })
 }
 
 /// The picks of a product record: its `gears`, trimmed, blanks dropped.
@@ -81,6 +148,70 @@ impl ProjectProducts for super::service::ProductService {
             .get_project_product(ctx, project_id)
             .await?
             .and_then(|n| picks_of(&n.value)))
+    }
+
+    async fn saved_description(
+        &self,
+        ctx: &SecurityContext,
+        project_id: &str,
+    ) -> anyhow::Result<Option<SavedDescription>> {
+        Ok(self
+            .get_project_product(ctx, project_id)
+            .await?
+            .and_then(|n| saved_of(&n.value)))
+    }
+
+    async fn latest_description(
+        &self,
+        ctx: &SecurityContext,
+        project_id: Uuid,
+    ) -> anyhow::Result<Option<DescriptionRevision>> {
+        if self.descriptions().is_none() {
+            return Ok(None);
+        }
+        // The service's own (inherent) read, which takes over a project's
+        // last saved description the first time (ADR-0053 §5).
+        let Some(latest) =
+            super::service::ProductService::latest_description(self, ctx, project_id).await?
+        else {
+            return Ok(None);
+        };
+        let record = self
+            .get_project_product(ctx, &project_id.to_string())
+            .await?
+            .map(|n| n.value);
+        Ok(Some(DescriptionRevision {
+            revision: latest.revision,
+            text: latest.text,
+            path: super::service::description_service::description_path(record.as_ref()),
+        }))
+    }
+}
+
+#[cfg(test)]
+mod saved_tests {
+    use super::*;
+
+    #[test]
+    fn a_record_says_where_its_description_was_written() {
+        let r = serde_json::json!({ "written": {
+            "branch": "product/shop-1a2b3c4d", "commit_sha": "abc", "path": "products/shop/product.gdl" } });
+        assert_eq!(
+            saved_of(&r),
+            Some(SavedDescription {
+                path: "products/shop/product.gdl".into(),
+                branch: Some("product/shop-1a2b3c4d".into()),
+            })
+        );
+        let onto_base = serde_json::json!({ "written": { "branch": null, "commit_sha": "abc" } });
+        assert_eq!(
+            saved_of(&onto_base),
+            Some(SavedDescription {
+                path: "product.gdl".into(),
+                branch: None
+            })
+        );
+        assert_eq!(saved_of(&serde_json::json!({ "gears": [] })), None);
     }
 }
 

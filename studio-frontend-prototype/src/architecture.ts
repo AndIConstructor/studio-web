@@ -324,7 +324,7 @@ export function edgeCounts(edges: Edge[]): Record<Via, number> & { total: number
 
 /** What `name` uses, worst first, then by name. */
 /** One kind of event on the studio-events channel, as
- *  `GET /studio-events/v1/catalog` serves docs/events-catalog.md. */
+ *  `GET /studio-events/v1/catalog` serves studio-backend/docs/events-catalog.md. */
 export interface EventKind {
   kind: string;
   subject_type: string;
@@ -629,8 +629,8 @@ export const SURFACES: Surface[] = [
       "ProjectKits",
       "SuggestedComponents",
       "BringsWithIt",
-      "BeyondGears",
       "ProductCard",
+      "DescriptionInRepository",
       "GearConfigForm",
       "ProjectCandidate",
       "ProductConfigurator",
@@ -650,18 +650,18 @@ export const SURFACES: Surface[] = [
   {
     id: "project-frontend",
     area: "project",
-    title: "Frontend",
-    does: "Compose the product's UI from micro-frontends in a FrontX shell, and see whether the product has the gears each screen calls.",
-    components: ["FrontendConstructor"],
-    gears: ["account-management", "studio-components-catalog", "studio-product"],
+    title: "Product: its header, Infrastructure and Frontend",
+    does: "See the product in one line (profile, gears, where it was saved, whether it resolves, whether it has a frontend) and switch between its parts; see where it runs (its profile, environments and their databases); add a frontend from FrontX's shell template, or leave the product gears alone; compose the UI from micro-frontends in the shell, see whether the product has the gears each screen calls, read the project's own repository into the catalogue when it has no micro-frontend, and find FrontX's templates to start a new one.",
+    components: ["FrontendConstructor", "ProductFrontend", "ProductInfrastructure", "ProductPage"],
+    gears: ["account-management", "studio-artifact-ingest", "studio-components-catalog", "studio-environments", "studio-product"],
   },
   {
     id: "project-builds",
     area: "project",
     title: "Builds",
-    does: "See what the product was built into, where and how it went: the CI runs of the project's repositories and the builds the IDE reported, a failed one with its first error; start the project's build workflow in CI, or open the project in the IDE to build and deploy there.",
-    components: ["ProjectBuilds"],
-    gears: ["account-management", "studio-artifact-ingest"],
+    does: "Build the composed product and publish it: in Studio as a Job in the organization's cluster, on the member's machine in the desktop IDE, or by proposing a CI workflow; follow each build's stages (prepare, images, publish) and read the end of each step's log from its pod, a failed one with its first error, a published one with its images and chart; deploy a published build to an environment; and read the CI runs of the project's repositories.",
+    components: ["ProjectBuilds", "HowItBuilds", "BuildInStudio", "BuildLogPanel", "InCi", "ProposeBuildWorkflow", "DeployBuildTo"],
+    gears: ["account-management", "studio-artifact-ingest", "studio-environments", "studio-product"],
   },
   {
     id: "project-tests",
@@ -675,16 +675,16 @@ export const SURFACES: Surface[] = [
     id: "project-deploys",
     area: "project",
     title: "Deploys",
-    does: "See where the project's product runs and run it there: each environment it may deploy to, its namespace and registry, the last deploy; deploy a build a pipeline or the IDE published, roll back, uninstall; set the release's chart values and secrets per environment; propose the workflow that builds the product in CI; bind the product's kubernetes profiles and read the deploy history.",
+    does: "See where the project's product runs and run it there: each environment it may deploy to, the organization's and its own (ADR-0054), its namespace and registry, the last deploy; add, change or remove an environment of the project's own; deploy a build the Builds tab, a pipeline or the IDE published, roll back, uninstall; set the release's chart values and secrets per environment; bind the product's kubernetes profiles and read the deploy history.",
     components: [
       "ProjectDeploys",
       "ProjectEnvironments",
       "StatusButton",
       "EnvironmentActions",
       "EnvironmentConfig",
-      "BuildWorkflowProposal",
+      "EnvironmentPreviews",
     ],
-    gears: ["studio-artifact-ingest", "studio-environments"],
+    gears: ["studio-artifact-ingest", "studio-connector", "studio-environments"],
   },
   {
     id: "project-artifacts",
@@ -768,8 +768,8 @@ export const SURFACES: Surface[] = [
     id: "environments",
     area: "organization",
     title: "Environments",
-    does: "Declare where the organization's products run -- a cluster connection, a registry, a namespace per project, approval for protected ones -- approve deploys, and see what runs where.",
-    components: ["OrgEnvironments", "EnvironmentForm", "AddCluster", "AddRegistry"],
+    does: "Declare where the organization's products run -- a cluster connection, a registry, a namespace per project, or a Constructor Research project and its hardware; approval for protected ones -- approve deploys, and see what runs where.",
+    components: ["OrgEnvironments", "EnvironmentForm", "ResearchFields", "AddCluster", "AddRegistry", "OpenClusters"],
     gears: ["account-management", "studio-connector", "studio-environments"],
   },
   {
@@ -896,7 +896,7 @@ export const SURFACES: Surface[] = [
     id: "desktop",
     area: "outside",
     title: "Desktop app (Electron)",
-    does: "Everything the IDE does, on your machine — plus your projects and kits from Studio, the gear catalogue for Gearbox, Git through Studio's proxy, a lease on a session, and the builds Build and Run report.",
+    does: "Everything the IDE does, on your machine — plus your projects and kits from Studio, the gear catalogue for Gearbox, Git through Studio's proxy, a lease on a session, Claude Code and Codex on the member's profile key, and the builds Build and Run report.",
     sources: ["theia/studio/src/{browser,node}/desktop-*.ts", "theia/studio/src/browser/gearbox-*.ts"],
     gears: [
       "account-management",
@@ -905,6 +905,8 @@ export const SURFACES: Surface[] = [
       "studio-environments",
       "studio-git",
       "studio-kits",
+      "studio-llm-proxy",
+      "studio-organizations",
       "studio-product",
       "studio-session",
       "studio-user",

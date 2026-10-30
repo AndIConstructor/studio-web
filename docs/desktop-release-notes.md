@@ -9,7 +9,236 @@ change for the person using the app. How the app works is
 
 Releases up to 0.3.0-beta.4 are described only on their GitHub release pages.
 
-## Next
+## 0.3.0-beta.13
+
+The product's description is kept by Studio, and the photo is where a member
+sees it. Everything merged since `desktop-v0.3.0-beta.12`.
+
+### The product's description
+
+- **Studio keeps the product's description.** Opening a product from Studio
+  writes Studio's latest revision into `product.gdl`, and every later save --
+  in the editor, or Apply in Gearbox -- becomes a new revision in Studio. It
+  no longer has to be committed to a branch to reach a build. (#942,
+  ADR-0053)
+- **When somebody saved a newer revision meanwhile**, you see both texts and
+  choose which one stays. (#942)
+- **A build from a `product/…` branch** takes only `product.gdl` from that
+  branch and the code from the branch you build, so an old product branch no
+  longer builds old code. (#942)
+
+### Account
+
+- **Your photo shows on the Constructor Studio tab**, the person icon in the
+  left bar. 0.3.0-beta.12 put it on a menu the desktop hides.
+
+### Known not to work
+
+- **Opening a product overwrites a `product.gdl` you changed by hand** in the
+  checkout with Studio's revision, without asking.
+- **None of this was run in a built app** before this release.
+
+## 0.3.0-beta.12
+
+Two fixes found trying 0.3.0-beta.11, through the PR that carries #935 and
+#936.
+
+### Building
+
+- **Build images builds Studio's own product.** It stopped compiling
+  `studio-backend` because the backend read its events catalogue from outside
+  its own folder, and an image build sees only the product's source folders.
+  The catalogue now lives inside `studio-backend`. Open the project again (or
+  Sync) so the clone has it. (#935)
+
+### Account
+
+- **Your photo on the Accounts button** now shows after you sign in, however
+  the sign-in happened; 0.3.0-beta.11 asked for it only when the window
+  opened, before the sign-in had finished. (#936)
+
+### Known not to work
+
+- **Neither fix was run in a built app** before this release.
+
+## 0.3.0-beta.11
+
+Gearbox's Product tab reads as the product it describes, and a build from
+the desktop compiles with the product's own crate versions. Everything merged
+since `desktop-v0.3.0-beta.10`.
+
+### Building
+
+- **The product's header is one card**: its name, a profile you pick from a
+  list that says what each kind of profile is, the branch, a health pill
+  (Healthy, or the warnings and conflicts), Apply and Discard, and Generate.
+  The **⋯** menu holds the product's own actions -- settings, add a profile,
+  recheck, open the description, close. (#932)
+- **A summary above Composition**, always there: how many gears were asked
+  for and pulled in, the applications, the last Generate, and the **next
+  step** -- reconnect, retry, review the conflicts, apply your changes, add
+  the first gear, or Generate. (#932)
+- **Gears in two lines**, the name and what the gear is for, with a dot for
+  its warnings or conflicts and its plugins counted; the gears pulled in
+  automatically say which gear needs them. (#932)
+- **A gear's details** in sections -- overview, features, configuration,
+  plugins -- with features as switches ("3 of 5 on") and the rarely needed
+  keys under Advanced. Identifiers are no longer drawn in red. (#932)
+- **The Building ribbon** groups Resolve, Conflicts and Lock as *Health*,
+  with the number of errors on Conflicts, and sets Generate apart. (#932)
+
+### Running and deploying
+
+- **Build, Run and Build images lock the generated tree to the product's own
+  crate versions.** gearbox writes no `Cargo.lock`, so cargo took the newest
+  release of every crate and a build of studio-web's images failed compiling
+  `cf-gears-toolkit` with two releases of `cf-gears-toolkit-security`. The
+  tree now gets the lock of the product's own code (else a fetched source's)
+  when it has none; a lock already there stays. (#934)
+
+### Known not to work
+
+- **A build of images with the new lock is not run end to end on the
+  desktop yet**; the same lock builds studio-web's api-gateway in Studio.
+- **Not looked at in a running app yet**: the dark theme of the new header,
+  switches and summary; the ⋯ menu and the profile list on the desktop,
+  where the menu may be drawn natively and without icons. Features show no
+  description: the engine does not report one.
+
+## 0.3.0-beta.10
+
+What trying Build in the IDE on 0.3.0-beta.9 turned up, and Constructor
+Research as a place to build and deploy. Through the integration PR that
+carries #922, #923 and #926.
+
+### Building
+
+- **Build types into a terminal that runs it.** After a restart, Build, Run
+  and Deploy typed into the terminal tab the layout restored, which showed
+  nothing and ran nothing. They now open a new one. (#926)
+- **Opening a project brings its clones up to date**, as Sync does: fetch,
+  then fast-forward only; a branch with commits of its own is left as it is.
+  A clone made at the first open no longer stays there for good. (#923)
+- **Constructor Research** as an organization's environment: Deploys lists
+  it beside the clusters, and a build made there runs as the project's
+  application. (#922)
+
+### Assistants
+
+- **Claude Code and Codex use the key in your Studio profile**, else an AI
+  connection you reach, through Studio's provider proxy; no provider key is
+  kept on the machine, and Claude Code no longer asks you to sign in to
+  Anthropic. A provider you point elsewhere yourself (its `*_BASE_URL` set)
+  is left alone. (#926)
+- **Your photo on the Accounts button**, from your Studio profile. (#926)
+
+### Known not to work
+
+- **None of the above was run in a built app.** The provider proxy is tested
+  against a stand-in Studio; whether the Codex extension still asks to sign
+  in with the key in its environment is not known.
+
+## 0.3.0-beta.9
+
+Builds start from the portal. Everything merged since `desktop-v0.3.0-beta.8`,
+through the integration PR that carries #916 and #919.
+
+### Building
+
+- **Build in the IDE from the portal.** On a project's **Builds** tab, *On my
+  machine* → **Build in the IDE** opens the project in the desktop, opens its
+  product in Gearbox, and runs the new **Gearbox: Generate and Build**: it
+  waits for the plan, applies it when there is anything to write, and presses
+  the Build the profile shows -- Build images for a kubernetes profile,
+  `cargo build` otherwise. Where a person pressing the buttons would be
+  stopped (an error in the plan, unsaved edits, no application to build), it
+  stops and says why. A product that opens only as a file is not built, and
+  the notice says so. (#916)
+- **Studio's own product resolves again**: its `product.gdl` takes gears-rust
+  at `c14f0fb5d`, where `settings-service` declares the authorization
+  resolver it consumes; at the old pin every build stopped with GBX0206.
+  (#919)
+
+### Known not to work
+
+- **Generate and Build has not been run in a built app**: the link and its
+  handler are covered by unit tests, the command itself by none. Neither was
+  a whole build of Studio's product at the new gears-rust pin; resolving it
+  with the engine from `snapshot-cf63925` was.
+- **A terminal that stays blank.** On one Windows machine running
+  0.3.0-beta.7, the Build terminal opened with no prompt and no shell
+  process behind it, so Build printed nothing. Not reproduced or explained
+  yet; if Build shows an empty terminal, say whether **Terminal → New
+  Terminal** shows a prompt.
+
+## 0.3.0-beta.8
+
+Everything merged since `desktop-v0.3.0-beta.7`, and Gearbox Studio's product
+workspace (#912, which reaches `main` through #913). The first release with a
+Mac build beside the Windows installer.
+
+### Building
+
+- **One product workspace.** The Product view has four sections --
+  Composition, Topology, Checks and Generate -- and a Product menu for its
+  settings and profiles. Composition is a searchable list of the selected
+  gears with the chosen one's settings beside it; Generate, with Build, Run
+  and Deploy, is a section rather than a separate view, and does not apply
+  while changes are pending. A saved layout that still holds a separate
+  Generate tab moves it into the Product view the first time it opens. (#912)
+- **The catalogue groups plugins** under the extension point of the gear they
+  plug into (or lists them flat: **Group plugins**), in the Catalogue and in
+  Add gear alike, and its search reads descriptions and interfaces too. Its
+  diagnostics open beside Conflicts. (#912)
+- **Add gear writes the source the product declares**, so a gears checkout in
+  a folder with another name no longer fails with GBX0102; choosing a plugin
+  under a gear the product lacks adds that gear too. (#912)
+- **Build, publish and deploy from Generate**, as in the portal: the project's
+  builds with their stages and what they published, the recent deploys, the
+  next step, and binding a profile to an environment. A deploy's **Status**
+  reads its pods (ready of desired) and the hosts it answers on from the
+  cluster; **Build in CI…** proposes the build workflow to the repository;
+  the release's configuration secrets of an environment are set and removed
+  there, and never shown. (#912)
+- **Deploy to your organization's environments.** The Deploy panel lists the
+  organization's environments first and the kube contexts on this machine
+  below them. Deploying to an environment asks for confirmation, packs the
+  chart (no helm needed on the machine) and sends it to Studio, which runs it
+  or holds it for an administrator's approval; the panel says which. Build
+  images and Push use the environment's namespace and registry. (#727)
+- **Publish instead of Push** for an environment with a registry login: Studio
+  hands out a push-only token, and the images and the chart go to the
+  organization's registry without a `docker login` of your own. **Build in
+  Studio** builds what is pushed to your branch in the organization's
+  cluster; Deploy then deploys that build. (#865)
+- **Builds are reported to Studio.** A Build, Run or Deploy from the desktop
+  is recorded with the project, so the portal shows it too. (#789, #792)
+- **Build and Run on Windows without hand-set tools.** cmake is found on the
+  PATH or in Visual Studio; protoc on the PATH or with **Get protoc**, which
+  fetches it into `~/ConstructorStudio/tools`. Build uses a short target
+  folder so cmake stays under Windows' path limit. Run starts a Postgres with
+  pgvector, **Create the databases** works on one already running, and the
+  local config gets the defaults a fresh product needs to start. For a
+  kubernetes profile, Build images, Push, Preview manifests and Deploy take
+  the place of Build and Run. (#717)
+- **Gearbox: Configure Sources** uses a local gears checkout -- for working
+  without a Studio server, or with gears of your own. (#912)
+- Checks list errors and warnings first; information is folded, and a
+  diagnostic's code and location are under Details. (#912)
+- **Remove one plugin** from beside its host in the composition. The Product
+  view names the product's branch, and says when a source reads an old copy
+  of the gears, with the commits and the line to change. (#720)
+- **The Gearbox engine comes from a constructorfabric/gearbox release**
+  (`snapshot-cf63925`), checked against its SHA-256. It reads the gears'
+  current `gear.gdl` (`implements`, maturity); a plugin no host declares no
+  longer breaks the catalogue; the `dev` and `local` profiles are development
+  profiles, so they are no longer held to production rules. (#630, #633,
+  #821, #887)
+- **A Studio without Gearbox** gives an empty catalogue instead of "the Studio
+  backend is not answering". (#696)
+- **A product saved in the portal opens in the desktop.** The portal's Build
+  it in Studio-ide link opens the project, then the product on the branch it
+  was saved to. (#617)
 
 ### macOS
 
@@ -18,7 +247,66 @@ Releases up to 0.3.0-beta.4 are described only on their GitHub release pages.
   the Windows installer. It is signed ad hoc: allow it once in System Settings
   → Privacy & Security, and download each new version from its release page
   (the app says when one is out) -- it does not update itself until it is
-  signed with a Developer ID. See desktop-studio.md, *Installing on a Mac*.
+  signed with a Developer ID. Started from Finder or the Dock, the app takes
+  the login shell's PATH, so Homebrew's tools are found. See
+  desktop-studio.md, *Installing on a Mac*. (#636)
+
+### Documents
+
+- **Rendered comparison of Markdown**: two versions side by side, with the
+  added, removed and reworded parts marked on the rendered text -- against
+  HEAD, a branch or a tag, from a conflict, a history entry, a suggestion, and
+  from *what Sync brought*. (#620)
+- **Share with the team** in Doc editing's Team group, with *N documents not
+  shared* in the status bar: commits only your documents, as you, and pushes;
+  a protected branch, or a repository the project takes changes for by review,
+  gets a pull request instead. (#620, #623, #624)
+- **Editing together without noise.** A save changes only the lines you
+  edited; a colleague's first comment arrives without a reload; a pull while
+  a document is open is the commit author's edit, not a held proposal. (#620)
+- **Studio's findings in the editor.** The findings Spec Quality recorded for
+  a document are drawn in the text and listed on the Quality rail. The
+  Quality button is always there, greyed out without findings. The Analyze
+  panel follows a tab picked while it has focus. (#597, #599, #600, #601,
+  #604, #821)
+- **Writing hints**: a dotted underline on a requirement that is over 20
+  words, states two requirements, or has no actor; a project can turn them
+  off. (#716)
+- **The assistants panel no longer opens by itself** on start or on a mode
+  switch; Doc editing's Agents offers Claude Code and Codex. (#605, #620)
+
+### Fixes
+
+- **git asks no password after sign-in.** Fetch and branch switch used to fall
+  back to a user name prompt, because the credential helper started after the
+  window. (#710)
+- **A product saved on its own branch can be switched to**: a clean checkout
+  moves to the branch instead of keeping it in a worktree beside it. (#710)
+- **Gearbox no longer reads every project on the machine** as a source root.
+  (#710)
+- **Long paths on Windows**: the desktop's clones and the product branch's
+  worktree set `core.longpaths`. (#717)
+- **Build in Studio builds with the product's own crate versions.** The first
+  such build of studio-web failed compiling with two releases of the same
+  toolkit crates. (#911, through #913)
+
+### Known not to work
+
+- **The app was not built or smoke-tested with Gearbox Studio's workspace**:
+  the Product view, the grouped catalogue, and the Deploy panel's builds,
+  deploys, Status, Build in CI and secrets (#912) are covered by unit tests
+  only. Nor were the engine from a release (#887), the Mac build itself
+  (#636), Remove plugin and the stale-source notice (#720), or Sync's *Show
+  changed documents* (#620) run in a built app.
+- **Not run against a real cluster or registry**: Deploy to an environment
+  (#727), Publish and a whole Build in Studio (#865).
+- **The Gearbox engine's catalogue is slow** from a Windows folder: about 60
+  seconds against 5 in a container. (#887)
+- **Build and Run** were checked on Windows only; macOS was not run, nor a
+  machine without Visual Studio's cmake. (#717)
+- `gearbox-engine-process.test.ts` has 2 failures on Windows only (its fake
+  engine is a shebang script); unchanged by this release. (#912)
+- Intel Macs are not built. (#636)
 
 ## 0.3.0-beta.7
 

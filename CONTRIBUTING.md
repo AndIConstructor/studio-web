@@ -83,6 +83,9 @@ locally for each component you changed:
 | `keycloak/` | the account-takeover tests against the running Compose Keycloak — [`keycloak/README.md`](keycloak/README.md) has the command |
 | `deploy/` | `helm lint deploy/helm/studio-web -f deploy/helm/values-dev.example.yaml`, and the same for `values-test.example.yaml` |
 
+Which runner a CI job uses, and what each runner can run, is in
+[`deploy/PIPELINES.md`](deploy/PIPELINES.md#runners).
+
 `npm run test:unit` is the frontend command CI runs. A bare `vitest` reads one
 config and misses the per-package suites.
 
@@ -94,7 +97,7 @@ say in the pull request what you saw.
 
 **API, events and errors.** Read [`docs/api-conventions.md`](docs/api-conventions.md)
 before adding or changing an endpoint. A new event `kind` goes into
-[`docs/events-catalog.md`](docs/events-catalog.md); an error a screen branches on
+[`studio-backend/docs/events-catalog.md`](studio-backend/docs/events-catalog.md); an error a screen branches on
 uses a category from [`docs/errors-catalog.md`](docs/errors-catalog.md). The
 portal is held to the backend's OpenAPI by a ratchet
 (`scripts/check-api-usage.mjs`, [ADR-0020](docs/adr/0020-one-contract-with-the-frontend.md)):

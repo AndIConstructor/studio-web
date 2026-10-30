@@ -15,8 +15,10 @@ use anyhow::{Context, anyhow};
 use async_trait::async_trait;
 use base64::Engine;
 use k8s_openapi::api::apps::v1::Deployment as KubeDeployment;
+use k8s_openapi::api::authentication::v1::SelfSubjectReview;
 use k8s_openapi::api::core::v1::{LocalObjectReference, Namespace, Secret, ServiceAccount};
 use k8s_openapi::api::networking::v1::Ingress;
+use k8s_openapi::api::rbac::v1::{RoleBinding, RoleRef, Subject};
 use kube::api::{ListParams, ObjectMeta, Patch, PatchParams, PostParams};
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
@@ -39,7 +41,7 @@ const HELM_TIMEOUT: &str = "8m";
 
 /// The helm binary: `STUDIO_HELM`, or `helm` on the PATH (the image installs
 /// one).
-fn helm_binary() -> String {
+pub(super) fn helm_binary() -> String {
     std::env::var("STUDIO_HELM")
         .ok()
         .filter(|s| !s.trim().is_empty())
@@ -87,8 +89,20 @@ pub struct DeployPayload {
     pub chart: Option<String>,
     #[serde(default)]
     pub chart_ref: Option<ChartRef>,
+    /// The tenant the environment's connections are found from and read as
+    /// (ADR-0054 §5); absent for an organization's environment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connections_from: Option<Uuid>,
     /// Values given to the chart: the images under the environment's registry.
     pub values: serde_json::Value,
+    /// A deploy to a Constructor Research environment (ADR-0049 §4): what it
+    /// prepares and where it puts the application. `None` for a cluster.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub research: Option<super::research::ResearchDeploy>,
+    /// A preview (ADR-0055): its namespace is labelled as one, and its host
+    /// routed once the release is installed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview: Option<super::preview::PreviewRoute>,
 }
 
 pub struct DeployTask {
@@ -223,15 +237,22 @@ impl TaskHandler for DeployTask {
                 ));
             }
         };
+        if let Some(research) = &payload.research {
+            return match super::research::deploy(&self.hub, ctx, &payload, research).await {
+                Ok(at) => TaskOutcome::done_with(at.clone(), serde_json::json!({ "output": at })),
+                Err(e) => TaskOutcome::Failed(format!("{e:#}")),
+            };
+        }
         ctx.progress("reading the cluster's access").await;
-        let access = match cluster_access(
-            &self.hub,
+        let (reader, from) = match super::build::connection_reader(
             &ctx.security,
             payload.organization_id,
-            payload.connection_id,
-        )
-        .await
-        {
+            payload.connections_from,
+        ) {
+            Ok(r) => r,
+            Err(e) => return TaskOutcome::Failed(format!("{e:#}")),
+        };
+        let access = match cluster_access(&self.hub, &reader, from, payload.connection_id).await {
             Ok(a) => a,
             Err(e) => return TaskOutcome::Failed(format!("{e:#}")),
         };
@@ -250,12 +271,10 @@ impl TaskHandler for DeployTask {
             };
         }
         let registry = match payload.registry_connection_id {
-            Some(id) => {
-                match registry_access(&self.hub, &ctx.security, payload.organization_id, id).await {
-                    Ok(r) => Some(r),
-                    Err(e) => return TaskOutcome::Failed(format!("{e:#}")),
-                }
-            }
+            Some(id) => match registry_access(&self.hub, &reader, from, id).await {
+                Ok(r) => Some(r),
+                Err(e) => return TaskOutcome::Failed(format!("{e:#}")),
+            },
             None => None,
         };
         ctx.progress(format!("preparing namespace {}", payload.namespace))
@@ -334,20 +353,30 @@ impl TaskHandler for DeployTask {
             payload.release, payload.namespace
         ))
         .await;
-        match helm(&scratch, helm_args(&payload, &prepared), &ctx.cancel).await {
-            Ok(out) => {
-                info!(
-                    deployment = %payload.deployment_id,
-                    namespace = %payload.namespace,
-                    "studio-environments: release installed"
-                );
-                TaskOutcome::done_with(
-                    format!("{} installed into {}", payload.release, payload.namespace),
-                    serde_json::json!({ "output": tail(&out, 4000) }),
-                )
+        let out = match helm(&scratch, helm_args(&payload, &prepared), &ctx.cancel).await {
+            Ok(out) => out,
+            Err(e) => return TaskOutcome::Failed(format!("{e:#}")),
+        };
+        info!(
+            deployment = %payload.deployment_id,
+            namespace = %payload.namespace,
+            "studio-environments: release installed"
+        );
+        let mut summary = format!("{} installed into {}", payload.release, payload.namespace);
+        if let Some(route) = &payload.preview {
+            ctx.progress("routing the preview's address").await;
+            match super::preview::apply_route(&client, &payload.namespace, &payload.release, route)
+                .await
+            {
+                Ok(Some(said)) => summary = format!("{summary}; {said}"),
+                Ok(None) => {}
+                Err(e) => return TaskOutcome::Failed(format!("{e:#}")),
             }
-            Err(e) => TaskOutcome::Failed(format!("{e:#}")),
         }
+        TaskOutcome::done_with(
+            summary.clone(),
+            serde_json::json!({ "output": format!("{}\n{summary}", tail(&out, 4000)) }),
+        )
     }
 }
 
@@ -371,26 +400,42 @@ pub(super) async fn prepare_namespace(
     namespace: &str,
     project: Uuid,
 ) -> anyhow::Result<()> {
+    make_namespace(client, namespace, project, None).await
+}
+
+/// [`prepare_namespace`], for a preview when `expires_at` is given: the
+/// namespace is labelled as one and says when it expires (ADR-0055).
+async fn make_namespace(
+    client: &kube::Client,
+    namespace: &str,
+    project: Uuid,
+    expires_at: Option<&str>,
+) -> anyhow::Result<()> {
     let namespaces: kube::Api<Namespace> = kube::Api::all(client.clone());
     match namespaces.get_opt(namespace).await {
         Ok(Some(_)) => Ok(()),
         Ok(None) => {
+            let mut labels: std::collections::BTreeMap<String, String> = [
+                (
+                    "app.kubernetes.io/managed-by".to_owned(),
+                    "constructor-studio".to_owned(),
+                ),
+                (
+                    "studio.constructor.tech/project".to_owned(),
+                    project.to_string(),
+                ),
+            ]
+            .into();
+            let mut annotations = std::collections::BTreeMap::new();
+            if let Some(at) = expires_at {
+                labels.insert(super::preview::PREVIEW_LABEL.to_owned(), "true".to_owned());
+                annotations.insert(super::preview::EXPIRES_ANNOTATION.to_owned(), at.to_owned());
+            }
             let ns = Namespace {
                 metadata: ObjectMeta {
                     name: Some(namespace.to_owned()),
-                    labels: Some(
-                        [
-                            (
-                                "app.kubernetes.io/managed-by".to_owned(),
-                                "constructor-studio".to_owned(),
-                            ),
-                            (
-                                "studio.constructor.tech/project".to_owned(),
-                                project.to_string(),
-                            ),
-                        ]
-                        .into(),
-                    ),
+                    labels: Some(labels),
+                    annotations: (!annotations.is_empty()).then_some(annotations),
                     ..ObjectMeta::default()
                 },
                 ..Namespace::default()
@@ -398,7 +443,6 @@ pub(super) async fn prepare_namespace(
             namespaces
                 .create(&PostParams::default(), &ns)
                 .await
-                .map(|_| ())
                 .map_err(|e| {
                     anyhow!(
                         "namespace {} does not exist and the cluster connection may not \
@@ -406,7 +450,8 @@ pub(super) async fn prepare_namespace(
                          create namespaces ({e})",
                         namespace
                     )
-                })
+                })?;
+            grant_self_admin(client, namespace).await
         }
         Err(kube::Error::Api(status)) if status.code == 403 => {
             warn!(namespace = %namespace, "studio-environments: cannot read namespaces; assuming it exists");
@@ -416,8 +461,90 @@ pub(super) async fn prepare_namespace(
     }
 }
 
+/// The RoleBinding that gives the connection `admin` in a namespace it made.
+pub const SELF_ADMIN_BINDING: &str = "constructor-studio";
+
+/// Give the connection's own account `admin` in the namespace it just made.
+/// Creating a namespace gives its creator nothing inside it, so a connection
+/// that may create namespaces (and bind `admin`: the cluster's bootstrap
+/// manifest, `deploy/k8s/studio-environments/`) would otherwise make one it
+/// cannot deploy into. Every project of the organization gets its namespace
+/// this way, without anybody preparing it.
+async fn grant_self_admin(client: &kube::Client, namespace: &str) -> anyhow::Result<()> {
+    let review = kube::Api::<SelfSubjectReview>::all(client.clone())
+        .create(&PostParams::default(), &SelfSubjectReview::default())
+        .await
+        .map_err(|e| anyhow!("the cluster did not say who the connection is: {e}"))?;
+    let username = review
+        .status
+        .and_then(|s| s.user_info)
+        .and_then(|u| u.username)
+        .ok_or_else(|| anyhow!("the cluster did not say who the connection is"))?;
+    let binding = RoleBinding {
+        metadata: ObjectMeta {
+            name: Some(SELF_ADMIN_BINDING.to_owned()),
+            labels: Some(
+                [(
+                    "app.kubernetes.io/managed-by".to_owned(),
+                    FIELD_MANAGER.to_owned(),
+                )]
+                .into(),
+            ),
+            ..ObjectMeta::default()
+        },
+        role_ref: RoleRef {
+            api_group: "rbac.authorization.k8s.io".to_owned(),
+            kind: "ClusterRole".to_owned(),
+            name: "admin".to_owned(),
+        },
+        subjects: Some(vec![subject_for(&username)]),
+    };
+    kube::Api::<RoleBinding>::namespaced(client.clone(), namespace)
+        .patch(
+            SELF_ADMIN_BINDING,
+            &PatchParams::apply(FIELD_MANAGER).force(),
+            &Patch::Apply(&binding),
+        )
+        .await
+        .map(|_| ())
+        .map_err(|e| {
+            anyhow!(
+                "namespace {namespace} was created, but the cluster connection may not give \
+                 itself admin there: apply the cluster's bootstrap manifest, which lets it \
+                 bind admin in the namespaces it makes ({e})"
+            )
+        })
+}
+
+/// The RBAC subject a username names: a service account's
+/// `system:serviceaccount:<namespace>:<name>`, else a user.
+fn subject_for(username: &str) -> Subject {
+    match username
+        .strip_prefix("system:serviceaccount:")
+        .and_then(|rest| rest.split_once(':'))
+    {
+        Some((namespace, name)) => Subject {
+            kind: "ServiceAccount".to_owned(),
+            name: name.to_owned(),
+            namespace: Some(namespace.to_owned()),
+            api_group: None,
+        },
+        None => Subject {
+            kind: "User".to_owned(),
+            name: username.to_owned(),
+            namespace: None,
+            api_group: Some("rbac.authorization.k8s.io".to_owned()),
+        },
+    }
+}
+
 async fn ensure_namespace(client: &kube::Client, p: &DeployPayload) -> anyhow::Result<()> {
-    prepare_namespace(client, &p.namespace, p.project_id).await
+    match &p.preview {
+        None => prepare_namespace(client, &p.namespace, p.project_id).await,
+        Some(route) => {
+            make_namespace(client, &p.namespace, p.project_id, Some(&route.expires_at)).await
+        }
+    }
 }
 
 /// The registry's login as the namespace's pull secret, used by every pod
@@ -797,6 +924,20 @@ pub async fn rollout(
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_service_account_binds_as_itself_and_anybody_else_as_a_user() {
+        let sa = subject_for("system:serviceaccount:studio-environments:deployer");
+        assert_eq!(sa.kind, "ServiceAccount");
+        assert_eq!(sa.name, "deployer");
+        assert_eq!(sa.namespace.as_deref(), Some("studio-environments"));
+        assert_eq!(sa.api_group, None);
+
+        let user = subject_for("kubernetes-admin");
+        assert_eq!(user.kind, "User");
+        assert_eq!(user.name, "kubernetes-admin");
+        assert_eq!(user.api_group.as_deref(), Some("rbac.authorization.k8s.io"));
+    }
+
     fn payload() -> DeployPayload {
         DeployPayload {
             deployment_id: Uuid::nil(),
@@ -813,7 +954,10 @@ mod tests {
             database_image: None,
             chart: Some(String::new()),
             chart_ref: None,
+            connections_from: None,
             values: serde_json::json!({}),
+            research: None,
+            preview: None,
         }
     }
 

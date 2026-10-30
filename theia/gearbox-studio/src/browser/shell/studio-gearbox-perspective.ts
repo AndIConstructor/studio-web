@@ -26,6 +26,7 @@ import { GearAuthorViewContribution } from "../view-contributions";
 import { GearLocator } from "./gear-locator";
 import { GearSessionService } from "./gear-session-service";
 import { ProductSessionService } from "./product-session-service";
+import { ProductDescriptionSync } from "./product-description-sync";
 import { GearboxService } from "../../common/protocol";
 import { PRODUCT_PERSPECTIVE } from "./studio-context-service";
 
@@ -63,6 +64,7 @@ export class StudioGearboxPerspective implements PerspectiveContribution, Comman
   @inject(GearLocator) protected readonly locator!: GearLocator;
   @inject(GearAuthorViewContribution) protected readonly gearView!: GearAuthorViewContribution;
   @inject(QuickInputService) protected readonly quickInput!: QuickInputService;
+  @inject(ProductDescriptionSync) protected readonly descriptions!: ProductDescriptionSync;
 
   registerPerspectives(service: PerspectiveService): void {
     service.registerPerspective({
@@ -137,9 +139,10 @@ export class StudioGearboxPerspective implements PerspectiveContribution, Comman
       await this.perspectives.switchPerspective(PRODUCT_PERSPECTIVE).catch(() => undefined);
     }
     if (!path) return false;
-    // The portal saves a product onto its own branch when the repository is
-    // shared; the session is on the base branch. The branch is then brought
-    // in beside the checkout (`fileOnBranch`), and the copy there is opened.
+    // The portal saved a product onto its own branch when the repository was
+    // shared; the session is on the base branch. A `product/…` branch lends
+    // only the file, written into the checkout, which keeps its current code
+    // (ADR-0053 §4); any other branch is brought in beside the checkout.
     const onBranch =
       branch === undefined ? undefined : await this.gearbox.fileOnBranch(branch, path).catch(() => undefined);
     const file = onBranch !== undefined ? URI.fromFilePath(onBranch) : await this.resolve(path);
@@ -151,6 +154,9 @@ export class StudioGearboxPerspective implements PerspectiveContribution, Comman
       );
       return false;
     }
+    // Opened from Studio: the description Studio keeps goes into the file,
+    // and every change of it back to Studio (ADR-0053 §1, §2).
+    await this.descriptions.open(file).catch((error) => console.warn("[gearbox] the description was not taken from Studio", error));
     const roots = this.workspace.tryGetRoots().map((r) => r.resource);
     const root = roots.find((r) => r.isEqualOrParent(file));
     const label = root ? root.relative(file)?.toString() ?? file.path.base : file.path.base;

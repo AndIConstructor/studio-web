@@ -465,6 +465,8 @@ mod text_of_tests {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct BuildRecord {
     pub build_id: String,
+    /// Where it ran: `studio`, `research`, `ci`, `desktop`.
+    pub r#where: Option<String>,
     /// `running` | `passed` | `failed` | `cancelled`.
     pub status: String,
     pub product: Option<String>,
@@ -483,6 +485,7 @@ impl BuildRecord {
         let text = |k: &str| value.get(k).and_then(|v| v.as_str()).map(str::to_owned);
         BuildRecord {
             build_id: text("build_id").unwrap_or_default(),
+            r#where: text("where"),
             status: text("status").unwrap_or_default(),
             product: text("product"),
             profile: text("profile"),
@@ -522,6 +525,9 @@ impl BuildRecord {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct BuildOutcome {
     pub build_id: String,
+    /// `research` for a build Constructor Research compiled; `None` for one
+    /// in the organization's cluster (`studio`).
+    pub r#where: Option<String>,
     /// `running` | `passed` | `failed`.
     pub status: String,
     pub product: Option<String>,
@@ -532,9 +538,14 @@ pub struct BuildOutcome {
     pub lock_hash: Option<String>,
     pub failure: Option<String>,
     pub failure_step: Option<String>,
+    /// The step a running build is in.
+    pub step: Option<String>,
     pub images: Vec<(String, String)>,
     pub chart_ref: Option<String>,
     pub chart_version: Option<String>,
+    /// The revision of the product description it was built with (ADR-0053
+    /// §2); `None` when it read the file in the checkout.
+    pub description_revision: Option<i64>,
 }
 
 impl BuildOutcome {
@@ -560,10 +571,47 @@ impl BuildOutcome {
             status: "failed".into(),
             repository: Some(repository.to_owned()),
             profile: Some(profile.to_owned()),
-            failure: Some(failure.chars().take(500).collect()),
+            failure: Some(one_line(failure).chars().take(500).collect()),
             failure_step: Some(step.to_owned()),
             ..Self::default()
         }
+    }
+}
+
+/// A tool's output as the one line a build's `failure` holds: its lines
+/// joined with ` · `, any other control character dropped. The record refuses
+/// a control character, and a refused failure left the build `running` for
+/// good, its watch giving up on recording it.
+fn one_line(text: &str) -> String {
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>()
+        .join(" · ")
+        .chars()
+        .filter(|c| !c.is_control())
+        .collect()
+}
+
+#[cfg(test)]
+mod build_outcome_tests {
+    use super::*;
+
+    #[test]
+    fn a_failure_of_many_lines_is_recorded_as_one() {
+        let o = BuildOutcome::failed(
+            "b",
+            "acme/shop",
+            "prod",
+            "Error: gearbox generate failed: error [GBX0511] no plugin\r\n\terror: nothing was generated\n",
+            "prepare",
+        );
+        assert_eq!(
+            o.failure.as_deref(),
+            Some(
+                "Error: gearbox generate failed: error [GBX0511] no plugin · error: nothing was generated"
+            )
+        );
     }
 }
 

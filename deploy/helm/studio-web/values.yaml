@@ -103,7 +103,9 @@ backend:
   # spec_quality_api_key [optional; enables the external detector wrapper],
   # insight_api_key [optional; enables Constructor Insight analytics — without it the
   # Components page reports delivery activity as unavailable],
-  # embed_api_key [required when embedding.provider=remote]).
+  # embed_api_key [required when embedding.provider=remote],
+  # research_client_secret [optional; the `constructor-studio` client's secret at
+  # the Constructor identity provider, see `research` below]).
   appSecrets:
     existingSecret: "studio-web-app"
   # WHO ADMINISTERS THIS INSTALLATION, as Keycloak subject ids, comma-separated.
@@ -261,6 +263,15 @@ backend:
   # Empty = invites disabled (plugin self-deprioritizes).
   idpAdmin:
     baseUrl: ""
+  # Constructor Research (ADR-0049, research-connector-plugin): the client
+  # Studio is registered as at the Constructor identity provider and Research's
+  # account API. The client secret is `research_client_secret` of appSecrets.
+  # Until clientId (and the secret) are set, Constructor Research is not offered.
+  research:
+    issuer: ""        # https://<stand>/idp
+    clientId: ""      # constructor-studio
+    redirectUri: ""   # https://<portal>/connections/oauth/callback
+    apiUrl: ""        # https://<stand>/api/platform-account/v1
   resources:
     requests: { cpu: 200m, memory: 256Mi }
     limits: { cpu: "1", memory: 1Gi }
@@ -286,6 +297,13 @@ backend:
   # What has not happened is two real replicas against a real cluster. Until
   # someone runs that on studio-dev, the guard stays — lifting it is then a
   # one-line change here.
+  # A build in an organization's cluster (studio-environments, ADR-0048 §9)
+  # runs as a Job of three steps. `prepare` and `publish` run in this backend's
+  # own image (backend.image above, so a cluster that admits only its own
+  # registry's proxy gets the image through it); `build` runs rootless BuildKit
+  # from buildkitImage. Point that at the same proxy where such a policy holds.
+  builds:
+    buildkitImage: "moby/buildkit:v0.20.0-rootless"
   sessions:
     enabled: false
     # One checkout, read by the IDE and by the analyses.

@@ -51,7 +51,7 @@ import type { ResolveResult } from "../common/generated/ResolveResult";
 import type { ValidateResult } from "../common/generated/ValidateResult";
 import type { ProgressParams } from "../common/generated/ProgressParams";
 import { GearboxClient, GearboxService, ProductRef, method } from "../common/protocol";
-import { checkoutOfFile, fileOnBranch } from "./product-branch";
+import { checkoutOfFile, descriptionFromBranch, fileOnBranch, isProductBranch } from "./product-branch";
 import { cachedCorpora, corpusCacheRoot, corpusRelay, materializeGitSource, materializeSharedCorpus } from "./git-sources";
 import {
   enginePath,
@@ -67,7 +67,7 @@ import { EngineHandle, spawnEngine } from "./gearbox-engine-process";
 import { closeSourcesList } from "./sources-list";
 import { LOCAL_POSTGRES, type BuildToolchain } from "../common/run-product";
 import type { DeployInfo } from "../common/deploy-product";
-import { deployInfo } from "./deploy-support";
+import { deployInfo, seedLock } from "./deploy-support";
 import { packChart } from "./chart-package";
 import { withBuildTools } from "../common/deploy-product";
 import { buildToolchain, containerOnPort, exec, fetchProtoc, portAnswers, startLocalPostgres, writeRunConfig } from "./run-support";
@@ -213,10 +213,39 @@ export class GearboxServiceImpl implements GearboxService {
    *  repository, each named by its source id, in the engine's order. */
   protected sharedCorpora: string[] = [];
 
-  /** What an engine opens by default: the workspace's own roots, and the shared corpus. */
+  /** The checkouts `useConfiguredRoots` named and this machine has. */
+  protected configuredRoots: string[] = [];
+
+  /** What an engine opens by default: the workspace's own roots, this machine's configured checkouts, and the shared corpus. */
   protected engineRoots(): string[] {
     const roots = this.defaultRoots();
-    return [...roots, ...this.sharedCorpora.filter((dir) => !roots.includes(dir))];
+    for (const dir of [...this.configuredRoots, ...this.sharedCorpora]) {
+      if (!roots.includes(dir)) roots.push(dir);
+    }
+    return roots;
+  }
+
+  async useConfiguredRoots(roots: readonly string[]): Promise<void> {
+    this.configuredRoots = roots
+      .filter((root) => typeof root === "string" && root.trim() !== "")
+      .map((root) => path.resolve(root.trim()))
+      .filter((root) => fs.existsSync(root));
+  }
+
+  async cloneSourceRepository(url: string, parent: string): Promise<string> {
+    const trimmed = url.trim();
+    if (trimmed === "") throw new Error("git clone URL is empty");
+    const name = path.basename(trimmed.replace(/\/+$/, "")).replace(/\.git$/, "") || "gears";
+    const target = path.join(parent, name);
+    // Refused rather than merged into: a directory already there is somebody's.
+    if (fs.existsSync(target)) throw new Error(`${target} already exists; choose it as a checkout instead`);
+    try {
+      await execFileAsync("git", ["clone", trimmed, target], { maxBuffer: 10 * 1024 * 1024 });
+    } catch (error) {
+      fs.rmSync(target, { recursive: true, force: true });
+      throw new Error(`git clone ${trimmed} failed: ${messageOfGit(error)}`);
+    }
+    return target;
   }
 
   protected client: GearboxClient | undefined;
@@ -603,6 +632,9 @@ export class GearboxServiceImpl implements GearboxService {
 
   async fileOnBranch(branch: string, file: string): Promise<string | undefined> {
     try {
+      // A product branch lends only its description: the checkout keeps its
+      // own (current) code, and the file is brought in (ADR-0053 §4).
+      if (isProductBranch(branch)) return await descriptionFromBranch(this.defaultWorkspace(), branch, file);
       // A desktop's checkout is one person's: switch it, rather than hold the
       // branch in a worktree beside it that keeps them from switching to it.
       const desktop = !!(process.env.STUDIO_DESKTOP_ENVIRONMENTS?.trim() || process.env.STUDIO_DESKTOP_URL?.trim());
@@ -1113,6 +1145,17 @@ export class GearboxServiceImpl implements GearboxService {
       if (fixed !== text) await fs.promises.writeFile(file, fixed);
       if (ignore !== undefined) await fs.promises.writeFile(`${file}.dockerignore`, ignore);
     }
+    await this.lockBuildTree(tree);
+  }
+
+  async lockBuildTree(outRoot: string): Promise<string | undefined> {
+    const tree = path.resolve(outRoot);
+    if (!/\/\.gearbox\//.test(tree.replace(/\\/g, "/"))) {
+      throw new Error(`refusing to change files outside a generated tree: ${tree}`);
+    }
+    const lock = await seedLock(tree);
+    if (lock !== undefined) this.logger.info(`gearbox: ${tree} builds with the crate versions of ${lock}`);
+    return lock;
   }
 
   async writeRegistryConfig(host: string, token: string): Promise<string> {

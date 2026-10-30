@@ -143,10 +143,22 @@ enum Commands {
         repo_url: String,
         #[arg(long = "ref")]
         git_ref: Option<String>,
+        /// Take only the product file from this ref (a `product/…` branch);
+        /// the code is `--ref`'s (ADR-0053 §4).
+        #[arg(long)]
+        description_ref: Option<String>,
+        /// The Studio revision whose text is in `STUDIO_PRODUCT_DESCRIPTION`
+        /// (ADR-0053 §2); for the log.
+        #[arg(long)]
+        description_revision: Option<i64>,
         #[arg(long)]
         product_file: String,
         #[arg(long)]
         profile: String,
+        /// A build of the repository's own Dockerfiles and chart, as JSON
+        /// (ADR-0054 §7); without it the product description is built.
+        #[arg(long)]
+        own: Option<String>,
     },
     /// The last step of a build in an organization's cluster: push the chart
     /// beside the images and leave the manifest as the termination message.
@@ -198,17 +210,36 @@ pub async fn run_cli() -> Result<()> {
         work,
         repo_url,
         git_ref,
+        description_ref,
+        description_revision,
         product_file,
         profile,
+        own,
     }) = &cli.command
     {
+        // Studio's revision when the Job carries one (ADR-0053 §2), else only
+        // the file of a product branch (§4), else the checkout's own.
+        let studio_text = std::env::var(environments::build::DESCRIPTION_ENV)
+            .ok()
+            .filter(|t| !t.trim().is_empty());
+        let description = match (studio_text.as_deref(), description_ref.as_deref()) {
+            (Some(text), _) => environments::build::DescriptionFrom::Text {
+                revision: *description_revision,
+                text,
+            },
+            (None, Some(r)) => environments::build::DescriptionFrom::Ref(r),
+            (None, None) => environments::build::DescriptionFrom::Checkout,
+        };
         return environments::build::prepare(
             work,
             repo_url,
             git_ref.as_deref(),
+            &description,
             product_file,
             profile,
-        );
+            own.as_deref(),
+        )
+        .inspect_err(environments::build::say_failure);
     }
     if let Some(Commands::BuildPublish {
         work,
@@ -216,7 +247,9 @@ pub async fn run_cli() -> Result<()> {
         registry_config,
     }) = &cli.command
     {
-        return environments::build::publish(work, prefix, registry_config).map(|_| ());
+        return environments::build::publish(work, prefix, registry_config)
+            .map(|_| ())
+            .inspect_err(environments::build::say_failure);
     }
     if matches!(cli.command, Some(Commands::GtsTypes)) {
         print!("{}", gts_inventory::to_pretty_json()?);

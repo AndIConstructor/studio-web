@@ -7,13 +7,15 @@
  *   - `fixesFrom`: the engine's completion (`POST /gearbox/complete`) turned
  *     into separate fixes, each applied on its own, instead of one "Make it
  *     resolve" that changes everything at once;
+ *   - `productionFixes`: what completion cannot offer -- a production rule
+ *     (GBX0325) broken by a gear that is there, not by one that is missing;
  *   - `codeDiff`: the product against what the code depends on, for "Take
  *     the product from the code";
  *   - `rowShortlist` / `alsoCovers`: section 1 shows one recommendation per
  *     capability and says when one gear answers several;
  *   - `plainText`: a statement quoted from a spec without its markdown. */
 
-import type { Candidate, Conformance, GearConfig, PlanRow, ProductChange } from "./api";
+import type { Candidate, Conformance, GearConfig, GearboxDiagnostic, PlanRow, ProductChange } from "./api";
 import { isPickable } from "./product";
 
 /** A sentence from a document, without the markdown that was around it. */
@@ -33,7 +35,10 @@ export function plainText(s: string): string {
 export type Fix =
   | { kind: "add"; gear: string; reason: string }
   | { kind: "remove"; gear: string; reason: string }
-  | { kind: "config"; gear: string; field: string; value: unknown; reason: string };
+  | { kind: "config"; gear: string; field: string; value: unknown; reason: string }
+  /** A picked gear the product is to configure: its settings, not a change. */
+  | { kind: "setup"; gear: string; fields: string[]; reason: string }
+  | { kind: "replace"; gear: string; with: string; reason: string };
 
 /** The engine's completion of the current product, as separate fixes. */
 export function fixesFrom(
@@ -47,6 +52,10 @@ export function fixesFrom(
     const key = `${c.added ? "+" : "-"}${c.gear}`;
     if (seen.has(key)) continue;
     seen.add(key);
+    if (c.needs && c.needs.length > 0) {
+      out.push({ kind: "setup", gear: c.gear, fields: c.needs, reason: c.reason });
+      continue;
+    }
     if (c.added && !picks.includes(c.gear)) out.push({ kind: "add", gear: c.gear, reason: c.reason });
     if (!c.added && picks.includes(c.gear)) out.push({ kind: "remove", gear: c.gear, reason: c.reason });
   }
@@ -65,17 +74,51 @@ export function fixesFrom(
   return out;
 }
 
+/** A production rule a picked gear breaks, and the gear that keeps it. */
+const PRODUCTION_SWAPS = [
+  {
+    // `accept_all`, its default mode, authenticates any non-empty token.
+    code: "GBX0325",
+    gear: "static-authn-plugin",
+    with: "oidc-authn-plugin",
+    reason: "static sign-in accepts any token; a production profile signs in with OIDC",
+  },
+];
+
+/** Fixes for the production rules a preview reports broken: each swaps the
+ *  pick that breaks one for the gear that keeps it. Picks are named as the
+ *  catalogue names them (`cf-gears-static-authn-plugin`), errors by engine id. */
+export function productionFixes(picks: readonly string[], diagnostics: readonly GearboxDiagnostic[]): Fix[] {
+  const out: Fix[] = [];
+  for (const swap of PRODUCTION_SWAPS) {
+    const named = "`" + swap.gear + "`";
+    const broken = diagnostics.some((d) => d.severity === "error" && d.code === swap.code && d.message.includes(named));
+    const pick = picks.find((p) => p === swap.gear || p.endsWith("-" + swap.gear));
+    if (!broken || !pick) continue;
+    const keeper = pick.slice(0, pick.length - swap.gear.length) + swap.with;
+    out.push(
+      picks.includes(keeper)
+        ? { kind: "remove", gear: pick, reason: swap.reason }
+        : { kind: "replace", gear: pick, with: keeper, reason: swap.reason },
+    );
+  }
+  return out;
+}
+
 /** The picks and configuration with one fix applied. */
 export function applyFix(
   picks: readonly string[],
   config: GearConfig,
   fix: Fix,
 ): { picks: string[]; config: GearConfig } {
+  if (fix.kind === "setup") return { picks: [...picks], config };
   if (fix.kind === "add") return { picks: picks.includes(fix.gear) ? [...picks] : [...picks, fix.gear], config };
-  if (fix.kind === "remove") {
+  if (fix.kind === "remove" || fix.kind === "replace") {
     const next = { ...config };
     delete next[fix.gear];
-    return { picks: picks.filter((p) => p !== fix.gear), config: next };
+    const kept = picks.filter((p) => p !== fix.gear);
+    if (fix.kind === "replace" && !kept.includes(fix.with)) kept.push(fix.with);
+    return { picks: kept, config: next };
   }
   return { picks: [...picks], config: { ...config, [fix.gear]: { ...(config[fix.gear] ?? {}), [fix.field]: fix.value } } };
 }
@@ -139,7 +182,8 @@ export function alsoCovers(plan: readonly PlanRow[]): Record<string, string[]> {
 
 // ── The next step ────────────────────────────────────────────────────────
 
-export type NextAction = "add-recommended" | "take-from-code" | "preview" | "fix" | "build" | "open";
+/** `builds`: the product is written; building it is the Builds tab's. */
+export type NextAction = "add-recommended" | "take-from-code" | "preview" | "fix" | "build" | "open" | "builds";
 
 export interface NextStep {
   text: string;
@@ -200,7 +244,11 @@ export function nextStep(s: FlowState): NextStep {
       ? ` ${plural(s.open, "capability", "capabilities")} the specs ask for ${s.open === 1 ? "is" : "are"} not closed yet.`
       : "";
   if (!s.written) return { text: `The product resolves: build it in Studio-ide.${gap}`, action: "build", tone: gap ? "warn" : "todo" };
-  return { text: `Built: product.gdl is in the repository. Open it in Studio-ide.${gap}`, action: "open", tone: gap ? "warn" : "done" };
+  return {
+    text: `Composed: product.gdl is in the repository. Next: build it, in Studio, the IDE or CI.${gap}`,
+    action: "builds",
+    tone: gap ? "warn" : "done",
+  };
 }
 
 /** One step of the way from the specs to a built product. */

@@ -10,6 +10,7 @@ import {
   environmentsByConnection,
   namespaceFor,
   registryConnections,
+  researchConnections,
   registryHost,
   runningNow,
   slug,
@@ -71,6 +72,16 @@ describe("an environment form", () => {
     expect(environmentProblem({ ...ready, namespace_pattern: "{environment}" }, [])).toMatch(/\{project\}/);
     expect(environmentProblem({ ...ready, registry: "https://ghcr.io/acme" }, [])).toMatch(/scheme/);
     expect(environmentProblem({ ...ready, projects: [] }, [])).toMatch(/at least one project/);
+  });
+
+  it("takes previews only where nobody approves deploys, with a domain, a life and a limit that make sense", () => {
+    const previews = { domain: "preview.example.com", ingress_class: null, ttl_hours: 72, max_live: 3 };
+    expect(environmentProblem({ ...ready, previews }, [])).toBeNull();
+    expect(environmentProblem({ ...ready, previews: { ...previews, domain: "" } }, [])).toBeNull();
+    expect(environmentProblems({ ...ready, protected: true, previews }, []).previews).toMatch(/protected/);
+    expect(environmentProblems({ ...ready, previews: { ...previews, domain: "not a domain" } }, []).previews).toMatch(/domain/);
+    expect(environmentProblems({ ...ready, previews: { ...previews, ttl_hours: 0 } }, []).previews).toMatch(/336/);
+    expect(environmentProblems({ ...ready, previews: { ...previews, max_live: 21 } }, []).previews).toMatch(/20/);
   });
 
   it("says everything wrong at once, by field", () => {
@@ -174,5 +185,21 @@ describe("cluster cards", () => {
       ["A cluster this page cannot see", 1, 1, "2026-09-01T00:00:00Z"],
     ]);
     expect(cards[0].running).toHaveLength(2);
+  });
+});
+
+describe("a Constructor Research environment (ADR-0049)", () => {
+  const research = { ...emptyEnvironment(), name: "ml", kind: "research" as const, connection_id: "r1", research_project: "p1" };
+
+  it("names its connection and project, and nothing of a cluster", () => {
+    expect(environmentProblem(research, [])).toBeNull();
+    expect(environmentProblems({ ...research, research_project: " " }, []).research_project).toMatch(/Research project/);
+    expect(environmentProblems({ ...research, connection_id: "" }, []).connection_id).toMatch(/Research connection/);
+    expect(environmentProblem({ ...research, namespace_pattern: "fixed" }, [])).toBeNull();
+  });
+
+  it("is chosen from Research sign-ins, a member's own among them", () => {
+    const c = (id: string, provider: string, scope: string) => ({ id, provider, scope }) as Connection;
+    expect(researchConnections([c("a", "research", "organization"), c("b", "research", "personal"), c("k", "kubernetes", "organization")]).map((x) => x.id)).toEqual(["a", "b"]);
   });
 });

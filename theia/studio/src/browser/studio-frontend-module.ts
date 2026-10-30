@@ -52,7 +52,9 @@ import { AnalyzeContribution } from './analyze-contribution';
 import { AnalyzeStudioClient } from './analyze-studio-client';
 import { DeployEnvironments, GEARBOX_DEPLOY_ENVIRONMENTS } from './gearbox-deploy-environments';
 import { BuildReports, GEARBOX_BUILD_REPORTS } from './gearbox-build-reports';
+import { GEARBOX_PRODUCT_DESCRIPTIONS, ProductDescriptions } from './gearbox-product-descriptions';
 import { isDesktopHost } from './desktop-git-contribution';
+import { DesktopAccountAvatar } from './desktop-account-avatar';
 import { AnalyzeWidget } from './analyze-widget';
 import { AuditFrontendController } from './audit-controller';
 import { OperationsWidget } from './operations-widget';
@@ -163,6 +165,9 @@ export default new ContainerModule((bind, unbind, isBound, rebind) => {
     // What each mode keeps on its rails, whatever order the modes were visited in.
     bind(StudioModeLayout).toSelf().inSingletonScope();
     bind(FrontendApplicationContribution).toService(StudioModeLayout);
+    // The desktop's Accounts button, as the member's photo.
+    bind(DesktopAccountAvatar).toSelf().inSingletonScope();
+    bind(FrontendApplicationContribution).toService(DesktopAccountAvatar);
     // The three modes, chosen explicitly, each with its own toolbar.
     bind(StudioModeBar).toSelf().inSingletonScope();
     bind(StudioModeSwitch).toSelf().inSingletonScope();
@@ -243,6 +248,11 @@ export default new ContainerModule((bind, unbind, isBound, rebind) => {
     bind(GEARBOX_BUILD_REPORTS).toDynamicValue(ctx => {
         const client = ctx.container.get(AnalyzeStudioClient);
         return new BuildReports(roots => client.scope(roots), isDesktopHost);
+    }).inSingletonScope();
+    // The product's description is read from and saved to Studio (ADR-0053).
+    bind(GEARBOX_PRODUCT_DESCRIPTIONS).toDynamicValue(ctx => {
+        const client = ctx.container.get(AnalyzeStudioClient);
+        return new ProductDescriptions(roots => client.scope(roots));
     }).inSingletonScope();
     bind(WorkspaceGraphService).toDynamicValue(ctx => {
         const provider = ctx.container.get(WebSocketConnectionProvider);

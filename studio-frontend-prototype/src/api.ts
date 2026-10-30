@@ -940,8 +940,11 @@ export interface ProjectConfig {
   /** The CI workflow that builds the product (ADR-0045): Build starts it. */
   build?: { repo: string; workflow: string };
   /** The product's frontend (ADR-0050): the micro-frontends its shell
-   *  mounts, by package name, until product.gdl has a frontend block. */
-  frontend?: { mfes?: string[] };
+   *  mounts, by package name, until product.gdl has a frontend block.
+   *  Absent: the product has no frontend (it is gears alone). `shell` is the
+   *  FrontX template the shell comes from, as FrontX's provenance spells a
+   *  source (`github:owner/repo//template-shell@ref`). */
+  frontend?: { mfes?: string[]; shell?: string };
 }
 
 // Workspace settings live as AM tenant metadata (schema seeded by the backend config).
@@ -1600,12 +1603,20 @@ export interface BudgetStatus {
 
 /** One place an organization's products run: a cluster reached through a
  *  `kubernetes` connection, a registry, a namespace per project. */
+/** What runs an environment's products: a cluster, or Constructor Research (ADR-0049). */
+export type EnvironmentKind = "kubernetes" | "research";
+
 export interface DeployEnvironment {
   id: string;
   name: string;
   description: string;
-  /** The organization's `kubernetes` connection. */
+  /** Absent on environments written before kinds: a cluster. */
+  kind?: EnvironmentKind;
+  /** The organization's `kubernetes` connection, or its `research` one. */
   connection_id: string;
+  /** For `research`: the Research project products run in, and the hardware. */
+  research_project?: string | null;
+  research_hardware?: string | null;
   /** Image registry prefix (`ghcr.io/acme`); empty: images as generated. */
   registry: string;
   /** The organization's `registry` connection: the cluster pulls with it and
@@ -1623,15 +1634,64 @@ export interface DeployEnvironment {
   promote_from?: string | null;
   /** The projects that may deploy here; absent: all of them. */
   projects?: string[] | null;
+  /** The project that keeps it (ADR-0054); absent: the organization's. */
+  project_id?: string | null;
+  /** Whether projects may preview a build here (ADR-0055); absent: no. */
+  previews?: PreviewSettings | null;
   updated_by: string;
   updated_at: string;
+}
+
+/** What an environment says of previews (ADR-0055). */
+export interface PreviewSettings {
+  /** Wildcard DNS to the cluster's ingress: a preview answers at
+   *  `<namespace>.<domain>`. Empty: no address. */
+  domain: string;
+  /** Absent: the cluster's default Ingress class. */
+  ingress_class?: string | null;
+  /** How long a preview lives, and the most anybody may ask for. */
+  ttl_hours?: number | null;
+  /** How many previews one project keeps there at once. */
+  max_live?: number | null;
+}
+
+/** A deployment that is a preview (ADR-0055). */
+export interface DeploymentPreview {
+  name: string;
+  expires_at: string;
+  host?: string | null;
+  removed_at?: string | null;
+  removal_error?: string | null;
+}
+
+/** How a project builds (ADR-0054 §7): on gears from its `product.gdl`, or
+ *  from the repository's own Dockerfiles and Helm chart. */
+export interface ProjectBuildSetting {
+  kind: "gears" | "own";
+  images: OwnImage[];
+  chart?: string | null;
+}
+
+/** One image of a build of the repository's own. */
+export interface OwnImage {
+  /** The chart's values key: a deploy sets `<app>.image.repository` and `.tag`. */
+  app: string;
+  /** The image's name under the environment's registry. */
+  name: string;
+  /** From the repository's root. */
+  dockerfile: string;
+  /** From the repository's root; `.` by default. */
+  context?: string | null;
 }
 
 /** What an administrator sends for an environment. */
 export interface DeployEnvironmentInput {
   name: string;
   description: string;
+  kind?: EnvironmentKind;
   connection_id: string;
+  research_project?: string | null;
+  research_hardware?: string | null;
   registry: string;
   registry_connection_id?: string | null;
   namespace_pattern?: string;
@@ -1640,6 +1700,20 @@ export interface DeployEnvironmentInput {
   protected: boolean;
   promote_from?: string | null;
   projects?: string[] | null;
+  previews?: PreviewSettings | null;
+}
+
+/** A Constructor Research project, as its integration service names it. */
+export interface ResearchProject {
+  id: string;
+  name: string;
+}
+
+/** A hardware configuration of a Research project; a trial one Research ends by its rules. */
+export interface ResearchHardware {
+  id: string;
+  name: string;
+  trial: boolean;
 }
 
 /** A project's product profile bound to an environment. */
@@ -1708,6 +1782,8 @@ export interface Deployment {
   decided_at?: string | null;
   reason?: string | null;
   outcome?: string | null;
+  /** A preview (ADR-0055); absent for a deploy of what runs there. */
+  preview?: DeploymentPreview | null;
 }
 
 /** A release as its cluster reports it now. */
@@ -2728,6 +2804,19 @@ async function requestBlob(path: string, token: string): Promise<Blob> {
   return res.blob();
 }
 
+/** How many more times a product preview is asked after a gateway timeout. */
+const PREVIEW_RETRIES = 3;
+
+async function retryOnTimeout<T>(ask: () => Promise<T>, retries: number): Promise<T> {
+  for (let left = retries; ; left--) {
+    try {
+      return await ask();
+    } catch (e) {
+      if (left === 0 || !(e instanceof ApiError) || e.status !== 504) throw e;
+    }
+  }
+}
+
 /** Server-side ceiling on `limit` (studio-backend `src/pagination.rs`). */
 const MAX_PAGE = 200;
 
@@ -2975,6 +3064,16 @@ export interface ScaffoldFile {
   content: string;
 }
 
+/** A build Studio runs, as its pod shows it now (`GET …/builds/{id}/log`). */
+export interface BuildLog {
+  build_id: string;
+  /** The environment it runs in. */
+  environment: string;
+  namespace: string;
+  /** prepare, build, publish: in the order they run. */
+  steps: { step: string; state: "waiting" | "running" | "passed" | "failed" | string; log: string }[];
+}
+
 export interface ProjectGearRepo {
   project_id?: string;
   tenant?: string;
@@ -3044,6 +3143,18 @@ export interface ProductChange {
   gear: string;
   added: boolean;
   reason: string;
+  /** A picked gear kept with settings it has yet to be given: their names. */
+  needs?: string[];
+}
+
+/** Something a product's gears need running beside them. */
+export interface ProductTechnology {
+  /** `postgres`, `oidc`, `keycloak`, `clickhouse`, ... */
+  id: string;
+  name: string;
+  why: string;
+  /** The gears that need it, by crate name. */
+  gears: string[];
 }
 
 /** The product a project is composing, as the server remembers it. */
@@ -3101,9 +3212,51 @@ export interface ProjectProduct {
     /** Every gear the resolution contains, picked or pulled in, by crate. */
     gears: string[];
     corpus_commit?: string | null;
+    /** What the gears need running beside them; absent in a record from before. */
+    infrastructure?: ProductTechnology[];
   };
   /** Where `product.gdl` was last committed; `path` is relative to the repository root. */
   written?: { branch: string; commit_sha: string; pr_url?: string | null; path?: string };
+  /** The description revision Studio keeps (ADR-0053), and its path in the repository. */
+  description?: { revision: number; sha256?: string; path?: string | null };
+  /** Where and which revision was last published to the repository (ADR-0053 §3). */
+  published?: { revision: number; branch: string; commit_sha: string; pr_url?: string | null; path?: string; at?: string };
+}
+
+/** One revision of a product's description, which Studio keeps (ADR-0053). */
+export interface ProductDescriptionRevision {
+  revision: number;
+  text: string;
+  author: string;
+  created_at: string;
+  sha256: string;
+  /** `studio`, `repository` (read back from the base branch) or `migrated`. */
+  source: string;
+}
+
+/** A project's product description as Studio keeps it. */
+export interface ProductDescription {
+  latest?: ProductDescriptionRevision | null;
+  path?: string | null;
+  published?: { revision: number; branch: string; commit_sha: string; pr_url?: string | null; path: string; at?: string | null } | null;
+  /** The published file, changed in the repository since: offered as a new revision. */
+  repository_change?: { path: string; branch: string; text: string; sha256: string } | null;
+}
+
+/** The 409 a save against an older revision answers: both texts. */
+export interface ProductDescriptionConflict {
+  reason: string;
+  message: string;
+  base_revision?: number | null;
+  latest: ProductDescriptionRevision;
+  yours: string;
+}
+
+/** The conflict in an ApiError, when the error is one. */
+export function descriptionConflictOf(e: unknown): ProductDescriptionConflict | null {
+  if (!(e instanceof ApiError) || e.status !== 409) return null;
+  const body = e.body as Partial<ProductDescriptionConflict> | undefined;
+  return body?.reason === "DESCRIPTION_REVISION_STALE" && body.latest ? (body as ProductDescriptionConflict) : null;
 }
 
 /** What the Gearbox engine made of a set of picked gears. */
@@ -3120,7 +3273,10 @@ export interface ProductPreview {
    *  engine ids that could fill it. */
   plugin_options: { host: string; available: string[] }[];
   corpus_commit?: string | null;
+  /** Set when `write` published it to the repository. */
   written?: { branch: string; commit_sha: string; pr_url?: string | null } | null;
+  /** Set when `write` saved it as a revision Studio keeps (ADR-0053). */
+  description_revision?: { revision: number; created: boolean; sha256: string } | null;
 }
 
 /** What `importDomainModel` loaded. */
@@ -4343,10 +4499,58 @@ export const api = {
 
   /** The organization's deployment environments, and whether the caller may change them. */
   environments: (token: string, org: string) =>
-    request<{ items: DeployEnvironment[]; total: number; may_manage: boolean }>(
-      `/studio-environments/v1/environments?organization_id=${encodeURIComponent(org)}`,
+    request<{
+      items: DeployEnvironment[];
+      total: number;
+      may_manage: boolean;
+      /** The clusters its projects may put environments of their own on (ADR-0054). */
+      open_clusters?: { connection_ids: string[] };
+    }>(`/studio-environments/v1/environments?organization_id=${encodeURIComponent(org)}`, token),
+  /** Say which of the organization's clusters its projects may use (ADR-0054 §2). */
+  saveOpenClusters: (token: string, org: string, connectionIds: string[]) =>
+    request<{ connection_ids: string[] }>(
+      `/studio-environments/v1/open-clusters?organization_id=${encodeURIComponent(org)}`,
+      token,
+      { method: "PUT", body: JSON.stringify({ connection_ids: connectionIds }) },
+    ),
+  /** A project's own environments, and the organization's clusters it may put one on. */
+  projectEnvironments: (token: string, projectId: string) =>
+    request<{ items: DeployEnvironment[]; total: number; open_clusters: { connection_ids: string[] } }>(
+      `/studio-environments/v1/project-environments?project_id=${encodeURIComponent(projectId)}`,
       token,
     ),
+  createProjectEnvironment: (token: string, projectId: string, body: DeployEnvironmentInput) =>
+    request<DeployEnvironment>(
+      `/studio-environments/v1/project-environments?project_id=${encodeURIComponent(projectId)}`,
+      token,
+      { method: "POST", body: JSON.stringify(body) },
+    ),
+  updateProjectEnvironment: (token: string, projectId: string, id: string, body: DeployEnvironmentInput) =>
+    request<DeployEnvironment>(
+      `/studio-environments/v1/project-environments/${encodeURIComponent(id)}?project_id=${encodeURIComponent(projectId)}`,
+      token,
+      { method: "PUT", body: JSON.stringify(body) },
+    ),
+  deleteProjectEnvironment: (token: string, projectId: string, id: string) =>
+    request<void>(
+      `/studio-environments/v1/project-environments/${encodeURIComponent(id)}?project_id=${encodeURIComponent(projectId)}`,
+      token,
+      { method: "DELETE" },
+    ),
+  testProjectEnvironment: (token: string, projectId: string, id: string) =>
+    request<{ message: string }>(
+      `/studio-environments/v1/project-environments/${encodeURIComponent(id)}/test?project_id=${encodeURIComponent(projectId)}`,
+      token,
+      { method: "POST" },
+    ),
+  /** How the project builds (ADR-0054 §7). */
+  projectBuild: (token: string, projectId: string) =>
+    request<ProjectBuildSetting>(`/studio-environments/v1/project-build?project_id=${encodeURIComponent(projectId)}`, token),
+  saveProjectBuild: (token: string, projectId: string, body: ProjectBuildSetting) =>
+    request<ProjectBuildSetting>(`/studio-environments/v1/project-build?project_id=${encodeURIComponent(projectId)}`, token, {
+      method: "PUT",
+      body: JSON.stringify(body),
+    }),
   createEnvironment: (token: string, org: string, body: DeployEnvironmentInput) =>
     request<DeployEnvironment>(`/studio-environments/v1/environments?organization_id=${encodeURIComponent(org)}`, token, {
       method: "POST",
@@ -4371,6 +4575,18 @@ export const api = {
       token,
       { method: "POST" },
     ),
+  /** The Research projects an organization's `research` connection may run products in. */
+  researchProjects: (token: string, org: string, connectionId: string) =>
+    request<{ items: ResearchProject[] }>(
+      `/studio-environments/v1/research/projects?${new URLSearchParams({ organization_id: org, connection_id: connectionId })}`,
+      token,
+    ),
+  /** The hardware a Research project's services may run on. */
+  researchHardware: (token: string, org: string, connectionId: string, project: string) =>
+    request<{ items: ResearchHardware[] }>(
+      `/studio-environments/v1/research/projects/${encodeURIComponent(project)}/hardware?${new URLSearchParams({ organization_id: org, connection_id: connectionId })}`,
+      token,
+    ),
   /** Where a project's product can be deployed, and its profile bindings. */
   projectTargets: (token: string, projectId: string) =>
     request<ProjectTargets>(`/studio-environments/v1/targets?project_id=${encodeURIComponent(projectId)}`, token),
@@ -4392,12 +4608,22 @@ export const api = {
       build?: string;
       redeploy_of?: string;
       action?: "install" | "uninstall";
+      /** Install it as a preview (ADR-0055), in a namespace of its own. */
+      preview?: { name?: string; ttl_hours?: number };
     },
   ) =>
     request<Deployment>(`/studio-environments/v1/deployments?project_id=${encodeURIComponent(projectId)}`, token, {
       method: "POST",
       body: JSON.stringify({ profile: "", product: "", ...body }),
     }),
+  /** Remove a preview before it expires (ADR-0055): 202 with the run that
+   *  deletes its namespace. */
+  removePreview: (token: string, projectId: string, deploymentId: string) =>
+    request<{ run_id: string }>(
+      `/studio-environments/v1/previews/${encodeURIComponent(deploymentId)}?project_id=${encodeURIComponent(projectId)}`,
+      token,
+      { method: "DELETE" },
+    ),
   /** Build the product in an environment's cluster (ADR-0048 §9): 202 with
    *  the build's id, recorded as running and then passed or failed. */
   startBuild: (
@@ -4409,6 +4635,13 @@ export const api = {
       `/studio-environments/v1/builds?project_id=${encodeURIComponent(projectId)}`,
       token,
       { method: "POST", body: JSON.stringify(body) },
+    ),
+  /** A build Studio runs, step by step with the end of each step's log, read
+   *  from its pod now; 404 once the pod is gone, a day after it ended. */
+  buildLog: (token: string, projectId: string, buildId: string) =>
+    request<BuildLog>(
+      `/studio-environments/v1/builds/${encodeURIComponent(buildId)}/log?project_id=${encodeURIComponent(projectId)}`,
+      token,
     ),
   /** Propose the workflow that builds the product for an environment, as a
    *  pull request to the project's repository. */
@@ -5755,6 +5988,33 @@ export const api = {
     );
     return r.nodes?.[0]?.value ?? null;
   },
+  /** The project's product description as Studio keeps it (ADR-0053). */
+  productDescription: (token: string, projectId: string) =>
+    request<ProductDescription>(`/studio-product/v1/product-description?project_id=${encodeURIComponent(projectId)}`, token),
+  /** Save a new revision against `base_revision`; a 409 (`descriptionConflictOf`) when it is not the latest. */
+  saveProductDescription: (
+    token: string,
+    projectId: string,
+    body: { base_revision?: number | null; text: string; from_repository?: boolean },
+  ) =>
+    request<{ revision: ProductDescriptionRevision; created: boolean }>(
+      `/studio-product/v1/product-description-revisions?project_id=${encodeURIComponent(projectId)}`,
+      token,
+      { method: "POST", body: JSON.stringify(body) },
+    ),
+  /** Publish the latest revision to the repository (ADR-0053 §3). */
+  publishProductDescription: (token: string, projectId: string, body: { onto_base?: boolean } = {}) =>
+    request<{ revision: number; branch: string; commit_sha: string; pr_url?: string | null; path: string }>(
+      `/studio-product/v1/product-description-publications?project_id=${encodeURIComponent(projectId)}`,
+      token,
+      { method: "POST", body: JSON.stringify(body) },
+    ),
+  /** The `product/*` branches from before Studio kept the description, which the project may delete. */
+  oldProductBranches: (token: string, projectId: string) =>
+    request<{ items: { branch: string; commit_sha: string; pr_url?: string | null; held: boolean }[]; total: number }>(
+      `/studio-product/v1/product-description-branches?project_id=${encodeURIComponent(projectId)}`,
+      token,
+    ),
   /** Merge fields into the project's product; omitted fields keep their value. */
   saveProjectProduct: (
     token: string,
@@ -5842,9 +6102,12 @@ export const api = {
     return request<GearboxStatus>(`/studio-product/v1/gearbox${q.length ? `?${q.join("&")}` : ""}`, token);
   },
   /** Compose a product.gdl from picked gears and resolve it with the Gearbox
-   *  engine. `write` also commits it to the project's repository -- where its
-   *  source's share mode says (onto the base branch, or a `product/…` branch
-   *  with a pull request) unless `open_pr` / `onto_base` say otherwise. */
+   *  engine. `write` also saves it as the project's next description revision,
+   *  which Studio keeps (ADR-0053); a 409 (`descriptionConflictOf`) when
+   *  `base_revision` is no longer the latest. `publish` also writes it to the
+   *  repository -- onto `product/<id>` with one pull request, or onto the base
+   *  branch as its source's share mode says -- unless `open_pr` / `onto_base`
+   *  say otherwise. */
   previewProduct: (
     token: string,
     projectId: string,
@@ -5854,18 +6117,27 @@ export const api = {
       gears: string[];
       profile?: string;
       write?: boolean;
+      base_revision?: number;
+      publish?: boolean;
       open_pr?: boolean;
       /** The product's configuration of its gears (see GearConfig). */
       config?: GearConfig;
       /** Commit onto the base branch, whatever the share mode. */
       onto_base?: boolean;
     },
-  ) =>
-    request<ProductPreview>(
-      `/studio-product/v1/projects/${encodeURIComponent(projectId)}/product/preview`,
-      token,
-      { method: "POST", body: JSON.stringify(body) },
-    ),
+  ) => {
+    const ask = () =>
+      request<ProductPreview>(
+        `/studio-product/v1/projects/${encodeURIComponent(projectId)}/product/preview`,
+        token,
+        { method: "POST", body: JSON.stringify(body) },
+      );
+    // A large product resolves past the gateway's 30 s; the backend finishes
+    // the run and keeps its answer, so asking again (a read only -- a write
+    // is never repeated) picks it up instead of reporting a timeout.
+    if (body.write) return ask();
+    return retryOnTimeout(ask, PREVIEW_RETRIES);
+  },
   /** Create a new repository via the connector and set it as the project's gear repo. */
   createProjectRepo: (
     token: string,

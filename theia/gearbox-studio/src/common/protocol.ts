@@ -251,7 +251,9 @@ export interface GearboxService {
    * as it is on `branch`, bringing the branch in beside its checkout as a git
    * worktree when no checkout has it. `undefined` when no checkout's origin
    * has the branch, or the file is not on it. For a product the portal saved
-   * onto its own branch of a shared repository.
+   * onto its own branch of a shared repository. A `product/…` branch lends
+   * only the file: it is written into the checkout, which stays on its own
+   * branch and code (ADR-0053 §4).
    */
   fileOnBranch(branch: string, file: string): Promise<string | undefined>;
 
@@ -307,6 +309,22 @@ export interface GearboxService {
    * are missing. The directories in order, or `undefined` when one is not.
    */
   useSharedCorpora(origins: readonly CorpusOrigin[], fetch: boolean): Promise<string[] | undefined>;
+
+  /**
+   * Constructor Studio: this machine's own gear checkouts, from the
+   * `gearbox.sourceRoots` setting (**Gearbox: Configure Sources**) -- the way
+   * to a catalogue with no Studio server to list or bring one. An engine opens
+   * them beside the workspace's roots and the shared corpus; a path no longer
+   * there is left out. Said before each load, as the window's folder is.
+   */
+  useConfiguredRoots(roots: readonly string[]): Promise<void>;
+
+  /**
+   * Constructor Studio: `git clone <url>` into a new directory under `parent`;
+   * its absolute path. For **Configure Sources**, when this machine has no
+   * checkout of the gears yet. Refuses a directory already there.
+   */
+  cloneSourceRepository(url: string, parent: string): Promise<string>;
 
   /** Evaluate a `product.gdl`. Evaluation only; nothing is joined against the
    * catalogue. */
@@ -549,6 +567,12 @@ export interface GearboxService {
    * tree only.
    */
   prepareImageBuild(outRoot: string): Promise<void>;
+  /**
+   * Give the generated tree the `Cargo.lock` of the sources it builds when it
+   * has none (gearbox writes none): the product's own code's first, else a
+   * fetched one's. Inside a generated tree only; the lock copied, if any.
+   */
+  lockBuildTree(outRoot: string): Promise<string | undefined>;
   /** Where `file` is in its git repository, and the branch checked out: what a build in Studio clones. */
   repositoryPathOf(file: string): Promise<{ readonly path: string; readonly branch?: string } | undefined>;
 
@@ -750,6 +774,30 @@ export const DeployEnvironmentsSource = Symbol.for("gearbox-studio.DeployEnviron
  * is a desktop or a session; absent in Gearbox Studio proper, where nothing
  * is reported.
  */
+/**
+ * Constructor Studio: the product's description as Studio keeps it, by
+ * revision (ADR-0053). Bound by the Studio extension, which knows the project
+ * a folder was opened for and holds the member's token; absent in Gearbox
+ * Studio proper, where the file in the checkout is the description.
+ */
+export const ProductDescriptions = Symbol.for("gearbox-studio.ProductDescriptions");
+export interface StudioDescriptionRevision {
+  readonly revision: number;
+  readonly text: string;
+  readonly author?: string;
+  readonly createdAt?: string;
+}
+export type DescriptionSave =
+  | { readonly kind: "saved"; readonly revision: number }
+  | { readonly kind: "conflict"; readonly latest: StudioDescriptionRevision; readonly yours: string }
+  | { readonly kind: "none" };
+export interface ProductDescriptions {
+  /** The latest revision for the project `file` belongs to; undefined when none, or none of Studio's. */
+  latest(file: string): Promise<StudioDescriptionRevision | undefined>;
+  /** Save `text` as the next revision, made against `baseRevision`; a conflict carries both texts. */
+  save(file: string, text: string, baseRevision: number | undefined): Promise<DescriptionSave>;
+}
+
 export const BuildReports = Symbol.for("gearbox-studio.BuildReports");
 export interface BuildReports {
   /** For the project `file` (a product.gdl) belongs to; resolves quietly when it is none of Studio's. */
@@ -777,6 +825,28 @@ export interface DeployEnvironmentsSource {
     environmentId: string,
     repositories: readonly string[],
   ): Promise<{ readonly registry: string; readonly prefix: string; readonly token: string; readonly expires_in?: number | null }>;
+  /** A deployed release's workloads and hosts, read from its cluster now; rejects with the server's words. */
+  status?(organizationId: string, deploymentId: string): Promise<import("./deploy-product").DeploymentStatus>;
+  /** Propose the product's CI build workflow to the project's repository as a pull request (ADR-0048 §5). */
+  proposeBuildWorkflow?(
+    projectId: string,
+    body: { readonly environment_id: string; readonly profile: string; readonly product_file: string },
+  ): Promise<import("./deploy-product").BuildWorkflow>;
+  /** Set (a value) or remove (`undefined`) a secret of the release's configuration in one environment. */
+  configSecret?(projectId: string, environmentId: string, key: string, value: string | undefined): Promise<void>;
+  /**
+   * The project's builds, newest first: Studio's and the ones IDEs reported,
+   * with what each published -- what is in the registry to deploy. Rejects
+   * when the server could not be asked.
+   */
+  builds?(projectId: string): Promise<readonly import("./deploy-product").ProductBuild[]>;
+  /** The project's deploys, newest first. */
+  deployments?(projectId: string): Promise<readonly import("./deploy-product").ProductDeployment[]>;
+  /**
+   * Bind `profile` to an environment, keeping every other binding and its
+   * chart values; rejects with the server's words.
+   */
+  bind?(projectId: string, profile: string, environmentId: string): Promise<void>;
 }
 export interface RemoteCatalogueSource {
   /**
