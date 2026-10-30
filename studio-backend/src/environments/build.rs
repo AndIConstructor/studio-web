@@ -107,6 +107,15 @@ pub struct BuildPayload {
     /// own tenant.
     #[serde(default)]
     pub records_in: Option<Uuid>,
+    /// The description revision Studio keeps that the build lays at
+    /// `product_file` before it generates (ADR-0053 §2), and its text, which
+    /// the Job's `prepare` gets in its environment. Absent when the project
+    /// has none: `prepare` reads the file in the checkout (or, for a
+    /// `product/…` ref, from that branch -- §4).
+    #[serde(default)]
+    pub description_revision: Option<i64>,
+    #[serde(default)]
+    pub description_text: Option<String>,
     /// The tenant the environment's connections are found from and read as
     /// (ADR-0054 §5): the project, for a project's own environment. Absent
     /// for an organization's, and from a build queued before it was recorded.
@@ -132,6 +141,9 @@ pub(super) fn connection_reader(
     }
 }
 
+/// The environment variable the Job's `prepare` reads the description from.
+pub const DESCRIPTION_ENV: &str = "STUDIO_PRODUCT_DESCRIPTION";
+
 fn default_buildkit_image() -> String {
     BUILDKIT_IMAGE.to_owned()
 }
@@ -156,6 +168,9 @@ pub struct WatchPayload {
     /// See [`BuildPayload::records_in`].
     #[serde(default)]
     pub records_in: Option<Uuid>,
+    /// See [`BuildPayload::description_revision`]: recorded beside `commit`.
+    #[serde(default)]
+    pub description_revision: Option<i64>,
     /// See [`BuildPayload::connections_from`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub connections_from: Option<Uuid>,
@@ -222,6 +237,28 @@ while read -r app name dockerfile context filename; do
 done < /work/apps
 "#;
 
+/// Which ref a build takes its code from, and which (if any) only its
+/// description (ADR-0053 §4). A `product/…` branch is a snapshot of the whole
+/// repository from the day the description was saved on it, so a build of one
+/// compiles the base branch's code and takes only `product.gdl` from the
+/// product branch. Any other ref -- a branch, a tag, a commit somebody chose
+/// -- is built as it is.
+pub fn code_and_description_refs(git_ref: Option<&str>, base: &str) -> (String, Option<String>) {
+    match git_ref.map(str::trim).filter(|r| !r.is_empty()) {
+        Some(r) if is_product_branch(r) => (base.to_owned(), Some(r.to_owned())),
+        Some(r) => (r.to_owned(), None),
+        None => (base.to_owned(), None),
+    }
+}
+
+/// A branch Studio saved a product's description on: `product/<id>` or
+/// `product/<id>-<digest>`.
+pub fn is_product_branch(r: &str) -> bool {
+    r.strip_prefix("product/")
+        .or_else(|| r.strip_prefix("refs/heads/product/"))
+        .is_some_and(|rest| !rest.is_empty())
+}
+
 /// The Job that builds `p`.
 pub fn job_manifest(p: &BuildPayload, git_secret: bool) -> serde_json::Value {
     let name = job_name(&p.build_id);
@@ -230,7 +267,7 @@ pub fn job_manifest(p: &BuildPayload, git_secret: bool) -> serde_json::Value {
         "app.kubernetes.io/name": "studio-build",
         "studio.constructor.tech/build": p.build_id,
     });
-    let git_env = if git_secret {
+    let mut git_env = if git_secret {
         serde_json::json!([
             { "name": "GIT_USERNAME", "valueFrom": { "secretKeyRef": { "name": git_secret_name(&p.build_id), "key": "username" } } },
             { "name": "GIT_PASSWORD", "valueFrom": { "secretKeyRef": { "name": git_secret_name(&p.build_id), "key": "password" } } },
@@ -239,6 +276,13 @@ pub fn job_manifest(p: &BuildPayload, git_secret: bool) -> serde_json::Value {
     } else {
         serde_json::json!([{ "name": "HOME", "value": "/work/home" }])
     };
+    // The description revision's text (ADR-0053 §2): kilobytes, in the Job's
+    // own spec rather than a Secret -- it is no secret, and it goes with the
+    // Job.
+    let description = p.description_text.as_ref().filter(|t| !t.trim().is_empty());
+    if let (Some(text), Some(env)) = (description, git_env.as_array_mut()) {
+        env.push(serde_json::json!({ "name": DESCRIPTION_ENV, "value": text }));
+    }
     let mut prepare_args = vec![
         "build-prepare".to_owned(),
         "--work".to_owned(),
@@ -250,16 +294,25 @@ pub fn job_manifest(p: &BuildPayload, git_secret: bool) -> serde_json::Value {
         "--profile".to_owned(),
         p.profile.clone(),
     ];
+    let (code_ref, description_ref) =
+        code_and_description_refs(p.git_ref.as_deref(), &p.repo.branch);
+    prepare_args.push("--ref".to_owned());
+    prepare_args.push(code_ref);
+    match (description, p.description_revision) {
+        (Some(_), Some(revision)) => {
+            prepare_args.push("--description-revision".to_owned());
+            prepare_args.push(revision.to_string());
+        }
+        _ => {
+            if let Some(r) = description_ref {
+                prepare_args.push("--description-ref".to_owned());
+                prepare_args.push(r);
+            }
+        }
+    }
     if let Some(own) = &p.own {
         prepare_args.push("--own".to_owned());
         prepare_args.push(serde_json::to_string(own).unwrap_or_default());
-    }
-    if let Some(r) = p.git_ref.as_ref().filter(|r| !r.trim().is_empty()) {
-        prepare_args.push("--ref".to_owned());
-        prepare_args.push(r.trim().to_owned());
-    } else {
-        prepare_args.push("--ref".to_owned());
-        prepare_args.push(p.repo.branch.clone());
     }
     let restricted = serde_json::json!({
         "runAsNonRoot": true, "runAsUser": 1000, "runAsGroup": 1000,
@@ -561,6 +614,7 @@ impl BuildTask {
             round: 0,
             step: None,
             records_in: p.records_in,
+            description_revision: p.description_revision,
             connections_from: p.connections_from,
         };
         enqueue(
@@ -892,7 +946,7 @@ impl WatchTask {
         outcome: Result<String, (String, String)>,
     ) -> anyhow::Result<()> {
         use crate::artifact_ingest::port::BuildOutcome;
-        let record_of = match outcome {
+        let mut record_of = match outcome {
             Ok(manifest) => match serde_json::from_str::<Manifest>(manifest.trim()) {
                 Ok(m) => BuildOutcome {
                     build_id: p.build_id.clone(),
@@ -923,6 +977,7 @@ impl WatchTask {
                 &step,
             ),
         };
+        record_of.description_revision = p.description_revision;
         record(
             &self.hub,
             &ctx.security,
@@ -1270,6 +1325,7 @@ pub fn prepare(
     work: &Path,
     repo_url: &str,
     git_ref: Option<&str>,
+    description: &DescriptionFrom<'_>,
     product_file: &str,
     profile: &str,
     own: Option<&str>,
@@ -1286,9 +1342,68 @@ pub fn prepare(
         repo_url,
         (&username, &password),
         git_ref,
+        description,
         product_file,
         profile,
     )
+}
+
+/// Where `prepare` takes the product's description from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DescriptionFrom<'a> {
+    /// The file as it is in the checkout.
+    Checkout,
+    /// Only the file, from another ref of the repository: a `product/…`
+    /// branch, whose code is not built (ADR-0053 §4).
+    Ref(&'a str),
+    /// A revision Studio keeps, laid at the product's path over whatever the
+    /// checkout holds there (ADR-0053 §2).
+    Text {
+        revision: Option<i64>,
+        text: &'a str,
+    },
+}
+
+/// Lay the description `from` names at `product_file` in the checkout `repo`.
+fn lay_description(
+    repo: &Path,
+    (username, password): (&str, &str),
+    from: &DescriptionFrom<'_>,
+    product_file: &str,
+) -> anyhow::Result<()> {
+    let text = match from {
+        DescriptionFrom::Checkout => return Ok(()),
+        DescriptionFrom::Ref(r) => {
+            let (text, commit) = crate::connectors::sdk::git_checkout::file_at_ref(
+                repo,
+                username,
+                password,
+                r,
+                product_file,
+            )
+            .with_context(|| format!("the description could not be read from {r}"))?
+            .ok_or_else(|| anyhow!("{r} has no {product_file}"))?;
+            println!(
+                "the description is {product_file} of {r} at {commit}; the code is the checkout's"
+            );
+            text
+        }
+        DescriptionFrom::Text { revision, text } => {
+            match revision {
+                Some(r) => println!(
+                    "the description is revision {r} from Studio; the code is the checkout's"
+                ),
+                None => println!("the description is Studio's; the code is the checkout's"),
+            }
+            (*text).to_owned()
+        }
+    };
+    let at = inside(repo, Path::new(product_file))
+        .ok_or_else(|| anyhow!("'{product_file}' leaves the repository"))?;
+    if let Some(dir) = at.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(&at, text).with_context(|| format!("{product_file} could not be written"))
 }
 
 /// `build-prepare` for a project built without a product description
@@ -1383,6 +1498,7 @@ pub fn prepare_as(
     repo_url: &str,
     (username, password): (&str, &str),
     git_ref: Option<&str>,
+    description: &DescriptionFrom<'_>,
     product_file: &str,
     profile: &str,
 ) -> anyhow::Result<()> {
@@ -1396,6 +1512,7 @@ pub fn prepare_as(
     .context("the product's repository could not be cloned")?;
     let commit = crate::connectors::sdk::git_checkout::head_commit(&repo)
         .ok_or_else(|| anyhow!("the clone has no commit"))?;
+    lay_description(&repo, (username, password), description, product_file)?;
     let file = repo.join(product_file);
 
     let intent: serde_json::Value = serde_json::from_str(&run(
@@ -1668,6 +1785,8 @@ mod tests {
             builder_image: "ghcr.io/acme/studio-backend:sha-1".into(),
             buildkit_image: BUILDKIT_IMAGE.into(),
             records_in: None,
+            description_revision: None,
+            description_text: None,
             connections_from: None,
             own: None,
         }
@@ -1949,6 +2068,86 @@ mod tests {
                 .iter()
                 .all(|e| e["name"] != "GIT_PASSWORD")
         );
+    }
+
+    #[test]
+    fn a_product_branch_lends_the_build_only_its_description() {
+        assert_eq!(
+            code_and_description_refs(Some("product/shop-1a2b3c4d"), "main"),
+            ("main".to_owned(), Some("product/shop-1a2b3c4d".to_owned()))
+        );
+        assert_eq!(
+            code_and_description_refs(Some("release/1.2"), "main"),
+            ("release/1.2".to_owned(), None)
+        );
+        assert_eq!(
+            code_and_description_refs(None, "main"),
+            ("main".to_owned(), None)
+        );
+        assert_eq!(
+            code_and_description_refs(Some("product/"), "main"),
+            ("product/".to_owned(), None)
+        );
+        let mut p = payload();
+        p.git_ref = Some("product/shop-1a2b3c4d".into());
+        let args: Vec<String> = serde_json::from_value(
+            job_manifest(&p, false)["spec"]["template"]["spec"]["initContainers"][0]["args"]
+                .clone(),
+        )
+        .unwrap();
+        let after = |flag: &str| {
+            args.iter()
+                .position(|a| a == flag)
+                .map(|i| args[i + 1].clone())
+        };
+        assert_eq!(after("--ref").as_deref(), Some("main"));
+        assert_eq!(
+            after("--description-ref").as_deref(),
+            Some("product/shop-1a2b3c4d")
+        );
+        p.git_ref = None;
+        let plain = job_manifest(&p, false);
+        assert!(
+            !plain["spec"]["template"]["spec"]["initContainers"][0]["args"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|a| a == "--description-ref")
+        );
+    }
+
+    #[test]
+    fn the_job_takes_the_description_from_studio_and_the_code_from_the_base_branch() {
+        let mut p = payload();
+        p.git_ref = Some("product/shop-1a2b3c4d".into());
+        p.description_revision = Some(4);
+        p.description_text = Some("product shop {}".into());
+        let job = job_manifest(&p, false);
+        let prepare = &job["spec"]["template"]["spec"]["initContainers"][0];
+        let args: Vec<String> = serde_json::from_value(prepare["args"].clone()).unwrap();
+        let after = |flag: &str| {
+            args.iter()
+                .position(|a| a == flag)
+                .map(|i| args[i + 1].clone())
+        };
+        assert_eq!(after("--ref").as_deref(), Some("main"));
+        assert_eq!(after("--description-revision").as_deref(), Some("4"));
+        assert_eq!(after("--description-ref"), None);
+        assert!(
+            prepare["env"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|e| e["name"] == DESCRIPTION_ENV && e["value"] == "product shop {}")
+        );
+        // A watch queued before the revision was carried still reads.
+        let w: WatchPayload = serde_json::from_value(serde_json::json!({
+            "build_id": "b", "organization_id": Uuid::nil(), "project_id": Uuid::nil(),
+            "connection_id": Uuid::nil(), "namespace": "n", "job": "j",
+            "repository": "acme/shop", "profile": "prod",
+        }))
+        .unwrap();
+        assert_eq!(w.description_revision, None);
     }
 
     #[test]

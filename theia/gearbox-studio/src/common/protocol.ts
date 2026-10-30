@@ -251,7 +251,9 @@ export interface GearboxService {
    * as it is on `branch`, bringing the branch in beside its checkout as a git
    * worktree when no checkout has it. `undefined` when no checkout's origin
    * has the branch, or the file is not on it. For a product the portal saved
-   * onto its own branch of a shared repository.
+   * onto its own branch of a shared repository. A `product/…` branch lends
+   * only the file: it is written into the checkout, which stays on its own
+   * branch and code (ADR-0053 §4).
    */
   fileOnBranch(branch: string, file: string): Promise<string | undefined>;
 
@@ -772,6 +774,30 @@ export const DeployEnvironmentsSource = Symbol.for("gearbox-studio.DeployEnviron
  * is a desktop or a session; absent in Gearbox Studio proper, where nothing
  * is reported.
  */
+/**
+ * Constructor Studio: the product's description as Studio keeps it, by
+ * revision (ADR-0053). Bound by the Studio extension, which knows the project
+ * a folder was opened for and holds the member's token; absent in Gearbox
+ * Studio proper, where the file in the checkout is the description.
+ */
+export const ProductDescriptions = Symbol.for("gearbox-studio.ProductDescriptions");
+export interface StudioDescriptionRevision {
+  readonly revision: number;
+  readonly text: string;
+  readonly author?: string;
+  readonly createdAt?: string;
+}
+export type DescriptionSave =
+  | { readonly kind: "saved"; readonly revision: number }
+  | { readonly kind: "conflict"; readonly latest: StudioDescriptionRevision; readonly yours: string }
+  | { readonly kind: "none" };
+export interface ProductDescriptions {
+  /** The latest revision for the project `file` belongs to; undefined when none, or none of Studio's. */
+  latest(file: string): Promise<StudioDescriptionRevision | undefined>;
+  /** Save `text` as the next revision, made against `baseRevision`; a conflict carries both texts. */
+  save(file: string, text: string, baseRevision: number | undefined): Promise<DescriptionSave>;
+}
+
 export const BuildReports = Symbol.for("gearbox-studio.BuildReports");
 export interface BuildReports {
   /** For the project `file` (a product.gdl) belongs to; resolves quietly when it is none of Studio's. */

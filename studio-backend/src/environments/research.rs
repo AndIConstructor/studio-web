@@ -139,6 +139,7 @@ async fn prepare(
     ctx: &SecurityContext,
     repo: &RepoRef,
     git_ref: Option<String>,
+    description: Option<(Option<i64>, String)>,
     product_file: &str,
     profile: &str,
 ) -> anyhow::Result<Tree> {
@@ -152,7 +153,10 @@ async fn prepare(
     let url = driver.clone_url(&auth.base_url, &repo.repo)?;
     let (username, password) = driver.clone_credentials(&auth.token);
     let (username, password) = (username.to_owned(), password.to_owned());
-    let git_ref = git_ref.unwrap_or_else(|| repo.branch.clone());
+    // A product branch lends only its description; the code is the base
+    // branch's (ADR-0053 §4).
+    let (git_ref, description_ref) =
+        build::code_and_description_refs(git_ref.as_deref(), &repo.branch);
     let (product_file, profile) = (product_file.to_owned(), profile.to_owned());
     let work = std::env::temp_dir().join(format!("studio-research-{}", Uuid::new_v4().simple()));
     let at = work.clone();
@@ -163,6 +167,16 @@ async fn prepare(
             &url,
             (&username, &password),
             Some(&git_ref),
+            // Studio's revision first (ADR-0053 §2), else a product
+            // branch's file (§4), else the checkout's.
+            &match (&description, description_ref.as_deref()) {
+                (Some((revision, text)), _) => build::DescriptionFrom::Text {
+                    revision: *revision,
+                    text,
+                },
+                (None, Some(r)) => build::DescriptionFrom::Ref(r),
+                (None, None) => build::DescriptionFrom::Checkout,
+            },
             &product_file,
             &profile,
         )?;
@@ -408,6 +422,11 @@ pub struct ResearchBuildPayload {
     pub git_ref: Option<String>,
     #[serde(default)]
     pub records_in: Option<Uuid>,
+    /// See [`build::BuildPayload::description_revision`] (ADR-0053 §2).
+    #[serde(default)]
+    pub description_revision: Option<i64>,
+    #[serde(default)]
+    pub description_text: Option<String>,
     /// Whose Research sign-in the build uses.
     #[serde(default)]
     pub requested_by: Option<Requester>,
@@ -442,6 +461,7 @@ impl ResearchBuildTask {
     ) {
         let outcome = crate::artifact_ingest::port::BuildOutcome {
             r#where: Some("research".into()),
+            description_revision: outcome.description_revision.or(p.description_revision),
             ..outcome
         };
         if let Err(e) =
@@ -488,6 +508,10 @@ impl ResearchBuildTask {
             &ctx.security,
             &p.repo,
             p.git_ref.clone(),
+            p.description_text
+                .clone()
+                .filter(|t| !t.trim().is_empty())
+                .map(|t| (p.description_revision, t)),
             &p.product_file,
             &p.profile,
         )
@@ -798,6 +822,10 @@ pub async fn deploy(
         &ctx.security,
         &r.repo,
         Some(r.commit.clone()),
+        // TODO(ADR-0053 §2): a deploy re-renders the chart from the
+        // checkout's file at the build's commit; a build that took its
+        // description from Studio should be rendered with that revision too.
+        None,
         &r.product_file,
         &r.profile,
     )

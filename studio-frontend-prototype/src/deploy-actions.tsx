@@ -317,6 +317,8 @@ export interface SavedProduct {
   branch: string | null;
   prUrl: string | null;
   profile: string | null;
+  /** The description revision Studio keeps and a build takes (ADR-0053 §2). */
+  revision?: number | null;
 }
 
 /** The environments a Studio build can push from: a registry prefix and a
@@ -396,7 +398,9 @@ export function BuildInStudio({
         </p>
       ) : (
       <p data-build-summary>
-        Builds <code>{file}</code> from {branch ? <code>{branch}</code> : "the repository's own branch"}
+        Builds <code>{file}</code>
+        {saved?.revision ? ` (revision ${saved.revision}, kept in Studio)` : ""} with the code of{" "}
+        {branch ? <code>{branch}</code> : "the repository's own branch"}
         {saved?.prUrl && branch === saved.branch ? (
           <>
             {" "}
