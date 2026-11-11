@@ -531,7 +531,7 @@ mod tests {
     /// is how the fourth entry left: `studio-user` was recorded here as an open
     /// question, the question was answered, and the test demanded the entry go
     /// with it.
-    const DATABASE_OMISSIONS: [(&str, &str, &str); 14] = [
+    const DATABASE_OMISSIONS: [(&str, &str, &str); 12] = [
         (
             "dev.yaml",
             "studio-product",
@@ -611,16 +611,6 @@ mod tests {
             "docker.yaml",
             "github-mirror",
             "same reason as dev.yaml",
-        ),
-        (
-            "oidc.yaml",
-            "github-mirror",
-            "same reason as dev.yaml",
-        ),
-        (
-            "k8s.yaml",
-            "github-mirror",
-            "same reason as dev.yaml, until studio-dev runs the mirror",
         ),
     ];
 
