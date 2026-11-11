@@ -36,20 +36,21 @@ database:
         #
         # toolkit-db caches one `Db` PER GEAR (manager.rs, `cache: DashMap<String, Db>`),
         # and a gear inherits this block unless it declares its own. This is
-        # therefore not "four connections to pg_main" — it is four PER GEAR, and
-        # this assembly configures fifteen gear databases: 13 x 4 = 52, plus
-        # the gears with their own override below, Keycloak, the bootstrap Job,
-        # the CloudNativePG manager and the reserved slots, 89 in all. A second
-        # replica needs 158, which is why `max_connections` is 160;
-        # deploy/k8s/cloudnative-pg/README.md carries the table and the memory
-        # that pays for it. Lowering this is not the way to make room (at 3 two
-        # replicas still need 128); raising it by one raises the ceiling by
-        # fourteen, so raise a single gear's own `pool` instead.
+        # therefore not "three connections to pg_main" — it is three PER GEAR,
+        # and fourteen gear databases below inherit it: 14 x 3 = 42, plus the
+        # gears with their own `pool` (20), 62 per replica. Two replicas need
+        # 124, and 144 with Keycloak, the bootstrap Job, the operator and the
+        # reserved slots, against `max_connections: 160`;
+        # deploy/k8s/cloudnative-pg/README.md carries the table. It was 4, and
+        # two replicas then needed 172. Two replicas at 3 still give each gear
+        # 6 in all, more than one replica at 4 did. Raising it by one raises
+        # the ceiling by fourteen per replica, so give a busy gear its own
+        # `pool` instead.
         #
         # Keep a run of comment lines under 32: the config's YAML parser
         # (granit-parser) refuses more before the next entry, and the backend
         # then does not start.
-        max_conns: 4
+        max_conns: 3
         # Nothing is held open for a gear nobody calls. Fourteen idle pools
         # each keeping a connection warm is fourteen connections spent on
         # nothing.
@@ -155,6 +156,12 @@ gears:
 
   api-gateway:
     config:
+      # Request timeout: 30 s, fixed in cf-gears-api-gateway 0.5.2 (a tower
+      # TimeoutLayer; "Request exceeded 30s timeout"). It is not configurable
+      # there, and this block denies unknown keys, so a `request_timeout` here
+      # would stop the boot. Studio works inside it: a product save answers
+      # within 20 s and its engine check carries on in the background
+      # (product/rest.rs SAVE_ANSWERS_WITHIN, ADR-0053, amendment 2026-11-04).
       # Throttling zones the mini-chat create-chat route names (its ThrottlingSpec);
       # api-gateway refuses to start when a route references an undefined zone.
       # Values follow gears-rust config/mini-chat.yaml. `ip` keys everyone behind
@@ -189,7 +196,7 @@ gears:
         version: "0.1.0"
         description: "Studio backend assembly — account-management demo"
 
-  gear-orchestrator:
+  service-discovery:
     config: {}
 
   grpc-hub:
@@ -539,6 +546,10 @@ gears:
       # Stable Ed25519 seed; Helm loads it from the environment-specific
       # file-storage signing Secret. The value is base64url without padding.
       signing_key_seed: "${STUDIO_FS_SIGNING_SEED}"
+      # The token the sidecar sends on its finalize callbacks (its
+      # FS_SIDECAR_INTERNAL_TOKEN, the same Secret key); file-storage >= 0.4
+      # refuses to start without it.
+      finalize_internal_secret: "${STUDIO_FS_FINALIZE_SECRET}"
       # JSON is valid YAML. Helm supplies one S3 entry in Kubernetes; an empty
       # list preserves local-fs for non-S3/manual deployments.
       sidecar_base_url: "${STUDIO_FS_SIDECAR_BASE_URL:-http://127.0.0.1:8087}"
@@ -546,9 +557,21 @@ gears:
       s3_backends: ${STUDIO_FS_S3_BACKENDS:-[]}
 
   # LLM egress chain: mini-chat -> oagw -> provider; secrets via credstore
+  # A database keeps upstreams and routes across restarts and moves the
+  # registry reconcile (which needs the root tenant) out of post_init into
+  # a background task in `start` (oagw >= 0.6, ADR-0018), so a fresh
+  # database no longer stops the boot before account-management seeds it.
   oagw:
+    database:
+      server: "pg_main"
+      dbname: "studio_oagw"
     config:
       proxy_timeout_secs: 120
+      # The deployment's generation (Helm .Release.Revision): a pod of an
+      # older release does not revert what a newer one reconciled. Unset
+      # (null) turns the guard off, with a startup warning.
+      registry_provisioning:
+        generation: ${STUDIO_OAGW_GENERATION:-null}
 
   credstore:
     database:
@@ -581,6 +604,14 @@ gears:
     database:
       server: "pg_main"
       dbname: "studio_documents"
+    config:
+      # Where each kind of this gear's data is kept (ADR-0066): `model` as
+      # domain objects in the graph, read through POST /query; `tables` in
+      # this database. Rows of a kind switched to `model` move on first read.
+      storage:
+        process: "model"
+        reviews: "model"
+        documents: "model"
 
   studio-user:
     database:
@@ -612,6 +643,16 @@ gears:
       # (`backend.serviceSubject`). The same value goes to studio-session.
       service_account:
         subject: "${STUDIO_SERVICE_SUBJECT:-00000000-0000-4000-8000-00000000057d}"
+
+  # How a person without an organization comes by one (ADR-0051 §2): `open`
+  # creates it at once, `request` asks a platform administrator, `off` leaves
+  # them to be joined or invited. Per environment, from the chart
+  # (`backend.organizations`). A value that does not parse closes creation.
+  # max_owned is unquoted so that unset reads as null, which is no limit.
+  studio-organizations:
+    config:
+      self_service: "${STUDIO_ORG_SELF_SERVICE:-open}"
+      max_owned: ${STUDIO_ORG_MAX_OWNED:-}
 
   studio-credstore-pg:
     database:
@@ -698,6 +739,19 @@ gears:
         idle_timeout: "5m"
         max_lifetime: "30m"
 
+  # ── studio-environments (slugs, namespace assignments, image records, ADR-0062) ──
+  # A few rows per build and deploy. One connection: each one here is one
+  # more per replica on pg_main's budget.
+  studio-environments:
+    database:
+      server: "pg_main"
+      dbname: "studio_environments"
+      pool:
+        max_conns: 1
+        min_conns: 0
+        acquire_timeout: "10s"
+        idle_timeout: "5m"
+
   # ── usage-collector (the platform's metering store, issue #781) ──
   # What model calls and IDE sessions use is recorded here by studio-llm-proxy
   # and studio-session; the records live with the storage plugin below.
@@ -754,6 +808,29 @@ gears:
       client_credentials:
         client_id: "mini-chat"
         client_secret: "${STUDIO_OIDC_S2S_CLIENT_SECRET:-mini-chat-dev-secret}"
+      # The artifact graph as domain objects (ADR-0066 §8a): `model`, or
+      # `graph` for the gear's own graph types and the index above.
+      storage:
+        artifacts: "model"
+
+  # ── studio-domain-model (the domain read model) ──
+  # Every live domain object and relation as rows, so POST /query runs in
+  # Postgres with no bound on a type's size, follows relations both ways and
+  # counts by group (ADR-0066, src/domain_model/mirror.rs). Filled from the
+  # graph on a tenant's first query and kept current by every domain write.
+  # Drop the block and nothing is lost but speed and reach: queries read the
+  # graph, over at most 5 000 objects of a type.
+  studio-domain-model:
+    database:
+      server: "pg_main"
+      dbname: "studio_domain_model"
+      pool:
+        max_conns: 2
+        min_conns: 0
+        acquire_timeout: "10s"
+        idle_timeout: "5m"
+        max_lifetime: "30m"
+    config: {}
 
   # ── studio-scheduler (cron/interval schedules) ──
   # Owns schedules and nothing else: each tick it enqueues due runs into

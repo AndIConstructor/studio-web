@@ -55,6 +55,39 @@ export interface Manifest {
   sessions_enabled: boolean;
   session_image?: string | null;
   gears: ManifestGear[];
+  /** Where each gear keeps its records (ADR-0066 §8a); absent on a backend
+   *  older than the domain-model move. */
+  data?: ManifestData[];
+}
+
+/** One gear's records: each kind and its `storage.<kind>` setting, and the
+ *  domain-model types only it writes. */
+export interface ManifestData {
+  gear: string;
+  stores: { kind: string; store: string }[];
+  types: string[];
+}
+
+/** The design the data section explains. */
+export const DATA_DESIGN_DOC = "docs/adr/0066-domain-objects-are-read-from-a-postgres-mirror-of-the-graph.md";
+
+/** What the data section counts: gears keeping records, kinds in the model and
+ *  kinds still kept elsewhere, and the types gears hold. */
+export function dataSummary(data: ManifestData[]): {
+  gears: number;
+  inModel: number;
+  elsewhere: { gear: string; kind: string; store: string }[];
+  types: number;
+} {
+  const elsewhere = data.flatMap((d) =>
+    d.stores.filter((s) => s.store !== "model").map((s) => ({ gear: d.gear, ...s })),
+  );
+  return {
+    gears: data.length,
+    inModel: data.reduce((n, d) => n + d.stores.filter((s) => s.store === "model").length, 0),
+    elsewhere,
+    types: new Set(data.flatMap((d) => d.types)).size,
+  };
 }
 
 /** The part of `prototype-map.json` the page still reads: its build commit. */
@@ -125,8 +158,8 @@ export const DOMAINS: Domain[] = [
   {
     id: "ide",
     title: "IDE sessions & AI",
-    blurb: "Per-project Theia IDE containers, the bridge from the IDE back to Studio, and the LLM proxy the agents call.",
-    gears: ["studio-session", "studio-theia", "studio-llm-proxy"],
+    blurb: "Per-project Theia IDE containers, the bridge from the IDE back to Studio, the LLM proxy the agents call, and the MCP server that gives an agent outside Studio its tools.",
+    gears: ["studio-session", "studio-theia", "studio-llm-proxy", "studio-mcp"],
   },
   {
     id: "background",
@@ -456,6 +489,7 @@ export const COMPONENT_GEAR: Record<string, string> = {
   "studio-insight": "studio-insight",
   "studio-kits": "studio-kits",
   "studio-llm": "studio-llm-proxy",
+  "studio-mcp": "studio-mcp",
   "studio-notify": "studio-notify",
   "studio-organizations": "studio-organizations",
   "studio-presence": "studio-presence",
@@ -504,17 +538,23 @@ export const SURFACES: Surface[] = [
   {
     id: "shell",
     area: "portal",
-    title: "Sign-in, navigation and notifications",
-    does: "Sign in, switch organization and workspace, get notified, see who is online, open a project in the IDE or the desktop app.",
-    components: ["App", "Login", "Shell", "ContextPane", "ChatNotifier", "EditorNotifier", "OpenInDesktop", "StudioLauncher", "WhoIsOnline", "OrgMark"],
+    title: "Sign-in, navigation, notifications and the inbox",
+    does: "Sign in, switch organization and workspace, get notified, see who is online, open a project in the IDE or the desktop app; and the Inbox: deploys to approve, reviews and pull requests waiting on you, your failed background work and undelivered notifications, each to act on, mark done or snooze.",
+    components: ["App", "Login", "Shell", "ContextPane", "ChatNotifier", "EditorNotifier", "OpenInDesktop", "StudioLauncher", "WhoIsOnline", "OrgMark", "TenantMark", "IconPicker", "InboxView"],
     gears: [
       "account-management",
+      "studio-artifact-ingest",
       "studio-connector",
+      "studio-documents",
+      "studio-domain-model",
+      "studio-environments",
       "studio-events",
       "studio-notify",
       "studio-organizations",
       "studio-presence",
+      "studio-product",
       "studio-session",
+      "studio-tasks",
       "studio-theia",
       "studio-user",
     ],
@@ -523,7 +563,7 @@ export const SURFACES: Surface[] = [
     id: "home",
     area: "portal",
     title: "Waiting on you",
-    does: "On the organization's overview: reviews asked of you and pull requests whose next step is yours, across its workspaces.",
+    does: "The \"For you\" half of the organization overview's \"Needs attention\": reviews asked of you and pull requests whose next step is yours, across its workspaces.",
     components: ["WaitingOnYou"],
     gears: ["studio-artifact-ingest", "studio-documents", "studio-events", "studio-user"],
   },
@@ -531,10 +571,11 @@ export const SURFACES: Surface[] = [
     id: "workspaces",
     area: "portal",
     title: "Workspaces and their projects",
-    does: "Browse workspaces, create a project from a product, see the portfolio.",
-    components: ["WorkspacesView", "WorkspaceProjects", "ProjectsPortfolio", "ProjectScreen"],
+    does: "Browse workspaces, create a project -- optionally from a template that fills in its sources, brief and kits; a new repository, one attached or none yet, with a starter gear if asked -- and see the portfolio, filtered by what each project's config carries (its phase, its template, its repositories, any other short value). A project's status -- the phase it is in -- shows on its row and card and in its tab bar, where a member moves it. Attaching or detaching a repository has the project's catalogue read its sources again.",
+    components: ["WorkspacesView", "WorkspaceProjects", "ProjectsPortfolio", "WorkspaceStatusLine", "ProjectScreen", "ProjectFieldControls"],
     gears: [
       "account-management",
+      "studio-components-catalog",
       "studio-connector",
       "studio-documents",
       "studio-kits",
@@ -545,33 +586,37 @@ export const SURFACES: Surface[] = [
   {
     id: "doc-types",
     area: "portal",
-    title: "Document types and process",
-    does: "Define document templates, section checklists and the journey's stages for a workspace.",
-    components: ["DocumentTypesTab", "ProcessCatalogTab", "TypesView"],
+    title: "Document types",
+    does: "Define document templates and section checklists for a workspace.",
+    components: ["DocumentTypesTab", "TypesView"],
     gears: ["studio-documents", "studio-spec-quality"],
   },
   {
     id: "project-types",
     area: "portal",
-    title: "Project types",
-    does: "Decide which kinds of project an organization or a workspace offers, what each creates and which tabs its projects show.",
-    components: ["ProjectTypesTab"],
-    gears: ["account-management", "studio-kits"],
+    title: "Project templates and phases",
+    does: "Decide which templates an organization or a workspace offers a new project, each optional and only filling in the card -- the sources it starts with and whether a starter gear goes there, a brief, the kits ticked -- and which tabs its projects show; or offer none. Beside them, the phases its projects move through, in order.",
+    components: ["ProjectTypesTab", "PhasesEditor"],
+    gears: ["studio-kits", "studio-organizations"],
   },
   {
     id: "project-overview",
     area: "project",
     title: "Overview",
-    does: "See a project's state and its path to a product that builds: specs, components, pull requests waiting on people, its IDE.",
-    components: ["ProjectOverview", "ProjectPath", "PullRequestsWaiting"],
+    does: "See how a project is doing: a verdict and its reasons, the path to a product that builds -- with deciding what the product is after its specs are read -- its releases, spec health, team and metrics, what waits on whom, and its IDE.",
+    components: ["ProjectOverview", "PullRequestsWaiting", "MetricsBoard"],
     gears: [
       "account-management",
       "studio-artifact-ingest",
+      "studio-components-catalog",
       "studio-connector",
       "studio-documents",
-      "studio-kits",
+      "studio-environments",
+      "studio-organizations",
       "studio-product",
       "studio-session",
+      "studio-spec-mapping",
+      "studio-user",
     ],
   },
   {
@@ -582,11 +627,11 @@ export const SURFACES: Surface[] = [
     components: [
       "DocumentsTab",
       "IngestedDocumentsView",
+      "SpecPipelineSummary",
       "ReviewPanel",
       "DomainQuestionsPanel",
       "BriefPanel",
       "RemarksPanel",
-      "PullRequestChecksPanel",
       "SpecQuality",
       "SqStatusChip",
       "PublishModal",
@@ -644,47 +689,58 @@ export const SURFACES: Surface[] = [
   {
     id: "project-frontend",
     area: "project",
-    title: "Product: its header, Infrastructure and Frontend",
-    does: "See the product in one line (profile, gears, where it was saved, whether it resolves, whether it has a frontend) and switch between its parts; see where it runs (its profile, environments and their databases); add a frontend from FrontX's shell template, or leave the product gears alone; compose the UI from micro-frontends in the shell, see whether the product has the gears each screen calls, read the project's own repository into the catalogue when it has no micro-frontend, and find FrontX's templates to start a new one.",
-    components: ["FrontendConstructor", "ProductFrontend", "ProductInfrastructure", "ProductPage"],
-    gears: ["account-management", "studio-artifact-ingest", "studio-components-catalog", "studio-environments", "studio-product"],
+    title: "Product: its header, the way to running, Infrastructure and Frontend",
+    does: "Decide what the product is -- Studio proposes a full product on gears, a gear service, a FrontX app or one built from its own source, with the reasons it read in the brief, the declared capabilities and requirements, the project's own components and the product, and a member confirms it or picks another (experimental) -- then follow the product from configured to running in four steps -- configure its infrastructure, backend and frontend, save it to product.gdl after seeing what changes against the kept revision, read its history and restore an earlier revision, build it, deploy it -- each with where it stands and what comes next; see the product in a header -- whether it resolves, the revision kept and whether it is published, and one action that follows the state (show the fixes, save to product.gdl, build) -- and switch between its parts on tabs, each with a dot for where it stands; see the whole product on its map -- the shell and its micro-frontends, the gears grouped by subsystem, what they run on, and the links between them, each screen card showing the pictures the last build took of its screens (a schematic until a build has), with a screen that calls a gear the product lacks, a database an environment does not give and a gear no screen uses marked -- and build it there: add screens and gears from a palette by dragging or Add, take the gears the engine says they also need, remove one, and read the same product as the product.gdl the next save would write, selected together with the map; see what it needs to run, and the environments it runs in as chips that open Releases; add a frontend from FrontX's shell template, or leave the product gears alone; compose the UI from micro-frontends in the shell, with how it gets built folded to how many steps are ready, see whether the product has the gears each screen calls, read the project's own repository into the catalogue when it has no micro-frontend, and find FrontX's templates to start a new one.",
+    components: ["FrontendConstructor", "GdlSection", "GdlView", "InfraLane", "Palette", "ProductFlow", "ProductFrontend", "ProductInfrastructure", "ProductKindStep", "ProductInfraServices", "ProductMap", "ProductPage", "ProductSources", "Revisions", "SaveStep", "ScreenPreview"],
+    gears: ["account-management", "studio-artifact-ingest", "studio-components-catalog", "studio-environments", "studio-product", "studio-spec-mapping"],
   },
   {
-    id: "project-builds",
+    id: "project-releases",
     area: "project",
-    title: "Builds",
-    does: "Build the composed product and publish it: in Studio as a Job in the organization's cluster, on the member's machine in the desktop IDE, or by proposing a CI workflow; follow each build's stages (prepare, images, publish) and read the end of each step's log from its pod, a failed one with its first error, a published one with its images and chart; deploy a published build to an environment; and read the CI runs of the project's repositories.",
-    components: ["ProjectBuilds", "HowItBuilds", "BuildInStudio", "BuildLogPanel", "InCi", "ProposeBuildWorkflow", "DeployBuildTo"],
-    gears: ["account-management", "studio-artifact-ingest", "studio-environments", "studio-product"],
+    title: "Releases",
+    does: "Take the product from a build to production (ADR-0056 §4): see the ladder of the environments it may deploy to in promote_from order, each with the version it runs, how its newest deploy went and whether one waits for approval, and promote what the environment before it runs or deploy a published build there; roll back, uninstall, preview, and set the release's chart values and secrets per environment. Build the product in Studio as a Job in the organization's cluster -- seeing first what the build will do: where its Job runs, the builder, the code and whose connection clones it, the repositories it pushes to, and why Studio would refuse it -- on the member's machine in the desktop IDE, or by proposing a CI workflow; follow each build's stages (prepare, images, publish) and read the end of each step's log from its pod, a failed one with its first error, a published one with its images, each linked to its record, and chart; see the project's images by app, where each runs, pin, promote into another environment's registry or delete one nothing runs, set how long they are kept, and import an external image into the project's own path; read the CI runs of the project's repositories and the deploy history. Folded at the bottom, bind the product's kubernetes profiles and add, change or remove an environment of the project's own (ADR-0054).",
+    components: [
+      "RungPlace",
+      "BuildForResearch",
+      "ProjectReleases",
+      "PromoteBuild",
+      "ProjectBuilds",
+      "HowItBuilds",
+      "BuildInStudio",
+      "BuildLogPanel",
+      "InCi",
+      "ProposeBuildWorkflow",
+      "DeployBuildTo",
+      "DeployProgress",
+      "PendingDecisions",
+      "ProjectEnvironments",
+      "DeployHistory",
+      "StepDetail",
+      "StatusButton",
+      "EnvironmentActions",
+      "InfraPlanView",
+      "EnvironmentConfig",
+      "EnvironmentPreviews",
+      "BuildImages",
+      "ProjectImages",
+      "RetentionForm",
+      "ImportImage",
+    ],
+    gears: ["account-management", "studio-artifact-ingest", "studio-connector", "studio-environments", "studio-product", "studio-tasks"],
   },
   {
     id: "project-tests",
     area: "project",
     title: "Tests",
-    does: "See whether what the project built works: the mainline's CI and its 7-day pass rate, each open pull request's CI and document checks, the CI runs of the last two weeks with the job and step that failed; and how much of what the specs declare the code answers, which opens Specs.",
+    does: "See whether what the project built works: the mainline's CI and its 7-day pass rate, each open pull request's CI and document checks, the CI runs of the last two weeks with the job and step that failed; and how much of what the specs declare the code answers, which opens Specs; a repository that cannot be read is a chip with the server's answer behind it and a way to fix the connection.",
     components: ["ProjectTests"],
     gears: ["studio-artifact-ingest", "studio-documents", "studio-spec-mapping"],
-  },
-  {
-    id: "project-deploys",
-    area: "project",
-    title: "Deploys",
-    does: "See where the project's product runs and run it there: each environment it may deploy to, the organization's and its own (ADR-0054), its namespace and registry, the last deploy; add, change or remove an environment of the project's own; deploy a build the Builds tab, a pipeline or the IDE published, roll back, uninstall; set the release's chart values and secrets per environment; bind the product's kubernetes profiles and read the deploy history.",
-    components: [
-      "ProjectDeploys",
-      "ProjectEnvironments",
-      "StatusButton",
-      "EnvironmentActions",
-      "EnvironmentConfig",
-      "EnvironmentPreviews",
-    ],
-    gears: ["studio-artifact-ingest", "studio-connector", "studio-environments"],
   },
   {
     id: "project-artifacts",
     area: "project",
     title: "Artifacts",
-    does: "Take what the project produced: the files its CI builds kept, under the build, and its releases, downloaded straight from the provider; see the repository documents Studio has typed and the files kept in Studio, and add one.",
+    does: "Take what the project produced: the files its CI builds kept, by the version built -- passed builds only unless all are asked for -- and its releases, downloaded straight from the provider; see the repository documents Studio has typed and the files kept in Studio, and add one.",
     components: ["ProjectOutputs", "ProjectFiles"],
     gears: ["file-storage", "studio-artifact-ingest"],
   },
@@ -692,31 +748,44 @@ export const SURFACES: Surface[] = [
     id: "project-sources",
     area: "project",
     title: "Sources",
-    does: "Attach repositories, choose how shared edits land, run a sync.",
+    does: "Attach repositories -- one list, no hidden main one -- mark the one new gears go to and the one a product.gdl is published to, see the commit the latest revision pins in each and the components found there, choose how shared edits land, run a sync; see which connector each came from, and manage the connections they are picked from -- the project's own, or with the organization's it inherits (the project's Connections tab was this; its address opens here).",
     components: ["ProjectSources", "RepoBrowser", "SourceAttachPicker"],
     gears: [
       "account-management",
       "studio-artifact-ingest",
+      "studio-components-catalog",
       "studio-connector",
       "studio-documents",
       "studio-events",
+      "studio-product",
     ],
   },
   {
     id: "project-activity",
     area: "project",
     title: "Activity",
-    does: "Follow what happened in the project's repositories.",
+    does: "Follow what happened in the project's documents: comments first, then the detectors' checks, a run of the same check one after another folded into one row that opens to its documents.",
     components: ["ActivityView"],
     gears: ["studio-artifact-ingest"],
   },
   {
     id: "project-team",
     area: "project",
-    title: "Team and automation",
-    does: "See who works on the project; set its automation.",
-    components: ["PeopleView", "AutomationSettings"],
-    gears: ["account-management", "studio-organizations", "studio-user"],
+    title: "Team",
+    does: "See who works on the project and with which role; add someone from the organization in a dialog, change a role, remove one.",
+    components: ["PeopleView"],
+    // The same component is the organization's People page, which also reads
+    // where each person works: open pull requests and feeds, presence,
+    // desktop sessions and Insight (people-org.tsx).
+    gears: [
+      "account-management",
+      "studio-artifact-ingest",
+      "studio-insight",
+      "studio-organizations",
+      "studio-presence",
+      "studio-session",
+      "studio-user",
+    ],
   },
   {
     id: "publication-requests",
@@ -724,7 +793,7 @@ export const SURFACES: Surface[] = [
     title: "Publication requests",
     does: "Answer the organizations' requests to give a gear to the platform: preview and publish it as a pull request into the platform's gear repository, or decline it; name the platform's gear curators.",
     components: ["PublicationRequests", "Curators"],
-    gears: ["studio-components-catalog", "studio-user"],
+    gears: ["account-management", "studio-components-catalog", "studio-user"],
   },
   {
     id: "platform-sources",
@@ -746,9 +815,9 @@ export const SURFACES: Surface[] = [
     id: "organization-dashboard",
     area: "organization",
     title: "Organization overview",
-    does: "Open the organization from the path and see what needs its leaders: refused connections, spend against the same days last month with a month-end forecast, pull requests stuck over 7 days and who they wait on, components to decide; its workspaces worst first, down to projects; and where the money goes.",
-    components: ["OrgDashboard"],
-    gears: ["studio-organizations"],
+    does: "Open the organization from the path and see a metrics board -- delivery, quality, money and people over 7, 30 or 90 days, each panel against the days before, Studio's own figures beside Constructor Insight's for the repositories its projects are made of -- and, beside it, what needs attention in one list, for you and for others: refused connections, spend against the same days last month, who the pull requests stuck over 7 days wait on, components to decide, idle people. Each workspace's spend, failing specs, stuck pull requests and quiet days are on the Workspaces tab.",
+    components: ["MetricsBoard", "OrgDashboard"],
+    gears: ["studio-environments", "studio-organizations"],
   },
   {
     id: "costs",
@@ -761,9 +830,20 @@ export const SURFACES: Surface[] = [
   {
     id: "environments",
     area: "organization",
-    title: "Environments",
-    does: "Declare where the organization's products run -- a cluster connection, a registry, a namespace per project, or a Constructor Research project and its hardware; approval for protected ones -- approve deploys, and see what runs where.",
-    components: ["OrgEnvironments", "EnvironmentForm", "ResearchFields", "AddCluster", "AddRegistry", "OpenClusters"],
+    title: "Infrastructure",
+    does: "Lay out where the organization's products run (ADR-0056 §2): the environments as the ladder a release climbs, in promote_from order, each with its place, approval, projects and deploys to decide; beside it, what runs where, projects by environments with the version and state, with the deploys waiting for an administrator to approve or decline; below, the places it holds -- clusters, Constructor Research projects and registries -- as one grid of cards, a cluster's \"open to projects\" a switch, each opening a side panel with its address, its test and the environments on it, where an environment is added -- with how its builds run there (the builder, the build namespace, the namespaces the cluster gives) and the read-only login the cluster pulls with; a cluster's card checks, when asked, whether it is ready for Studio; a registry's panel browses its repositories and their versions, and its orphans; an environment says how strictly it checks a product (development or production) and the ladder marks one that differs from what its protection implies. For an administrator, two more tabs: Namespaces -- which namespace each project deploys into in each environment and where its builds run, assigned or changed there, a namespace a run made shown as Studio's -- and Image retention, the organization's default for every project without its own. \"Add a place\" connects a cluster, a Research project or a registry.",
+    components: [
+      "OrgInfrastructure",
+      "EnvironmentForm",
+      "ResearchFields",
+      "AddCluster",
+      "AddRegistry",
+      "PlaceReadiness",
+      "RegistryBrowser",
+      "RepositoryTags",
+      "NamespaceAssignments",
+      "OrgRetention",
+    ],
     gears: ["account-management", "studio-connector", "studio-environments"],
   },
   {
@@ -779,8 +859,8 @@ export const SURFACES: Surface[] = [
     area: "organization",
     title: "Components catalogue",
     does: "Browse every gear a product can be built from, with its profile and documentation.",
-    components: ["ComponentsCatalog", "ComponentRegistry", "RegistryDecisions", "DeclareCandidate", "SuggestDescription", "ExtractReadiness", "GearDetail", "ProfileEditor", "PlatformSourcesPanel"],
-    gears: ["studio-components-catalog", "studio-connector", "studio-kits", "studio-user"],
+    components: ["ComponentsCatalog", "ComponentRegistry", "RegistryDecisions", "DeclareCandidate", "SuggestDescription", "ExtractReadiness", "GearDetail", "ProfileEditor", "PlatformSourcesPanel", "SourcesPanel", "CatalogueLevelsPanel", "PlatformRelease", "Publications"],
+    gears: ["studio-components-catalog", "studio-connector", "studio-kits", "studio-product", "studio-user"],
   },
   {
     id: "reports",
@@ -793,9 +873,9 @@ export const SURFACES: Surface[] = [
   {
     id: "domain-model",
     area: "organization",
-    title: "Objects and views",
-    does: "Explore the domain model: object types, their relations, saved views.",
-    components: ["ObjectTypes", "ViewsScreen", "ViewGraph", "ViewTable", "DomainModelGraph"],
+    title: "Domain model, objects and views",
+    does: "Edit the domain model (types and their fields), explore it, keep saved views, and record the attributes it gives projects and workspaces.",
+    components: ["DomainModelAdmin", "Relations", "LinkList", "GtsIds", "TypeObjectsTab", "LevelGenericTab", "ObjectAttributes", "ModelFields", "ProjectTimeline", "MilestoneDialog", "ObjectTypes", "ViewsScreen", "ViewGraph", "ViewTable", "DomainModelGraph"],
     gears: ["studio-components-catalog", "studio-domain-model", "types-registry"],
   },
   {
@@ -860,6 +940,7 @@ export const SURFACES: Surface[] = [
       "studio-connector",
       "studio-domain-model",
       "studio-events",
+      "studio-mcp",
       "types-registry",
     ],
   },
@@ -908,6 +989,15 @@ export const SURFACES: Surface[] = [
       "studio-theia",
       "studio-user",
     ],
+  },
+  {
+    id: "mcp",
+    area: "outside",
+    title: "Your own agent, over MCP",
+    does: "From Claude Code, Codex or Cursor on your machine: read the domain model and change its fields, see what a project's documents need and which gears could provide it, check a draft spec before you commit it. The agent signs you in at Studio's Keycloak and every tool calls the REST API as you: a way in, not more rights. Deploying is not a tool. A product goes to Constructor Research through an environment of its project; Research's own MCP (constructor-research-mcp) runs a folder Studio does not hold, on the agent's own Research sign-in, and Studio does not see it.",
+    sources: ["studio-backend/src/mcp/", "studio-backend/src/{domain_model,spec_mapping,spec_quality}/mcp.rs"],
+    hostedBy: ["studio-mcp"],
+    gears: ["studio-domain-model", "studio-mcp", "studio-spec-mapping", "studio-spec-quality", "studio-tasks"],
   },
 ];
 

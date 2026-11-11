@@ -28,10 +28,14 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use super::database;
-use super::model::{ChartRef, DatabaseMode, DeploymentAction};
+use super::model::{ChartRef, DatabaseMode, DeployImage, DeploymentAction};
 use super::preflight;
 use crate::connectors::sdk::{ClusterAccess, Connectors, RegistryAccess, same_registry};
 use crate::tasks::sdk::{TaskContext, TaskHandler, TaskOutcome};
+
+// Installing a product's infra services before its release (ADR-0064 §5).
+#[path = "infra_install.rs"]
+mod infra_install;
 
 /// Task type. A wire contract: stored on every queued run.
 pub const TASK_TYPE: &str = "environments.deploy";
@@ -67,6 +71,10 @@ pub struct DeployPayload {
     /// a published chart is fetched with.
     #[serde(default)]
     pub registry_connection_id: Option<Uuid>,
+    /// `registry_connection_id` is the push login: the environment names no
+    /// pull identity (`PULL_USES_PUSH_LOGIN`), which the run says.
+    #[serde(default)]
+    pub pull_uses_push_login: bool,
     pub namespace: String,
     pub release: String,
     /// Install (payloads queued before uninstall existed) or uninstall.
@@ -80,6 +88,10 @@ pub struct DeployPayload {
     /// read from credstore by the run and written into the namespace.
     #[serde(default)]
     pub secret_keys: Vec<String>,
+    /// What the deploy goes on with and says, `CODE: message` each: the run
+    /// writes them in its progress and its outcome.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
     /// How the environment gives the product its database.
     #[serde(default)]
     pub database: DatabaseMode,
@@ -97,14 +109,27 @@ pub struct DeployPayload {
     pub connections_from: Option<Uuid>,
     /// Values given to the chart: the images under the environment's registry.
     pub values: serde_json::Value,
+    /// The images the release is to run, under the environment's registry:
+    /// what the rendered chart must name (`CHART_IGNORES_BUILT_IMAGES`).
+    /// Absent from a payload queued before it was carried.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<DeployImage>,
     /// A deploy to a Constructor Research environment (ADR-0049 §4): what it
     /// prepares and where it puts the application. `None` for a cluster.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub research: Option<super::research::ResearchDeploy>,
+    /// The project's build namespace there, recorded with its namespace once
+    /// the run made or found it (ADR-0062 §3); absent from a deploy queued
+    /// before it was recorded, and for a preview.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_namespace: Option<String>,
     /// A preview (ADR-0055): its namespace is labelled as one, and its host
     /// routed once the release is installed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preview: Option<super::preview::PreviewRoute>,
+    /// The product's infra services, as this run brings them (ADR-0064).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub infra: Vec<super::infra::InfraInstall>,
 }
 
 pub struct DeployTask {
@@ -288,12 +313,43 @@ impl TaskHandler for DeployTask {
         if let Err(e) = ensure_namespace(&client, &payload).await {
             return TaskOutcome::Failed(format!("{e:#}"));
         }
+        if payload.preview.is_none() {
+            super::placement::record(
+                &self.hub,
+                payload.organization_id,
+                payload.project_id,
+                payload.environment_id,
+                payload.connection_id,
+                &payload.namespace,
+                payload
+                    .build_namespace
+                    .as_deref()
+                    .unwrap_or(&payload.namespace),
+            )
+            .await;
+        }
         if let Some(registry) = &registry {
+            if payload.pull_uses_push_login {
+                ctx.progress(format!(
+                    "{}: {}",
+                    super::model::PULL_USES_PUSH_LOGIN,
+                    super::model::PULL_USES_PUSH_LOGIN_MESSAGE
+                ))
+                .await;
+            }
             ctx.progress(format!("writing the pull secret for {}", registry.host))
                 .await;
             if let Err(e) = write_pull_secret(&client, &payload.namespace, registry).await {
                 return TaskOutcome::Failed(format!("{e:#}"));
             }
+        }
+        // The product's infra services come first (ADR-0064 §5): what they
+        // provide is part of the configuration written next.
+        if !payload.infra.is_empty()
+            && let Err(e) =
+                infra_install::bring(&self.hub, ctx, &access, registry.as_ref(), &payload).await
+        {
+            return TaskOutcome::Failed(format!("{e:#}"));
         }
         if !payload.secret_keys.is_empty() {
             ctx.progress("writing the release's configuration secrets")
@@ -309,10 +365,21 @@ impl TaskHandler for DeployTask {
             Ok(s) => s,
             Err(e) => return TaskOutcome::Failed(format!("{e:#}")),
         };
-        let prepared = match prepare(&scratch, &access, registry.as_ref(), &payload) {
+        let mut prepared = match prepare(&scratch, &access, registry.as_ref(), &payload) {
             Ok(p) => p,
             Err(e) => return TaskOutcome::Failed(format!("{e:#}")),
         };
+        // A build's chart is installed as the build pushed it: pulled by its
+        // version, its digest checked, then installed from the pulled file,
+        // so a version pushed over since installs nothing.
+        if let Some(digest) = payload.chart_ref.as_ref().and_then(|r| r.digest.clone()) {
+            ctx.progress(format!("pulling the chart, pinned to {digest}"))
+                .await;
+            match pull_pinned(&scratch, &payload, &prepared, &digest, &ctx.cancel).await {
+                Ok(path) => prepared.chart = path,
+                Err(e) => return TaskOutcome::Failed(format!("{e:#}")),
+            }
+        }
         ctx.progress("reading what the chart needs").await;
         let rendered = match helm(
             &scratch,
@@ -324,11 +391,48 @@ impl TaskHandler for DeployTask {
             Ok(out) => out,
             Err(e) => return TaskOutcome::Failed(format!("{e:#}")),
         };
-        let needs = match database::needs(&rendered) {
-            Ok(n) => n,
+        // The release runs what was built, or nothing: a chart that reads its
+        // images from other values would install its own defaults.
+        if let Some(apps) = images_ignored(&rendered, &payload.images) {
+            return TaskOutcome::Failed(format!(
+                "CHART_IGNORES_BUILT_IMAGES: the rendered chart names none of the images built \
+                 for {}: set where the chart reads each image (the build's values paths) or \
+                 the chart's values",
+                apps.join(", ")
+            ));
+        }
+        let mut notes = Vec::new();
+        for w in &payload.warnings {
+            ctx.progress(format!("warning: {w}")).await;
+            notes.push(w.clone());
+        }
+        if let Some(why) = secret_unread(&rendered, &payload) {
+            ctx.progress(format!("warning: {why}")).await;
+            notes.push(why);
+        }
+        let needs = match database::needs_reported(&rendered) {
+            Ok((n, skipped)) => {
+                for s in skipped {
+                    ctx.progress(format!(
+                        "manifest document {} does not parse and was skipped: {}",
+                        s.index, s.error
+                    ))
+                    .await;
+                }
+                n
+            }
             // Without a database of Studio's to prepare, a configuration it
-            // cannot read is the product's business, not a reason to refuse.
-            Err(_) if payload.database == DatabaseMode::Shared => Vec::new(),
+            // cannot read is the product's business, not a reason to refuse
+            // -- but said, not taken for "needs no database".
+            Err(e) if payload.database == DatabaseMode::Shared => {
+                warn!(error = %format!("{e:#}"), "studio-environments: the chart's database configuration could not be read");
+                ctx.progress(format!(
+                    "the chart's database configuration could not be read ({e:#}); \
+                     the environment's shared database is used as the chart configures it"
+                ))
+                .await;
+                Vec::new()
+            }
             Err(e) => {
                 return TaskOutcome::Failed(format!("the chart's database configuration: {e:#}"));
             }
@@ -359,6 +463,12 @@ impl TaskHandler for DeployTask {
                     Err(e) => return TaskOutcome::Failed(format!("{e:#}")),
                 }
             }
+        }
+        // The product signs in through an IdP of its own (ADR-0062 §9).
+        if let Some((code, why)) =
+            preflight::platform_idp_refusal(&rendered, preflight::studio_issuer().as_deref())
+        {
+            return TaskOutcome::Failed(format!("{code}: {why}"));
         }
         ctx.progress("checking the namespace has every secret the chart reads")
             .await;
@@ -413,6 +523,9 @@ impl TaskHandler for DeployTask {
             "studio-environments: release installed"
         );
         let mut summary = format!("{} installed into {}", payload.release, payload.namespace);
+        for note in notes {
+            summary = format!("{summary}; warning: {note}");
+        }
         if let Some(route) = &payload.preview {
             ctx.progress("routing the preview's address").await;
             match super::preview::apply_route(&client, &payload.namespace, &payload.release, route)
@@ -443,8 +556,10 @@ fn tail(s: &str, n: usize) -> String {
 }
 
 /// Make sure the namespace exists, creating it when the connection may. A
-/// connection limited to its namespaces cannot read namespaces at all, and is
-/// trusted to have been given this one.
+/// connection that may not even read the namespace is refused with the
+/// reason: it used to be trusted to have been given it, and then failed
+/// later with a bare 403 (see `readiness`, which asks before anything is
+/// queued).
 pub(super) async fn prepare_namespace(
     client: &kube::Client,
     namespace: &str,
@@ -463,7 +578,21 @@ async fn make_namespace(
 ) -> anyhow::Result<()> {
     let namespaces: kube::Api<Namespace> = kube::Api::all(client.clone());
     match namespaces.get_opt(namespace).await {
-        Ok(Some(_)) => Ok(()),
+        // A namespace another project's label claims is never this one's
+        // (ADR-0062 §3); one without the label was assigned by hand, which
+        // the check before the run asked.
+        Ok(Some(found)) => {
+            let label = found
+                .metadata
+                .labels
+                .as_ref()
+                .and_then(|l| l.get(super::placement::PROJECT_LABEL))
+                .cloned();
+            match super::placement::owner_refusal(namespace, label.as_deref(), project, true) {
+                Some((_, why)) => Err(anyhow!(why)),
+                None => Ok(()),
+            }
+        }
         Ok(None) => {
             let mut labels: std::collections::BTreeMap<String, String> = [
                 (
@@ -503,10 +632,13 @@ async fn make_namespace(
                 })?;
             grant_self_admin(client, namespace).await
         }
-        Err(kube::Error::Api(status)) if status.code == 403 => {
-            warn!(namespace = %namespace, "studio-environments: cannot read namespaces; assuming it exists");
-            Ok(())
-        }
+        Err(kube::Error::Api(status)) if status.code == 403 => Err(anyhow!(
+            "the cluster connection may not read namespace {namespace}, so whether it exists \
+             cannot be told: a cluster administrator applies {}, or gives the connection's \
+             account admin in {namespace} ({})",
+            crate::connectors::sdk::BOOTSTRAP_FILE,
+            status.message
+        )),
         Err(e) => Err(anyhow!("the cluster did not answer: {e}")),
     }
 }
@@ -822,7 +954,11 @@ pub fn helm_template_args(p: &DeployPayload, c: &Prepared) -> Vec<String> {
 }
 
 fn chart_source_args(p: &DeployPayload, c: &Prepared, args: &mut Vec<String>) {
-    if let Some(r) = &p.chart_ref {
+    // A chart pulled by its digest is a file by now; only a reference has a
+    // version to name.
+    if let Some(r) = &p.chart_ref
+        && c.chart.starts_with("oci://")
+    {
         args.push("--version".into());
         args.push(r.version.clone());
     }
@@ -830,6 +966,99 @@ fn chart_source_args(p: &DeployPayload, c: &Prepared, args: &mut Vec<String>) {
         args.push("--registry-config".into());
         args.push(config.display().to_string());
     }
+}
+
+/// The arguments that pull a published chart into `dest`, by its version.
+pub fn helm_pull_args(p: &DeployPayload, c: &Prepared, dest: &Path) -> Vec<String> {
+    let mut args: Vec<String> = vec!["pull".into(), c.chart.clone()];
+    if let Some(r) = &p.chart_ref {
+        args.push("--version".into());
+        args.push(r.version.clone());
+    }
+    args.push("--destination".into());
+    args.push(dest.display().to_string());
+    if let Some(config) = &c.registry_config {
+        args.push("--registry-config".into());
+        args.push(config.display().to_string());
+    }
+    args
+}
+
+/// Whether what `helm pull` said it pulled is the digest the build recorded.
+pub fn check_pulled_digest(output: &str, expected: &str) -> anyhow::Result<()> {
+    match super::build::pushed_digest(output) {
+        Some(d) if d == expected => Ok(()),
+        Some(d) => Err(anyhow!(
+            "CHART_DIGEST_MISMATCH: the registry holds {d} under the chart's version, not the \
+             {expected} the build pushed -- the version was pushed over since"
+        )),
+        None => Err(anyhow!(
+            "helm pull said no digest for the chart, so it cannot be checked against the \
+             build's {expected}"
+        )),
+    }
+}
+
+/// The chart pulled, its digest checked, and the pulled file's path.
+async fn pull_pinned(
+    scratch: &Scratch,
+    p: &DeployPayload,
+    c: &Prepared,
+    digest: &str,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> anyhow::Result<String> {
+    let dest = scratch.path().join("pulled");
+    std::fs::create_dir_all(&dest).context("cannot create the chart's folder")?;
+    let out = helm(scratch, helm_pull_args(p, c, &dest), cancel).await?;
+    check_pulled_digest(&out, digest)?;
+    let mut tgz = std::fs::read_dir(&dest)?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x == "tgz"));
+    let path = tgz
+        .next()
+        .ok_or_else(|| anyhow!("helm pull left no chart"))?;
+    Ok(path.display().to_string())
+}
+
+/// The applications whose built images the rendered chart names nowhere,
+/// when it names none of them: each image is looked for by its digest and
+/// by `repository:tag`. `None` when one appears, or there is nothing to
+/// look for.
+pub fn images_ignored(rendered: &str, images: &[DeployImage]) -> Option<Vec<String>> {
+    let mut apps = Vec::new();
+    for i in images {
+        let (name, digest) = match i.image.split_once('@') {
+            Some((name, digest)) => (name, Some(digest)),
+            None => (i.image.as_str(), None),
+        };
+        let (repository, tag) = super::model::split_image(name);
+        let marks: Vec<String> = digest
+            .map(str::to_owned)
+            .into_iter()
+            .chain(tag.map(|t| format!("{repository}:{t}")))
+            .collect();
+        if marks.is_empty() {
+            continue;
+        }
+        if marks.iter().any(|m| rendered.contains(m.as_str())) {
+            return None;
+        }
+        apps.push(i.app.clone());
+    }
+    (!apps.is_empty()).then_some(apps)
+}
+
+/// Why the release's configuration secret reaches no application: it has
+/// keys, and the rendered chart never names it.
+pub fn secret_unread(rendered: &str, p: &DeployPayload) -> Option<String> {
+    let name = super::model::config_secret_name(&p.release);
+    (!p.secret_keys.is_empty() && !rendered.contains(&name)).then(|| {
+        format!(
+            "the chart reads no configuration secret {name}, so {} reach(es) no application: \
+             set where the chart reads it (the build's values paths)",
+            p.secret_keys.join(", ")
+        )
+    })
 }
 
 /// Run helm with `args`, its homes under the scratch directory: the
@@ -983,8 +1212,116 @@ async fn watch_start(client: kube::Client, namespace: &str) -> String {
         };
         let now: Vec<_> = list.items.iter().flat_map(preflight::waiting).collect();
         if let Some(why) = watch.look(&now) {
-            return why;
+            // The release is taken back after this, and its pods with it: what
+            // a crashing container said is kept in the reason, or it is lost.
+            let mut said = Vec::new();
+            for w in now.iter().filter(|w| w.restarts > 0) {
+                let params = LogParams {
+                    container: Some(w.container.clone()),
+                    previous: true,
+                    tail_lines: Some(CRASH_LOG_LINES),
+                    limit_bytes: Some(CRASH_LOG_BYTES),
+                    ..LogParams::default()
+                };
+                if let Ok(Ok(text)) =
+                    tokio::time::timeout(Duration::from_secs(10), pods.logs(&w.pod, &params)).await
+                    && let Some(last) = last_words(&text)
+                {
+                    said.push(format!("{} stopped: {last}", w.container));
+                }
+            }
+            if said.is_empty() {
+                return why;
+            }
+            // A run's reason is cut to 500 characters: what the container
+            // said goes first, the cluster's account of it after.
+            return format!("{}; {why}", said.join("; "));
         }
+    }
+}
+
+/// How much of a crashing container's last run is read for its reason.
+const CRASH_LOG_LINES: i64 = 60;
+const CRASH_LOG_BYTES: i64 = 16 * 1024;
+
+/// What a container that stopped said last that matters: its last lines
+/// that name an error, or its last lines when none does -- without their
+/// timestamps and colours, so the reason's few hundred characters go to the
+/// error itself.
+pub fn last_words(log: &str) -> Option<String> {
+    let lines: Vec<String> = log
+        .lines()
+        .map(plain_log_line)
+        .filter(|l| !l.is_empty())
+        .collect();
+    // A server that returns its error from `main` prints `Error: ...` and the
+    // chain of causes under it: that is the whole story, in order.
+    if let Some(at) = lines.iter().rposition(|l| l.starts_with("Error: ")) {
+        let chain: Vec<&str> = lines[at..]
+            .iter()
+            .map(String::as_str)
+            .filter(|l| *l != "Caused by:")
+            .collect();
+        return Some(chain.join(" / ").chars().take(400).collect());
+    }
+    let errors: Vec<&String> = lines
+        .iter()
+        .filter(|l| {
+            let l = l.to_ascii_lowercase();
+            ["error", "panic", "fatal", "failed"]
+                .iter()
+                .any(|w| l.contains(w))
+        })
+        .collect();
+    let pick: Vec<&String> = if errors.is_empty() {
+        lines.iter().rev().take(2).rev().collect()
+    } else {
+        errors.iter().rev().take(3).rev().copied().collect()
+    };
+    if pick.is_empty() {
+        return None;
+    }
+    Some(
+        pick.iter()
+            .map(|l| l.chars().take(240).collect::<String>())
+            .collect::<Vec<_>>()
+            .join(" / "),
+    )
+}
+
+/// A log line without its colour codes and the timestamp a server puts
+/// first.
+fn plain_log_line(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            // An escape sequence: `ESC [` up to its final letter.
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                for f in chars.by_ref() {
+                    if f.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        if c.is_control() || c == '\u{fffd}' {
+            continue;
+        }
+        out.push(c);
+    }
+    let out = out.trim();
+    match out.split_once(' ') {
+        Some((first, rest))
+            if first.len() >= 20
+                && first.as_bytes().get(4) == Some(&b'-')
+                && first.contains('T') =>
+        {
+            rest.trim().to_string()
+        }
+        _ => out.to_string(),
     }
 }
 
@@ -1020,7 +1357,7 @@ pub struct ContainerLog {
 
 /// How many lines of each log a reader gets when it does not say.
 pub const LOG_LINES: i64 = 200;
-const LOG_LINES_MAX: i64 = 2000;
+pub const LOG_LINES_MAX: i64 = 2000;
 const LOG_BYTES: i64 = 128 * 1024;
 /// A release with more pods than this is read for its first ones only.
 const LOG_PODS: usize = 12;
@@ -1198,13 +1535,14 @@ mod tests {
         assert_eq!(user.api_group.as_deref(), Some("rbac.authorization.k8s.io"));
     }
 
-    fn payload() -> DeployPayload {
+    pub(super) fn payload() -> DeployPayload {
         DeployPayload {
             deployment_id: Uuid::nil(),
             organization_id: Uuid::nil(),
             project_id: Uuid::nil(),
             connection_id: Uuid::nil(),
             registry_connection_id: None,
+            pull_uses_push_login: false,
             namespace: "studio-web-prod".into(),
             release: "studio-web".into(),
             action: DeploymentAction::Install,
@@ -1217,7 +1555,11 @@ mod tests {
             connections_from: None,
             values: serde_json::json!({}),
             research: None,
+            build_namespace: None,
             preview: None,
+            warnings: Vec::new(),
+            infra: Vec::new(),
+            images: Vec::new(),
         }
     }
 
@@ -1228,6 +1570,72 @@ mod tests {
             kubeconfig: "/s/kubeconfig".into(),
             registry_config: registry.then(|| "/s/registry.json".into()),
         }
+    }
+
+    const DIGEST: &str = "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+
+    #[test]
+    fn a_builds_chart_is_pulled_by_its_version_checked_and_installed_from_the_file() {
+        let mut p = payload();
+        p.chart = None;
+        p.chart_ref = Some(ChartRef {
+            reference: "oci://ghcr.io/acme/charts/shop".into(),
+            version: "0.1.0-sha.abc.r4".into(),
+            digest: Some(DIGEST.into()),
+        });
+        let c = prepared("oci://ghcr.io/acme/charts/shop", true);
+        let pull = helm_pull_args(&p, &c, Path::new("/s/pulled")).join(" ");
+        assert!(pull.starts_with("pull oci://ghcr.io/acme/charts/shop --version 0.1.0-sha.abc.r4"));
+        assert!(pull.contains("--destination /s/pulled"));
+        assert!(pull.contains("--registry-config /s/registry.json"));
+        let said = format!("Pulled: ghcr.io/acme/charts/shop:0.1.0-sha.abc.r4\nDigest: {DIGEST}\n");
+        assert!(check_pulled_digest(&said, DIGEST).is_ok());
+        let other = said.replace("sha256:1111", "sha256:2222");
+        let why = check_pulled_digest(&other, DIGEST).unwrap_err().to_string();
+        assert!(why.starts_with("CHART_DIGEST_MISMATCH"), "{why}");
+        assert!(check_pulled_digest("Pulled: x\n", DIGEST).is_err());
+        // Pulled, it installs from the file: no version to name.
+        let line = helm_args(&p, &prepared("/s/pulled/shop-0.1.0.tgz", true)).join(" ");
+        assert!(line.starts_with("upgrade --install studio-web /s/pulled/shop-0.1.0.tgz"));
+        assert!(!line.contains("--version"));
+    }
+
+    #[test]
+    fn a_chart_that_names_none_of_the_built_images_is_refused() {
+        let images = [
+            DeployImage {
+                app: "api".into(),
+                image: format!("ghcr.io/acme/shop/api:sha-abc@{DIGEST}"),
+            },
+            DeployImage {
+                app: "web".into(),
+                image: "ghcr.io/acme/shop/web:sha-abc".into(),
+            },
+        ];
+        let defaults = "image: \"nginx:1.27\"\n---\nimage: \"ghcr.io/acme/shop/api:latest\"\n";
+        assert_eq!(
+            images_ignored(defaults, &images),
+            Some(vec!["api".to_owned(), "web".to_owned()])
+        );
+        let by_digest = format!("image: \"ghcr.io/acme/shop/api:sha-abc@{DIGEST}\"\n");
+        assert_eq!(images_ignored(&by_digest, &images), None);
+        let by_tag = "image: ghcr.io/acme/shop/web:sha-abc\n";
+        assert_eq!(images_ignored(by_tag, &images), None);
+        // Nothing built, nothing to look for.
+        assert_eq!(images_ignored(defaults, &[]), None);
+    }
+
+    #[test]
+    fn a_configuration_secret_the_chart_never_names_is_said() {
+        let mut p = payload();
+        assert_eq!(secret_unread("kind: Deployment\n", &p), None, "no keys");
+        p.secret_keys = vec!["SMTP_PASSWORD".into()];
+        let why = secret_unread("kind: Deployment\n", &p).unwrap();
+        assert!(why.contains("studio-web-config") && why.contains("SMTP_PASSWORD"));
+        assert_eq!(
+            secret_unread("secretRef:\n  name: studio-web-config\n", &p),
+            None
+        );
     }
 
     #[test]
@@ -1250,6 +1658,7 @@ mod tests {
         p.chart_ref = Some(ChartRef {
             reference: "oci://ghcr.io/acme/charts/shop".into(),
             version: "0.1.0".into(),
+            digest: None,
         });
         let line =
             helm_template_args(&p, &prepared("oci://ghcr.io/acme/charts/shop", true)).join(" ");
@@ -1274,6 +1683,34 @@ mod tests {
         assert_eq!(log_lines(Some(50)), 50);
         assert_eq!(log_lines(Some(0)), 1);
         assert_eq!(log_lines(Some(1_000_000)), LOG_LINES_MAX);
+    }
+
+    #[test]
+    fn a_stopped_container_is_remembered_by_its_errors() {
+        let log = "2026-11-05T07:13:06.882117449Z \u{1b}[32m INFO\u{1b}[0m toolkit: Initializing a gear... gear=\"a\"\n\
+                   2026-11-05T07:13:06.990000000Z \u{1b}[31mERROR\u{1b}[0m toolkit: gear init failed: oidc discovery: connection refused\n\
+                   2026-11-05T07:13:07.000000000Z  INFO toolkit: shutting down\n";
+        assert_eq!(
+            last_words(log).as_deref(),
+            Some("ERROR toolkit: gear init failed: oidc discovery: connection refused")
+        );
+        // Nothing names an error: the last lines are what is left.
+        assert_eq!(
+            last_words("one\ntwo\nthree\n").as_deref(),
+            Some("two / three")
+        );
+        assert_eq!(last_words("\n \n"), None);
+        // An error returned from `main` is told with its causes.
+        let log = "2026-11-05T07:16:48.383Z ERROR hw: Failed to get hardware machine ID\n\
+                   Error: initialization failed for gear 'm'\n\
+                   \n\
+                   Caused by:\n    invalid config for gear 'm': missing field `model_catalog`\n";
+        assert_eq!(
+            last_words(log).as_deref(),
+            Some(
+                "Error: initialization failed for gear 'm' / invalid config for gear 'm': missing field `model_catalog`"
+            )
+        );
     }
 
     #[test]
@@ -1326,6 +1763,7 @@ mod tests {
         p.chart_ref = Some(ChartRef {
             reference: "oci://ghcr.io/acme/charts/shop".into(),
             version: "0.1.0".into(),
+            digest: None,
         });
         let line = helm_args(&p, &prepared("oci://ghcr.io/acme/charts/shop", true)).join(" ");
         assert!(line.starts_with("upgrade --install studio-web oci://ghcr.io/acme/charts/shop"));

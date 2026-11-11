@@ -53,6 +53,9 @@ export const SpecQuality = lazy(() =>
 
 /** Saved views over the domain model (views.tsx). */
 export const ViewsScreen = lazy(() => import("./views").then((m) => ({ default: m.ViewsScreen })));
+export const DomainModelAdmin = lazy(() =>
+  import("./domain-model-admin").then((m) => ({ default: m.DomainModelAdmin })),
+);
 export const DomainModelGraph = lazy(() =>
   import("./domain-model-graph").then((m) => ({ default: m.DomainModelGraph })),
 );
@@ -61,9 +64,6 @@ export const GtsEntitiesTable = lazy(() =>
 );
 export const ObjectTypes = lazy(() =>
   import("./object-types").then((m) => ({ default: m.ObjectTypes })),
-);
-export const ProcessCatalogTab = lazy(() =>
-  import("./process-catalog").then((m) => ({ default: m.ProcessCatalogTab })),
 );
 export const IdentityDirectory = lazy(() =>
   import("./identity-directory").then((m) => ({ default: m.IdentityDirectory })),

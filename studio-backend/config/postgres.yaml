@@ -103,7 +103,7 @@ gears:
         version: "0.1.0"
         description: "Studio backend assembly — account-management demo"
 
-  gear-orchestrator:
+  service-discovery:
     config: {}
 
   grpc-hub:
@@ -430,6 +430,14 @@ gears:
     database:
       server: "pg_main"
       dbname: "studio_documents"
+    config:
+      # Where each kind of this gear's data is kept (ADR-0066): `model` as
+      # domain objects in the graph, read through POST /query; `tables` in
+      # this database. Rows of a kind switched to `model` move on first read.
+      storage:
+        process: "model"
+        reviews: "model"
+        documents: "model"
 
   studio-user:
     database:
@@ -457,10 +465,20 @@ gears:
       # Dev-only Ed25519 seed so signed URLs survive restarts (generate your
       # own for any shared environment).
       signing_key_seed: "ej5FEOW2E1emMKbKUNBKALhdHb-VLvLNM-n4FcuDREY"
-      finalize_internal_secret: "dev-fs-internal-token"
+      # Dev-only: the token a sidecar would send on its finalize callbacks
+      # (FS_SIDECAR_INTERNAL_TOKEN); file-storage >= 0.4 refuses to start
+      # without one.
+      finalize_internal_secret: "dev-file-storage-internal-secret"
 
   # LLM egress chain: mini-chat -> oagw -> provider; secrets via credstore
+  # A database keeps upstreams and routes across restarts and moves the
+  # registry reconcile (which needs the root tenant) out of post_init into
+  # a background task in `start` (oagw >= 0.6, ADR-0018), so a fresh
+  # database no longer stops the boot before account-management seeds it.
   oagw:
+    database:
+      server: "pg_main"
+      dbname: "studio_oagw"
     config:
       proxy_timeout_secs: 120
 
@@ -540,6 +558,19 @@ gears:
         idle_timeout: "5m"
         max_lifetime: "30m"
 
+  # ── studio-environments (slugs, namespace assignments, image records, ADR-0062) ──
+  # A few rows per build and deploy. One connection: each one here is one
+  # more per replica on pg_main's budget.
+  studio-environments:
+    database:
+      server: "pg_main"
+      dbname: "studio_environments"
+      pool:
+        max_conns: 1
+        min_conns: 0
+        acquire_timeout: "10s"
+        idle_timeout: "5m"
+
   # ── usage-collector (the platform's metering store, issue #781) ──
   # What model calls and IDE sessions use is recorded here by studio-llm-proxy
   # and studio-session; the records live with the storage plugin below.
@@ -596,6 +627,29 @@ gears:
       client_credentials:
         client_id: "mini-chat"
         client_secret: "mini-chat-dev-secret"
+      # The artifact graph as domain objects (ADR-0066 §8a): `model`, or
+      # `graph` for the gear's own graph types and the index above.
+      storage:
+        artifacts: "model"
+
+  # ── studio-domain-model (the domain read model) ──
+  # Every live domain object and relation as rows, so POST /query runs in
+  # Postgres with no bound on a type's size, follows relations both ways and
+  # counts by group (ADR-0066, src/domain_model/mirror.rs). Filled from the
+  # graph on a tenant's first query and kept current by every domain write.
+  # Drop the block and nothing is lost but speed and reach: queries read the
+  # graph, over at most 5 000 objects of a type.
+  studio-domain-model:
+    database:
+      server: "pg_main"
+      dbname: "studio_domain_model"
+      pool:
+        max_conns: 2
+        min_conns: 0
+        acquire_timeout: "10s"
+        idle_timeout: "5m"
+        max_lifetime: "30m"
+    config: {}
 
   github-mirror:
     database:

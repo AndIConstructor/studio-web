@@ -247,7 +247,8 @@ impl TaskService {
             }
         };
         // Wake the sequencer rather than letting a quiet queue wait out its
-        // idle interval.
+        // idle interval: after the commit, so the partition is marked dirty
+        // against rows that are durable.
         wake.fire();
         Ok(row)
     }

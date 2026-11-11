@@ -146,6 +146,32 @@ pub(crate) trait CatalogSink: Send + Sync {
     ) -> anyhow::Result<Vec<Value>> {
         Ok(Vec::new())
     }
+    /// Write screen previews (see `components_catalog::previews`). Apart from
+    /// [`Self::upsert`] for the reason snapshots are: a picture is not a
+    /// catalogue node, and nothing in one is embedded.
+    async fn write_previews(
+        &self,
+        _ctx: &SecurityContext,
+        _nodes: &[GtsNode],
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+    /// One component's screen preview payloads, every build's. Unordered.
+    async fn previews(
+        &self,
+        _ctx: &SecurityContext,
+        _component: &str,
+    ) -> anyhow::Result<Vec<Value>> {
+        Ok(Vec::new())
+    }
+    /// Remove screen previews by instance id.
+    async fn delete_previews(
+        &self,
+        _ctx: &SecurityContext,
+        _instance_ids: &[String],
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 /// A node of any type, typed only by its id — what a catalogue that no longer
@@ -182,6 +208,7 @@ pub struct GraphNodeType {
 pub(crate) struct MemorySink {
     nodes: Mutex<HashMap<String, GtsNode>>,
     snapshots: Mutex<HashMap<String, Value>>,
+    previews: Mutex<HashMap<String, Value>>,
     scoped: bool,
 }
 
@@ -372,6 +399,46 @@ impl CatalogSink for MemorySink {
             .cloned()
             .collect())
     }
+
+    async fn write_previews(&self, ctx: &SecurityContext, nodes: &[GtsNode]) -> anyhow::Result<()> {
+        let mut map = self
+            .previews
+            .lock()
+            .map_err(|_| anyhow!("catalog store lock poisoned"))?;
+        for n in nodes {
+            map.insert(self.key(ctx, &n.instance_id), n.value.clone());
+        }
+        Ok(())
+    }
+
+    async fn previews(&self, ctx: &SecurityContext, component: &str) -> anyhow::Result<Vec<Value>> {
+        let map = self
+            .previews
+            .lock()
+            .map_err(|_| anyhow!("catalog store lock poisoned"))?;
+        Ok(map
+            .iter()
+            .filter(|(k, v)| {
+                self.mine(ctx, k) && v.get("component").and_then(Value::as_str) == Some(component)
+            })
+            .map(|(_, v)| v.clone())
+            .collect())
+    }
+
+    async fn delete_previews(
+        &self,
+        ctx: &SecurityContext,
+        instance_ids: &[String],
+    ) -> anyhow::Result<()> {
+        let mut map = self
+            .previews
+            .lock()
+            .map_err(|_| anyhow!("catalog store lock poisoned"))?;
+        for id in instance_ids {
+            map.remove(&self.key(ctx, id));
+        }
+        Ok(())
+    }
 }
 
 /// A snapshot's node name: which component, which day.
@@ -379,6 +446,18 @@ impl CatalogSink for MemorySink {
 fn snapshot_name(value: &Value) -> String {
     let part = |key: &str| value.get(key).and_then(Value::as_str).unwrap_or_default();
     format!("{} @ {}", part("component"), part("date"))
+}
+
+/// A screen preview's node name: which component, which screen, which commit.
+#[cfg(feature = "graph")]
+fn preview_name(value: &Value) -> String {
+    let part = |key: &str| value.get(key).and_then(Value::as_str).unwrap_or_default();
+    format!(
+        "{} {} @ {}",
+        part("component"),
+        part("route"),
+        part("commit")
+    )
 }
 
 /// Human name for a node, from the curated payload. Used by the graph backend.
@@ -521,10 +600,11 @@ impl CatalogSink for GraphSink {
     }
 
     /// One atomic batch, idempotent: a byte-identical re-registration
-    /// converges. Each type derives from a graph-storage family — a free-form
-    /// type has no chain to validate against and is refused.
+    /// converges, and a compatible change to a stored type updates it
+    /// (`on_existing: Update`). Each type derives from a graph-storage family —
+    /// a free-form type has no chain to validate against and is refused.
     async fn register_types(&self, ctx: &SecurityContext) -> anyhow::Result<()> {
-        use graph_storage_sdk::models::TypeRegistration;
+        use graph_storage_sdk::models::{OnExisting, TypeRegistration, TypeRegistrationOptions};
         let batch: Vec<TypeRegistration> = gts::graph_node_type_schemas()
             .into_iter()
             .chain(gts::graph_edge_type_schemas())
@@ -538,12 +618,19 @@ impl CatalogSink for GraphSink {
                 schema,
             })
             .collect();
-        self.client.register_types(ctx, batch).await.map_err(|e| {
-            anyhow!(
-                "register catalog types: {}",
-                crate::graph_error::explain(&e)
-            )
-        })?;
+        let options = TypeRegistrationOptions {
+            on_existing: OnExisting::Update,
+            ..Default::default()
+        };
+        self.client
+            .register_types_with(ctx, batch, options)
+            .await
+            .map_err(|e| {
+                anyhow!(
+                    "register catalog types: {}",
+                    crate::graph_error::explain(&e)
+                )
+            })?;
         Ok(())
     }
 
@@ -918,6 +1005,82 @@ impl CatalogSink for GraphSink {
         }
         Ok(out)
     }
+
+    async fn write_previews(&self, ctx: &SecurityContext, nodes: &[GtsNode]) -> anyhow::Result<()> {
+        use crate::artifact_ingest::sdk::{str_without_nul, without_nul};
+        use graph_storage_sdk::models::NodeSpec;
+        // One picture per batch: each carries its image, and a batch of them
+        // would be a large request for no gain.
+        for n in nodes {
+            let spec = NodeSpec {
+                node_key: n.instance_id.clone(),
+                type_id: gts::graph_type_id(n.type_id),
+                name: Some(str_without_nul(preview_name(&n.value))),
+                payload: Some(without_nul(n.value.clone())),
+                expected_version: None,
+            };
+            self.client
+                .ingest(ctx, node_batch(vec![spec], false))
+                .await
+                .map_err(|e| {
+                    anyhow!(
+                        "graph-storage screen preview ingest: {}",
+                        crate::graph_error::explain(&e)
+                    )
+                })?;
+        }
+        Ok(())
+    }
+
+    /// Filtered by the graph on the component the type indexes.
+    async fn previews(&self, ctx: &SecurityContext, component: &str) -> anyhow::Result<Vec<Value>> {
+        use toolkit_odata::{CursorV1, ODataQuery};
+        // Small pages: every row carries a picture.
+        const PAGE: u64 = 50;
+        let raw = format!("payload/component eq '{}'", component.replace('\'', "''"));
+        let filter = toolkit_odata::parse_filter_string(&raw)
+            .map_err(|e| anyhow!("screen preview filter `{raw}`: {e}"))?
+            .into_expr();
+        let patterns = [gts::graph_type_id(gts::SCREEN_PREVIEW_TYPE)];
+        let mut out: Vec<Value> = Vec::new();
+        let mut query = ODataQuery::default()
+            .with_filter(filter.clone())
+            .with_limit(PAGE);
+        loop {
+            let page = self
+                .client
+                .project_nodes(ctx, &patterns, query.clone())
+                .await
+                .map_err(|e| anyhow!("graph-storage screen preview projection: {e}"))?;
+            out.extend(
+                page.items
+                    .into_iter()
+                    .filter(|row| self.owned(ctx, row))
+                    .filter_map(|row| row.payload),
+            );
+            let Some(next) = page.page_info.next_cursor else {
+                break;
+            };
+            let cursor = CursorV1::decode(&next)
+                .map_err(|e| anyhow!("graph-storage returned an undecodable cursor: {e}"))?;
+            query = ODataQuery::default()
+                .with_filter(filter.clone())
+                .with_limit(PAGE)
+                .with_cursor(cursor);
+        }
+        Ok(out)
+    }
+
+    async fn delete_previews(
+        &self,
+        ctx: &SecurityContext,
+        instance_ids: &[String],
+    ) -> anyhow::Result<()> {
+        for id in instance_ids {
+            self.delete(ctx, id).await?;
+        }
+        Ok(())
+    }
 }
 
 /// The graph-storage sink against a fake of the gear that keeps its
@@ -928,9 +1091,9 @@ mod graph_sink_tests {
     use graph_storage_sdk::GraphStorageClientV1;
     use graph_storage_sdk::models::{
         DeleteOutcome, EdgeKey, ElementEnvelope, GraphRevision, GtsTypeId, IngestCounts,
-        IngestOutcome, IngestRequest, NeighborhoodRequest, NodeKey, NodeRow, NodeView, Page,
-        SearchRequest, SearchResponse, Subject, TraversalResponse, TraverseRequest, TypeQuery,
-        TypeRecord, TypeRegistration,
+        IngestOutcome, IngestRequest, NeighborhoodRequest, NodeCount, NodeKey, NodeRow, NodeView,
+        Page, RegisteredType, SearchRequest, SearchResponse, Subject, TraversalResponse,
+        TraverseRequest, TypeQuery, TypeRecord, TypeRegistration, TypeRegistrationOptions,
     };
     use toolkit_canonical_errors::CanonicalError;
     use uuid::Uuid;
@@ -983,6 +1146,7 @@ mod graph_sink_tests {
             updated_by: subject,
             deleted_at: None,
             deleted_by: None,
+            version: Some(1),
             graph_revision: GraphRevision {
                 source_epoch: 0,
                 revision: 0,
@@ -1005,12 +1169,21 @@ mod graph_sink_tests {
 
     #[async_trait]
     impl GraphStorageClientV1 for FakeGraph {
-        async fn register_types(
+        async fn register_types_with(
             &self,
             _ctx: &SecurityContext,
             _batch: Vec<TypeRegistration>,
-        ) -> Result<Vec<TypeRecord>, CanonicalError> {
+            _options: TypeRegistrationOptions,
+        ) -> Result<Vec<RegisteredType>, CanonicalError> {
             Ok(Vec::new())
+        }
+        async fn count_nodes(
+            &self,
+            _ctx: &SecurityContext,
+            _type_patterns: &[String],
+            _query: toolkit_odata::ODataQuery,
+        ) -> Result<NodeCount, CanonicalError> {
+            unimplemented!()
         }
         async fn get_type(
             &self,

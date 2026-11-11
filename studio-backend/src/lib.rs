@@ -16,6 +16,7 @@ mod catalog_graph; // the catalogue graph: node vocabulary + store, shared by th
 mod components_catalog; // connector to crates.io: catalogue our published gears + versions in the graph
 mod connectors; // source connectors: driver plugins + tenant connection catalogue
 mod credstore_pg; // persistent credstore value store (issue #66)
+mod data_places; // where each gear keeps its records, as the architecture page shows it
 mod database_bootstrap; // config-discovered PostgreSQL provisioning + migrations
 mod documents; // document management: types + templates + section-checklist validation
 mod domain_model; // store the Studio domain model as GTS types in the graph; create/extend objects
@@ -28,6 +29,8 @@ mod idempotency; // the Idempotency-Key request header every 202 operation takes
 mod identity_directory; // platform-admin view of assigned and unassigned Keycloak identities
 mod insight; // integration seam to Constructor Insight (external decision-intelligence service)
 mod kit_registry; // Git-backed kit catalogue + project-scoped desired installations
+mod model_metadata; // tenant documents a gear keeps (account-management metadata), held as domain objects
+mod model_sweep; // moves every tenant's records into (or back out of) the domain model at start
 // keycloak-idp-plugin is the official cf-gears-keycloak-idp-plugin (linked in
 // registered_gears.rs). The former in-crate implementation was removed once the
 // official plugin went green — see docs/keycloak-idp-migration.md.
@@ -160,6 +163,13 @@ enum Commands {
         /// (ADR-0054 §7); without it the product description is built.
         #[arg(long)]
         own: Option<String>,
+        /// `id=ref`: the description's `git(...)` source `id`, one of the
+        /// project's repositories, fetched at `ref` (ADR-0060 §3).
+        #[arg(long = "source-ref")]
+        source_refs: Vec<String>,
+        /// `dev` builds the profile as a development one (ADR-0060 §5).
+        #[arg(long)]
+        strictness: Option<String>,
     },
     /// The last step of a build in an organization's cluster: push the chart
     /// beside the images and leave the manifest as the termination message.
@@ -216,6 +226,8 @@ pub async fn run_cli() -> Result<()> {
         product_file,
         profile,
         own,
+        source_refs,
+        strictness,
     }) = &cli.command
     {
         // Studio's revision when the Job carries one (ADR-0053 §2), else only
@@ -239,6 +251,7 @@ pub async fn run_cli() -> Result<()> {
             product_file,
             profile,
             own.as_deref(),
+            &environments::build::SourceOptions::parse(source_refs, strictness.as_deref())?,
         )
         .inspect_err(environments::build::say_failure);
     }
@@ -432,13 +445,14 @@ mod config_expansion_tests {
 
     /// The union of no-default placeholders across the profiles — what the
     /// Helm chart (k8s) and docker-compose (docker/oidc/postgres) provide.
-    const REQUIRED: [&str; 11] = [
+    const REQUIRED: [&str; 12] = [
         "STUDIO_PG_HOST",
         "STUDIO_PG_USER",
         "STUDIO_PG_PASSWORD",
         "STUDIO_PG_DBNAME",
         "STUDIO_OIDC_ISSUER",
         "STUDIO_FS_SIGNING_SEED",
+        "STUDIO_FS_FINALIZE_SECRET",
         "STUDIO_IDP_ADMIN_BASE_URL",
         "STUDIO_IDP_ADMIN_SECRET",
         "STUDIO_SESSION_ENABLED",
