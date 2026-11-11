@@ -673,7 +673,7 @@ impl IngestService {
         // errors, leaves the metric unset and costs the sync nothing else.
         progress.set("reading review threads…");
         let threads = match driver
-            .open_review_threads(&auth, repo_full_path, MAX_THREAD_PULLS)
+            .open_review_threads(&download_auth, repo_full_path, MAX_THREAD_PULLS)
             .await
         {
             Ok(v) => v,
