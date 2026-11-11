@@ -180,18 +180,31 @@ impl TaskHandler for IngestTask {
             }
         };
 
-        let platform_token = if self
+        let platform = if self
             .service
-            .platform_auth(&ctx.security, payload.tenant(ctx.tenant), &payload.secret_ref)
+            .platform_auth(
+                &ctx.security,
+                payload.tenant(ctx.tenant),
+                &payload.secret_ref,
+            )
             .await
         {
+            let base_url = match self.service.platform_base_url() {
+                Ok(url) => url,
+                Err(e) => return TaskOutcome::Failed(format!("{e:#}")),
+            };
             match self.service.platform_token().await {
-                Ok(t) => Some(t),
+                Ok(t) => Some((t, base_url)),
                 Err(e) => return TaskOutcome::Retry(format!("{e:#}")),
             }
         } else {
             None
         };
+        let base_url = match &platform {
+            Some((_, url)) => Some(url.as_str()),
+            None => payload.base_url.as_deref(),
+        };
+        let platform_token = platform.as_ref().map(|(token, _)| token.as_str());
 
         let (progress, drain) = ctx.progress_bridge();
         // Held until the sync returns. A closed semaphore cannot happen -- it is
@@ -209,12 +222,12 @@ impl TaskHandler for IngestTask {
             .run_sync(
                 &ctx.security,
                 &payload.provider,
-                payload.base_url.as_deref(),
+                base_url,
                 &payload.secret_ref,
                 &payload.repo_full_path,
                 payload.since.as_deref(),
                 &token,
-                platform_token.as_deref(),
+                platform_token,
                 payload.workspace_id.as_deref(),
                 payload.project_id.as_deref(),
                 payload.repo_dir.as_deref(),

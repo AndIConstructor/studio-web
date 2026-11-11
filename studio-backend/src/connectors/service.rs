@@ -735,11 +735,7 @@ impl ConnectorService {
 
     /// Assemble driver credentials for a stored connection.
     async fn auth(&self, ctx: &SecurityContext, c: &Connection) -> anyhow::Result<ConnectionAuth> {
-        let base_url = direct_base_url(
-            self.driver(&c.provider)?.as_ref(),
-            &c.base_url,
-            &c.options,
-        );
+        let base_url = direct_base_url(self.driver(&c.provider)?.as_ref(), &c.base_url, &c.options);
         // Stored without a credential (a public gear repository).
         if c.secret_ref.is_empty() {
             return Ok(ConnectionAuth {
@@ -1224,10 +1220,19 @@ impl ConnectorService {
             None => existing.base_url.clone(),
         };
 
+        let options = match options {
+            Some(o) => driver.check_options(&base_url, &o)?,
+            None => existing.options.clone(),
+        };
+
         // No new token: verify the change against the credential already
         // stored, so relocating an installation cannot quietly leave a
         // connection that has never been proven to work.
-        address_change_needs_token(&base_url, &existing.base_url, token)?;
+        address_change_needs_token(
+            &direct_base_url(driver.as_ref(), &base_url, &options),
+            &direct_base_url(driver.as_ref(), &existing.base_url, &existing.options),
+            token,
+        )?;
 
         let rotating = token.is_some();
         // A connection stored without a credential has no secret to rotate.
@@ -1245,10 +1250,6 @@ impl ConnectorService {
                 t.to_string()
             }
             None => self.auth(ctx, &existing).await?.token,
-        };
-        let options = match options {
-            Some(o) => driver.check_options(&base_url, &o)?,
-            None => existing.options.clone(),
         };
 
         let identity = driver

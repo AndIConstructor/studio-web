@@ -173,6 +173,8 @@ fn resolve_dir(env: &str) -> Option<PathBuf> {
 struct IngestGearConfig {
     #[serde(default)]
     client_credentials: ClientCredentialsConfig,
+    #[serde(default)]
+    mirror_base_url: String,
 }
 
 #[derive(Default, Deserialize)]
@@ -197,6 +199,7 @@ fn platform_client(ctx: &GearCtx) -> anyhow::Result<Option<service::PlatformClie
         authn,
         client_id: creds.client_id,
         client_secret: creds.client_secret,
+        mirror_base_url: cfg.mirror_base_url.trim().trim_end_matches('/').to_string(),
     }))
 }
 

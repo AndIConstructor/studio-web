@@ -607,11 +607,7 @@ mod tests {
             "the mirror is linked only with the `github-mirror` feature, which \
              no default build turns on; it is tried on postgres.yaml first (#895)",
         ),
-        (
-            "docker.yaml",
-            "github-mirror",
-            "same reason as dev.yaml",
-        ),
+        ("docker.yaml", "github-mirror", "same reason as dev.yaml"),
     ];
 
     #[test]

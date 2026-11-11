@@ -38,8 +38,8 @@ database:
         # and a gear inherits this block unless it declares its own. This is
         # therefore not "three connections to pg_main" — it is three PER GEAR,
         # and fourteen gear databases below inherit it: 14 x 3 = 42, plus the
-        # gears with their own `pool` (20), 62 per replica. Two replicas need
-        # 124, and 144 with Keycloak, the bootstrap Job, the operator and the
+        # gears with their own `pool` (22), 64 per replica. Two replicas need
+        # 128, and 148 with Keycloak, the bootstrap Job, the operator and the
         # reserved slots, against `max_connections: 160`;
         # deploy/k8s/cloudnative-pg/README.md carries the table. It was 4, and
         # two replicas then needed 172. Two replicas at 3 still give each gear
@@ -808,6 +808,7 @@ gears:
       client_credentials:
         client_id: "mini-chat"
         client_secret: "${STUDIO_OIDC_S2S_CLIENT_SECRET:-mini-chat-dev-secret}"
+      mirror_base_url: "http://127.0.0.1:8090/cf"
       # The artifact graph as domain objects (ADR-0066 §8a): `model`, or
       # `graph` for the gear's own graph types and the index above.
       storage:
@@ -836,6 +837,12 @@ gears:
     database:
       server: "pg_main"
       dbname: "studio_github_mirror"
+      pool:
+        max_conns: 2
+        min_conns: 0
+        acquire_timeout: "10s"
+        idle_timeout: "5m"
+        max_lifetime: "30m"
     config:
       api_base_url: "https://api.github.com"
       github_token_secret:

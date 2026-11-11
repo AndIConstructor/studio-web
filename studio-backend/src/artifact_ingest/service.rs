@@ -265,6 +265,7 @@ pub struct PlatformClient {
     pub authn: Arc<dyn AuthNResolverClient>,
     pub client_id: String,
     pub client_secret: String,
+    pub mirror_base_url: String,
 }
 
 /// Why a sync may not read with the token it names.
@@ -383,6 +384,16 @@ impl IngestService {
             .bearer_token()
             .map(|t| t.expose_secret().to_string())
             .ok_or_else(|| anyhow!("the client credentials exchange returned no bearer token"))
+    }
+
+    pub fn platform_base_url(&self) -> anyhow::Result<String> {
+        match self.platform.as_ref() {
+            Some(p) if !p.mirror_base_url.is_empty() => Ok(p.mirror_base_url.clone()),
+            _ => Err(anyhow!(
+                "the connection reads with a platform token, but studio-artifact-ingest has no \
+                 mirror_base_url configured; the platform token is sent nowhere else"
+            )),
+        }
     }
 
     /// Record that `work_root` cannot be written (see [`writable`]).
@@ -962,7 +973,10 @@ impl IngestService {
             None => {
                 // No checkout available — fall back to connector metadata.
                 progress.set("listing files…");
-                match driver.list_files(&download_auth, repo_full_path, None).await {
+                match driver
+                    .list_files(&download_auth, repo_full_path, None)
+                    .await
+                {
                     Ok(listing) => {
                         let blobs: Vec<_> =
                             listing.files.into_iter().filter(|f| !f.is_dir).collect();
