@@ -653,8 +653,8 @@ gears:
 
   github-mirror:
     database:
-      engine: "sqlite"
-      file: "github_mirror.db"
+      server: "pg_main"
+      dbname: "studio_github_mirror"
     config:
       api_base_url: "https://api.github.com"
       github_token_secret:

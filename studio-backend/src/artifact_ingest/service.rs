@@ -962,7 +962,7 @@ impl IngestService {
             None => {
                 // No checkout available — fall back to connector metadata.
                 progress.set("listing files…");
-                match driver.list_files(&auth, repo_full_path, None).await {
+                match driver.list_files(&download_auth, repo_full_path, None).await {
                     Ok(listing) => {
                         let blobs: Vec<_> =
                             listing.files.into_iter().filter(|f| !f.is_dir).collect();

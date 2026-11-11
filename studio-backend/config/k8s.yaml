@@ -832,6 +832,16 @@ gears:
         max_lifetime: "30m"
     config: {}
 
+  github-mirror:
+    database:
+      server: "pg_main"
+      dbname: "studio_github_mirror"
+    config:
+      api_base_url: "https://api.github.com"
+      github_token_secret:
+        tenant_id: "00000000-0000-0000-0000-000000000001"
+        key: "github-token"
+
   # ── studio-scheduler (cron/interval schedules) ──
   # Owns schedules and nothing else: each tick it enqueues due runs into
   # studio-tasks. A tick runs under a PostgreSQL advisory lock, so a second
