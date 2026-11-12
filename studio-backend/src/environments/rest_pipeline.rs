@@ -10,8 +10,8 @@ use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
 use super::{
-    ConfigSecretQuery, DeploymentDto, DeploymentFilter, Environments, ImageDto, License,
-    ProjectQuery, TAG, deployment_dto, problem,
+    ConfigSecretQuery, DeploymentFilter, EnvironmentDeploymentDto, Environments, FailureCauseDto,
+    ImageDto, License, ProjectQuery, TAG, deployment_dto, path_routes, problem,
 };
 use crate::environments::service::{BuildView, SecretKeys};
 use crate::org_scope::OrgCtx;
@@ -42,6 +42,9 @@ pub struct EnvironmentBuildDto {
     /// cluster.
     pub failure: Option<String>,
     pub failure_step: Option<String>,
+    /// Why it failed in words a person acts on, and the actions that fix it
+    /// (#1054); only for a failed or cancelled build.
+    pub cause: Option<FailureCauseDto>,
     /// For a build Studio ran: the environment, namespace, ref, connection,
     /// builder image and engine it ran with.
     pub environment_id: Option<String>,
@@ -63,7 +66,16 @@ pub struct EnvironmentBuildDto {
 fn build_dto(v: BuildView) -> EnvironmentBuildDto {
     let r = v.record;
     let p = r.place;
+    let cause = matches!(r.status.as_str(), "failed" | "cancelled").then(|| {
+        path_routes::cause_dto(crate::environments::failure::explain(
+            crate::environments::failure::Of::Build,
+            r.failure.as_deref().unwrap_or_default(),
+            r.failure_step.as_deref(),
+            r.r#where.as_deref() == Some("research"),
+        ))
+    });
     EnvironmentBuildDto {
+        cause,
         build_id: r.build_id,
         ran_in: r.r#where,
         status: r.status,
@@ -179,7 +191,7 @@ async fn get_deployment(
     Extension(envs): Extension<Environments>,
     Path(deployment_id): Path<Uuid>,
     Query(f): Query<DeploymentFilter>,
-) -> ApiResult<JsonBody<DeploymentDto>> {
+) -> ApiResult<JsonBody<EnvironmentDeploymentDto>> {
     // As the list: a project's deployment is its organization's.
     let org = match f.project_id {
         Some(project) => envs
@@ -252,7 +264,11 @@ pub fn register(mut router: Router, openapi: &dyn OpenApiRegistry) -> Router {
         .query_param_typed("organization_id", false, "The organization", "string")
         .query_param_typed("project_id", false, "The project it is of", "string")
         .handler(get_deployment)
-        .json_response_with_schema::<DeploymentDto>(openapi, StatusCode::OK, "The deployment")
+        .json_response_with_schema::<EnvironmentDeploymentDto>(
+            openapi,
+            StatusCode::OK,
+            "The deployment",
+        )
         .error_401(openapi)
         .error_404(openapi)
         .error_500(openapi)
