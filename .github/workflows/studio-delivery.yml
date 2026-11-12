@@ -1675,7 +1675,7 @@ jobs:
           # FS_SIDECAR_INTERNAL_TOKEN). Derived from the signing key, so it is
           # as secret as the key, rotates with it and needs no secret of its own.
           FINALIZE_SECRET=$(printf 'studio-file-storage-finalize:%s' "$SIGNING_KEY" | sha256sum | cut -d' ' -f1)
-          kubectl create secret generic studio-web-file-storage-signing -n "$NAMESPACE" \
+          kubectl create secret generic studio-web-file-storage-signing-p256 -n "$NAMESPACE" \
             --from-literal=signing_key="$SIGNING_KEY" \
             --from-literal=sidecar_public_key="$SIDECAR_PUBLIC_KEY" \
             --from-literal=finalize_internal_secret="$FINALIZE_SECRET" \
@@ -1800,7 +1800,7 @@ jobs:
             studio-web-idp \
             studio-web-app \
             studio-web-file-storage-s3 \
-            studio-web-file-storage-signing \
+            studio-web-file-storage-signing-p256 \
             keycloak-postgres-app \
             studio-web-keycloak-admin \
             studio-web-keycloak-realm; do

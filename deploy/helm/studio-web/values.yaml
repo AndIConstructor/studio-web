@@ -279,7 +279,7 @@ backend:
       # Keys: signing_key, sidecar_public_key, finalize_internal_secret (the
       # sidecar's finalize-callback token, file-storage >= 0.4; deploy.yml
       # derives it from the signing key).
-      signingExistingSecret: "studio-web-file-storage-signing"
+      signingExistingSecret: "studio-web-file-storage-signing-p256"
     # Non-secret digest supplied by deploy.yml. A rotation rolls the Pod.
     secretRevision: ""
     resources:

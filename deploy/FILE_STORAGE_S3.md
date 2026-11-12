@@ -103,7 +103,10 @@ Revoke any S3 access key that has previously appeared in chat or a ticket.
 `Deploy Services` performs the secret synchronization before Helm:
 
 - creates or updates `studio-web-file-storage-s3` in the target namespace;
-- creates or updates `studio-web-file-storage-signing`;
+- creates or updates `studio-web-file-storage-signing-p256` (the P-256 keys);
+  the older `studio-web-file-storage-signing` (32-byte seed) is left as it is,
+  so a Helm rollback to a chart from before the P-256 switch still finds its
+  keys;
 - validates the signing values as 32-byte unpadded base64url;
 - injects a non-secret digest into the Pod template so secret rotation causes a
   rollout;
