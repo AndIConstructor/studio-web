@@ -95,6 +95,7 @@ env:
   SOURCE_SHA: ${{ github.event.inputs.source_ref || github.sha }}
   SOURCE_REF_NAME: ${{ github.event.inputs.source_ref || github.ref_name }}
   SOURCE_REF_TYPE: ${{ github.ref_type }}
+  CARGO_INCREMENTAL: 0
 
 jobs:
   test-changes:

@@ -180,7 +180,7 @@ impl TaskHandler for IngestTask {
             }
         };
 
-        let platform = if self
+        let platform_base_url = if self
             .service
             .platform_auth(
                 &ctx.security,
@@ -189,22 +189,16 @@ impl TaskHandler for IngestTask {
             )
             .await
         {
-            let base_url = match self.service.platform_base_url() {
-                Ok(url) => url,
+            match self.service.platform_base_url() {
+                Ok(url) => Some(url),
                 Err(e) => return TaskOutcome::Failed(format!("{e:#}")),
-            };
-            match self.service.platform_token().await {
-                Ok(t) => Some((t, base_url)),
-                Err(e) => return TaskOutcome::Retry(format!("{e:#}")),
             }
         } else {
             None
         };
-        let base_url = match &platform {
-            Some((_, url)) => Some(url.as_str()),
-            None => payload.base_url.as_deref(),
-        };
-        let platform_token = platform.as_ref().map(|(token, _)| token.as_str());
+        let base_url = platform_base_url
+            .as_deref()
+            .or(payload.base_url.as_deref());
 
         let (progress, drain) = ctx.progress_bridge();
         // Held until the sync returns. A closed semaphore cannot happen -- it is
@@ -217,6 +211,18 @@ impl TaskHandler for IngestTask {
                 INGEST_SLOT.acquire().await.ok()
             }
         };
+        let platform_token = if platform_base_url.is_some() {
+            match self.service.platform_token().await {
+                Ok(t) => Some(t),
+                Err(e) => {
+                    drop(progress);
+                    let _ = drain.await;
+                    return TaskOutcome::Retry(format!("{e:#}"));
+                }
+            }
+        } else {
+            None
+        };
         let outcome = self
             .service
             .run_sync(
@@ -227,7 +233,7 @@ impl TaskHandler for IngestTask {
                 &payload.repo_full_path,
                 payload.since.as_deref(),
                 &token,
-                platform_token,
+                platform_token.as_deref(),
                 payload.workspace_id.as_deref(),
                 payload.project_id.as_deref(),
                 payload.repo_dir.as_deref(),
