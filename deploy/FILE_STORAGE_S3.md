@@ -107,9 +107,11 @@ Revoke any S3 access key that has previously appeared in chat or a ticket.
   the older `studio-web-file-storage-signing` (32-byte seed) is left as it is,
   so a Helm rollback to a chart from before the P-256 switch still finds its
   keys;
-- validates the signing values as unpadded base64url: the private key as a
-  P-256 PKCS#8 DER key, the sidecar public key as the 65-byte uncompressed
-  P-256 point (87 characters);
+- checks only that both signing values use the unpadded base64url characters
+  and that the sidecar public key is 87 characters long; it does not parse the
+  keys or check that they belong together. The required formats are a P-256
+  PKCS#8 DER private key and its 65-byte uncompressed public point, so always
+  generate the pair together with `deploy/scripts/generate-file-storage-keypair.py`;
 - injects a non-secret digest into the Pod template so secret rotation causes a
   rollout;
 - checks that the matching sidecar image exists before changing the release.
