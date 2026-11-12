@@ -239,11 +239,11 @@ jobs:
       # features they compiled the crate once more than Test, which reuses
       # this build's library for its doc tests.
       - name: Lint
-        run: cargo clippy --locked --all-targets --features theia-bridge -- -D warnings
+        run: cargo clippy --locked --all-targets --features theia-bridge,github-mirror -- -D warnings
       - name: Build
-        run: cargo build --locked --features theia-bridge
+        run: cargo build --locked --features theia-bridge,github-mirror
       - name: Test
-        run: cargo test --locked --features theia-bridge
+        run: cargo test --locked --features theia-bridge,github-mirror
       - name: "Smoke: the assembly resolves its gears"
         run: |
           cargo run --locked --features theia-bridge -- --config config/dev.yaml --list-gears | tee gears.txt
@@ -716,7 +716,7 @@ jobs:
         # (/studio-assembly/v1/manifest); the checkout's HEAD, because
         # SOURCE_SHA may be a branch or tag name.
         run: |
-          STUDIO_BUILD_COMMIT="$(git rev-parse HEAD)"             cargo build --locked --release --no-default-features --features graph,theia-bridge
+          STUDIO_BUILD_COMMIT="$(git rev-parse HEAD)"             cargo build --locked --release --no-default-features --features graph,theia-bridge,github-mirror
 
       - uses: actions/upload-artifact@v6
         with:
