@@ -7,7 +7,7 @@
 #     provisioning: the official keycloak-idp-plugin is active — see its block
 #     below; add `enabled: false` there + idp.vendor "cf" to run without invites)
 #   STUDIO_LLM_API_KEY / STUDIO_LLM_HOST  (mini-chat only; the IDE uses people's keys)
-#   STUDIO_FS_SIGNING_SEED             (URL-signing key, per environment)
+#   STUDIO_FS_SIGNING_KEY              (URL-signing key, per environment)
 # IDE sessions use the Kubernetes Pod driver (ADR-0003) when the Helm
 # backend.sessions.enabled flag injects STUDIO_SESSION_ENABLED=true. The image
 # is injected too, so every backend snapshot launches the matching immutable
@@ -543,9 +543,9 @@ gears:
       server: "pg_main"
       dbname: "studio_file_storage"
     config:
-      # Stable Ed25519 seed; Helm loads it from the environment-specific
+      # Stable P-256 PKCS#8 key; Helm loads it from the environment-specific
       # file-storage signing Secret. The value is base64url without padding.
-      signing_key_seed: "${STUDIO_FS_SIGNING_SEED}"
+      signing_key_pkcs8: "${STUDIO_FS_SIGNING_KEY}"
       # The token the sidecar sends on its finalize callbacks (its
       # FS_SIDECAR_INTERNAL_TOKEN, the same Secret key); file-storage >= 0.4
       # refuses to start without it.
@@ -567,6 +567,8 @@ gears:
       dbname: "studio_oagw"
     config:
       proxy_timeout_secs: 120
+      proxy_cache:
+        enabled: false
       # The deployment's generation (Helm .Release.Revision): a pod of an
       # older release does not revert what a newer one reconciled. Unset
       # (null) turns the guard off, with a startup warning.

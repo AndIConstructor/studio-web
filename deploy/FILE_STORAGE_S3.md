@@ -10,7 +10,7 @@ Dev and test are isolated:
 | Dev | `studio-dev` | `dev-webstudio` | `https://studio-dev.cfabric.org` |
 | Test | `studio-test` | `test-webstudio` | `https://studio-test.cfabric.org` |
 
-Each environment has its own S3 credentials and Ed25519 signing pair. No secret
+Each environment has its own S3 credentials and P-256 signing pair. No secret
 value, rendered Kubernetes Secret, or kubeconfig belongs in Git.
 
 ## Architecture
@@ -82,8 +82,8 @@ Create these four secrets independently in both GitHub Environments (`dev` and
 | --- | --- |
 | `FILE_STORAGE_S3_ACCESS_KEY_ID` | Access key restricted to this environment's bucket |
 | `FILE_STORAGE_S3_SECRET_ACCESS_KEY` | Matching S3 secret key |
-| `FILE_STORAGE_SIGNING_SEED` | 32-byte Ed25519 seed, base64url without padding |
-| `FILE_STORAGE_SIDECAR_PUBLIC_KEY` | Matching raw Ed25519 public key, base64url without padding |
+| `FILE_STORAGE_SIGNING_KEY` | P-256 private key, PKCS#8 DER, base64url without padding |
+| `FILE_STORAGE_SIDECAR_PUBLIC_KEY` | Matching 65-byte uncompressed P-256 public point, base64url without padding |
 
 Generate a new signing pair for each environment:
 

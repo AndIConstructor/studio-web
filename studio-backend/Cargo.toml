@@ -111,9 +111,9 @@ uuid = { version = "1", features = ["serde", "v4", "v5"] }
 sha2 = "0.10"
 hex = "0.4"
 toolkit-macros = { package = "cf-gears-toolkit-macros", version = "=0.8.0" }
-credstore-sdk = { package = "cf-gears-credstore-sdk", version = "=0.2.21" }
+credstore-sdk = { package = "cf-gears-credstore-sdk", version = "=0.2.23" }
 # studio-git authenticates Git's Basic credentials itself (the gateway reads only Bearer).
-authn-resolver-sdk = { package = "cf-gears-authn-resolver-sdk", version = "=0.3.41" }
+authn-resolver-sdk = { package = "cf-gears-authn-resolver-sdk", version = "=0.3.43" }
 secrecy = "0.10"
 # Strict ${VAR} pre-expansion of the config file (#65): the toolkit loader
 # reads the YAML verbatim, so placeholders outside DSNs reached the runtime
@@ -126,19 +126,19 @@ gts = "0.16.1"
 # ── keycloak-idp-plugin (in-crate; real user provisioning, ADR-0004) ──
 # "stream" is for the llm-proxy gear (SSE passthrough to the LLM upstream).
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream", "multipart"] }
-account-management-sdk = { package = "cf-gears-account-management-sdk", version = "=0.8.3" }
-toolkit-odata = { package = "cf-gears-toolkit-odata", version = "=0.10.2" }
-types-registry-sdk = { package = "cf-gears-types-registry-sdk", version = "=0.5.0" }
-toolkit-security = { package = "cf-gears-toolkit-security", version = "=0.12.1" }
+account-management-sdk = { package = "cf-gears-account-management-sdk", version = "=0.9.1" }
+toolkit-odata = { package = "cf-gears-toolkit-odata", version = "=0.10.3" }
+types-registry-sdk = { package = "cf-gears-types-registry-sdk", version = "=0.5.2" }
+toolkit-security = { package = "cf-gears-toolkit-security", version = "=0.13.0" }
 # Optional: only pulled in by the `theia-event-broker` feature (ADR-0022
 # phase 3). Same gears-rust source as the toolkit crates above.
-event-broker-sdk = { package = "cf-gears-event-broker-sdk", version = "=0.5.2", optional = true }
+event-broker-sdk = { package = "cf-gears-event-broker-sdk", version = "=0.6.0", optional = true }
 # `utoipa` is on for graph-storage: it renders its Problem responses into the
 # OpenAPI document.
-toolkit-canonical-errors = { package = "cf-gears-toolkit-canonical-errors", version = "=0.10.0", features = ["axum", "utoipa"] }
+toolkit-canonical-errors = { package = "cf-gears-toolkit-canonical-errors", version = "=0.10.1", features = ["axum", "utoipa"] }
 # The connector plugin spec as a type (connectors/gts.rs), so Gearbox can check
 # the point studio-connector declares against it; already in the tree.
-toolkit-gts = { package = "cf-gears-toolkit-gts", version = "=0.2.0" }
+toolkit-gts = { package = "cf-gears-toolkit-gts", version = "=0.3.0" }
 # What the #[gts_type_schema] expansion names; the version toolkit-gts uses.
 schemars = "1.2.2"
 
@@ -148,7 +148,7 @@ schemars = "1.2.2"
 # encrypted in Postgres instead. `pg` + `sqlite` are named explicitly rather
 # than left to feature unification from the other gears: this crate is the one
 # that decides which engines the assembly can talk to.
-toolkit-db = { package = "cf-gears-toolkit-db", version = "=0.17.3", features = ["pg", "sqlite"] }
+toolkit-db = { package = "cf-gears-toolkit-db", version = "=0.17.4", features = ["pg", "sqlite"] }
 # Entity/migration definitions. Feature set and the runtime-tokio (NOT
 # runtime-tokio-rustls) choice mirror the gears-rust workspace manifest: the
 # rustls variant would activate `ring` alongside aws-lc-rs and make rustls
@@ -169,73 +169,62 @@ base64 = "0.22"
 
 # ── studio-project (in-crate; projects with two creation shapes, ADR-0005) ──
 # Membership stays on Resource Group per ADR-0002, so the gear needs RG's client.
-resource_group_sdk = { package = "cf-gears-resource-group-sdk", version = "=0.3.8" }
+resource_group_sdk = { package = "cf-gears-resource-group-sdk", version = "=0.3.10" }
 
 # ── graph-storage (knowledge-graph gear; behind the `graph` feature) ──
 # The gear and its SDK, as crates. Consumers (artifact-ingest, the gears
 # catalogue, the repository importer) talk to the gear through the SDK's
 # `GraphStorageClientV1` from the ClientHub, exactly as they talk to credstore.
 #
-# Interim: the `weftgraph` release candidate of the gear's 0.3 line
-# (constructorfabric/gears-rust#5571), whose libraries have the same names as
-# the official `cf-gears-graph-storage` crates. 0.3 carries what Studio asked
-# for in gears-rust#5529: a type update on the in-process client, a count, a
-# node's version on read, traversal direction and edge discriminators. Pinned
-# exactly, because a release candidate may change; it goes back to the
-# official crates once 0.3.0 is released. The embedding plugins come in
-# through the gear's `onnx` and `remote` features. Every other gears crate
-# comes from crates.io too, so there is one toolkit in the binary and no
-# `[patch]` block.
-#
 # NB: this gear runs ONLY against `pg_graph` (PostgreSQL 19 + pgvector) — see
 # the graph-postgres service in docker-compose.yml.
-graph_storage = { package = "cf-gears-graph-storage", version = "=0.3.0", optional = true }
-graph_storage_sdk = { package = "cf-gears-graph-storage-sdk", version = "=0.3.0", optional = true }
+graph_storage = { package = "cf-gears-graph-storage", version = "=0.3.2", optional = true }
+graph_storage_sdk = { package = "cf-gears-graph-storage-sdk", version = "=0.3.1", optional = true }
 
 # ── Core toolkit ──
-toolkit = { package = "cf-gears-toolkit", version = "=0.12.1", features = ["bootstrap"] }
+toolkit = { package = "cf-gears-toolkit", version = "=0.13.1", features = ["bootstrap"] }
 
 # ── System gears (required set) ──
-api_gateway = { package = "cf-gears-api-gateway", version = "=0.7.2" }
-grpc_hub = { package = "cf-gears-grpc-hub", version = "=0.5.0" }
-service_discovery = { package = "cf-gears-service-discovery", version = "=0.4.0" }
-nodes_registry = { package = "cf-gears-nodes-registry", version = "=0.1.47" }
-types_registry = { package = "cf-gears-types-registry", version = "=0.6.0" }
-tenant_resolver = { package = "cf-gears-tenant-resolver", version = "=0.2.0" }
-authn_resolver = { package = "cf-gears-authn-resolver", version = "=0.3.0" }
-authz_resolver = { package = "cf-gears-authz-resolver", version = "=0.4.0" }
-authz_resolver_sdk = { package = "cf-gears-authz-resolver-sdk", version = "=0.6.3" }
-resource_group = { package = "cf-gears-resource-group", version = "=0.4.9" }
+api_gateway = { package = "cf-gears-api-gateway", version = "=0.7.4" }
+grpc_hub = { package = "cf-gears-grpc-hub", version = "=0.5.2" }
+service_discovery = { package = "cf-gears-service-discovery", version = "=0.4.2" }
+nodes_registry = { package = "cf-gears-nodes-registry", version = "=0.1.49" }
+types_registry = { package = "cf-gears-types-registry", version = "=0.6.2" }
+tenant_resolver = { package = "cf-gears-tenant-resolver", version = "=0.2.2" }
+authn_resolver = { package = "cf-gears-authn-resolver", version = "=0.3.2" }
+authz_resolver = { package = "cf-gears-authz-resolver", version = "=0.4.2" }
+authz_resolver_sdk = { package = "cf-gears-authz-resolver-sdk", version = "=0.6.5" }
+resource_group = { package = "cf-gears-resource-group", version = "=0.4.11" }
 
 # ── Usage metering (issue #781) ──
 # The platform's metering store. Studio records what its model calls and IDE
 # sessions use through the SDK (src/usage); the records are kept by the storage
 # plugin, which is the published TimescaleDB plugin's code on a plain table
 # until the shared Postgres can have TimescaleDB (see its README).
-usage_collector = { package = "cf-gears-usage-collector", version = "=0.5.3" }
-usage_collector_sdk = { package = "cf-gears-usage-collector-sdk", version = "=0.3.18" }
+usage_collector = { package = "cf-gears-usage-collector", version = "=0.5.5" }
+usage_collector_sdk = { package = "cf-gears-usage-collector-sdk", version = "=0.3.20" }
 postgres_usage_collector_plugin = { package = "studio-postgres-usage-collector-plugin", path = "plugins/postgres-usage-collector-plugin" }
 rust_decimal = "1.39"
 # Reading the collector's sums (studio-usage costs): its query is OData, its
 # instants chrono, its sums BigDecimal.
-toolkit_odata = { package = "cf-gears-toolkit-odata", version = "=0.10.2" }
+toolkit_odata = { package = "cf-gears-toolkit-odata", version = "=0.10.3" }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 bigdecimal = "0.4"
 
 # ── Dev plugins (static auth for the demo; replace with OIDC for real deployments) ──
-static_authn_plugin = { package = "cf-gears-static-authn-plugin", version = "=0.3.22" }
+static_authn_plugin = { package = "cf-gears-static-authn-plugin", version = "=0.4.1" }
 # Real login: OIDC JWT validation (used by config/oidc.yaml with Keycloak from compose)
-oidc_authn_plugin = { package = "cf-gears-oidc-authn-plugin", version = "=0.4.0" }
-static_authz_plugin = { package = "cf-gears-static-authz-plugin", version = "=0.1.42" }
+oidc_authn_plugin = { package = "cf-gears-oidc-authn-plugin", version = "=0.5.1" }
+static_authz_plugin = { package = "cf-gears-static-authz-plugin", version = "=0.2.1" }
 
 # ── The gear under demonstration ──
 # account-management ships its own Tenant Resolver plugin (src/tr_plugin) in-crate.
-account_management = { package = "cf-gears-account-management", version = "=0.12.0" }
-static_idp_plugin = { package = "cf-gears-static-idp-plugin", version = "=0.1.22" }
+account_management = { package = "cf-gears-account-management", version = "=0.13.1" }
+static_idp_plugin = { package = "cf-gears-static-idp-plugin", version = "=0.1.24" }
 # Official Keycloak IdP plugin — full tenant/user/service-account lifecycle over
 # the Keycloak Admin API. Replaces the in-crate src/keycloak_idp_plugin.rs (which
 # is no longer `mod`-ed in main.rs). See docs/keycloak-idp-migration.md.
-keycloak_idp_plugin = { package = "cf-gears-keycloak-idp-plugin", version = "=0.2.4" }
+keycloak_idp_plugin = { package = "cf-gears-keycloak-idp-plugin", version = "=0.2.6" }
 
 # ── Feature gears: AI chat, per-user settings, file storage ──
 # mini-chat hard-depends on oagw (LLM egress); oagw depends on credstore.
@@ -253,13 +242,13 @@ keycloak_idp_plugin = { package = "cf-gears-keycloak-idp-plugin", version = "=0.
 # in `start`, which waits for the root instead of failing the boot (ADR-0018).
 # Without a database oagw still reconciles in post_init, so the section is
 # load-bearing.
-mini_chat = { package = "cf-gears-mini-chat", version = "=0.5.3", optional = true }
-api_egress = { package = "cf-gears-oagw", version = "=0.7.0", optional = true }
-credstore = { package = "cf-gears-credstore", version = "=0.7.0" }
-static_credstore_plugin = { package = "cf-gears-static-credstore-plugin", version = "=0.2.19" }
-simple_user_settings = { package = "cf-gears-simple-user-settings", version = "=0.3.3" }
-file_storage = { package = "cf-gears-file-storage", version = "=0.4.4" }
-github_mirror = { package = "cf-gears-github-mirror", version = "=0.1.3", path = "../../gears-rust-main/gears/github-mirror/github-mirror", optional = true }
+mini_chat = { package = "cf-gears-mini-chat", version = "=0.5.5", optional = true }
+api_egress = { package = "cf-gears-oagw", version = "=0.8.1", optional = true }
+credstore = { package = "cf-gears-credstore", version = "=0.7.2" }
+static_credstore_plugin = { package = "cf-gears-static-credstore-plugin", version = "=0.2.21" }
+simple_user_settings = { package = "cf-gears-simple-user-settings", version = "=0.3.5" }
+file_storage = { package = "cf-gears-file-storage", version = "=0.4.6" }
+github_mirror = { package = "cf-gears-github-mirror", version = "=0.2.1", optional = true }
 kube = { version = "4.2.0", default-features = false, features = ["client", "runtime", "rustls-tls"] }
 k8s-openapi = { version = "0.28.0", features = ["v1_32"] }
 rustls = "0.23.43"
@@ -286,80 +275,3 @@ testcontainers-modules = { version = "0.11", features = ["postgres"] }
 # see `src/test_pg.rs`. An exit hook is the one place left to stop it, and the
 # C runtime's is the only exit hook there is.
 libc = "0.2"
-
-[patch.crates-io]
-cf-gears-account-management = { path = "../../gears-rust-main/gears/system/account-management/account-management" }
-cf-gears-account-management-sdk = { path = "../../gears-rust-main/gears/system/account-management/account-management-sdk" }
-cf-gears-api-gateway = { path = "../../gears-rust-main/gears/system/api-gateway" }
-cf-gears-authn-resolver = { path = "../../gears-rust-main/gears/system/authn-resolver/authn-resolver" }
-cf-gears-authn-resolver-sdk = { path = "../../gears-rust-main/gears/system/authn-resolver/authn-resolver-sdk" }
-cf-gears-authz-resolver = { path = "../../gears-rust-main/gears/system/authz-resolver/authz-resolver" }
-cf-gears-authz-resolver-sdk = { path = "../../gears-rust-main/gears/system/authz-resolver/authz-resolver-sdk" }
-cf-gears-cluster-sdk = { path = "../../gears-rust-main/gears/system/cluster/cluster-sdk" }
-cf-gears-credstore = { path = "../../gears-rust-main/gears/credstore/credstore" }
-cf-gears-credstore-sdk = { path = "../../gears-rust-main/gears/credstore/credstore-sdk" }
-cf-gears-event-broker-sdk = { path = "../../gears-rust-main/gears/system/event-broker/event-broker-sdk" }
-cf-gears-file-storage = { path = "../../gears-rust-main/gears/file-storage/file-storage" }
-cf-gears-file-storage-sdk = { path = "../../gears-rust-main/gears/file-storage/file-storage-sdk" }
-cf-gears-github-mirror = { path = "../../gears-rust-main/gears/github-mirror/github-mirror" }
-cf-gears-github-mirror-sdk = { path = "../../gears-rust-main/gears/github-mirror/github-mirror-sdk" }
-cf-gears-graph-storage = { path = "../../gears-rust-main/gears/graph-storage/graph-storage" }
-cf-gears-graph-storage-onnx-embedding-plugin = { path = "../../gears-rust-main/gears/graph-storage/onnx-embedding-plugin" }
-cf-gears-graph-storage-remote-embedding-plugin = { path = "../../gears-rust-main/gears/graph-storage/remote-embedding-plugin" }
-cf-gears-graph-storage-sdk = { path = "../../gears-rust-main/gears/graph-storage/graph-storage-sdk" }
-cf-gears-grpc-hub = { path = "../../gears-rust-main/gears/system/grpc-hub" }
-cf-gears-keycloak-idp-plugin = { path = "../../gears-rust-main/gears/system/account-management/plugins/keycloak-idp-plugin" }
-cf-gears-mini-chat = { path = "../../gears-rust-main/gears/mini-chat/mini-chat" }
-cf-gears-mini-chat-sdk = { path = "../../gears-rust-main/gears/mini-chat/mini-chat-sdk" }
-cf-gears-nodes-registry = { path = "../../gears-rust-main/gears/system/nodes-registry/nodes-registry" }
-cf-gears-nodes-registry-sdk = { path = "../../gears-rust-main/gears/system/nodes-registry/nodes-registry-sdk" }
-cf-gears-oagw = { path = "../../gears-rust-main/gears/system/oagw/oagw" }
-cf-gears-oagw-sdk = { path = "../../gears-rust-main/gears/system/oagw/oagw-sdk" }
-cf-gears-oidc-authn-plugin = { path = "../../gears-rust-main/gears/system/authn-resolver/plugins/oidc-authn-plugin" }
-cf-gears-resource-group = { path = "../../gears-rust-main/gears/system/resource-group/resource-group" }
-cf-gears-resource-group-sdk = { path = "../../gears-rust-main/gears/system/resource-group/resource-group-sdk" }
-cf-gears-rustls-corecrypto-provider = { path = "../../gears-rust-main/libs/rustls-corecrypto-provider" }
-cf-gears-rustls-fips-shim = { path = "../../gears-rust-main/libs/rustls-fips-shim" }
-cf-gears-service-discovery = { path = "../../gears-rust-main/gears/system/service-discovery" }
-cf-gears-simple-user-settings = { path = "../../gears-rust-main/gears/simple-user-settings/simple-user-settings" }
-cf-gears-simple-user-settings-sdk = { path = "../../gears-rust-main/gears/simple-user-settings/simple-user-settings-sdk" }
-cf-gears-static-authn-plugin = { path = "../../gears-rust-main/gears/system/authn-resolver/plugins/static-authn-plugin" }
-cf-gears-static-authz-plugin = { path = "../../gears-rust-main/gears/system/authz-resolver/plugins/static-authz-plugin" }
-cf-gears-static-credstore-plugin = { path = "../../gears-rust-main/gears/credstore/plugins/static-credstore-plugin" }
-cf-gears-static-idp-plugin = { path = "../../gears-rust-main/gears/system/account-management/plugins/static-idp-plugin" }
-cf-gears-system-sdk-directory = { path = "../../gears-rust-main/libs/system-sdks/sdks/directory" }
-cf-gears-system-sdks = { path = "../../gears-rust-main/libs/system-sdks" }
-cf-gears-tenant-resolver = { path = "../../gears-rust-main/gears/system/tenant-resolver/tenant-resolver" }
-cf-gears-tenant-resolver-sdk = { path = "../../gears-rust-main/gears/system/tenant-resolver/tenant-resolver-sdk" }
-cf-gears-toolkit = { path = "../../gears-rust-main/libs/toolkit" }
-cf-gears-toolkit-auth = { path = "../../gears-rust-main/libs/toolkit-auth" }
-cf-gears-toolkit-canonical-errors = { path = "../../gears-rust-main/libs/toolkit-canonical-errors" }
-cf-gears-toolkit-canonical-errors-macro = { path = "../../gears-rust-main/libs/toolkit-canonical-errors-macro" }
-cf-gears-toolkit-contract = { path = "../../gears-rust-main/libs/toolkit-contract" }
-cf-gears-toolkit-contract-macros = { path = "../../gears-rust-main/libs/toolkit-contract-macros" }
-cf-gears-toolkit-db = { path = "../../gears-rust-main/libs/toolkit-db" }
-cf-gears-toolkit-db-macros = { path = "../../gears-rust-main/libs/toolkit-db-macros" }
-cf-gears-toolkit-gateway = { path = "../../gears-rust-main/libs/toolkit-gateway" }
-cf-gears-toolkit-gts = { path = "../../gears-rust-main/libs/toolkit-gts" }
-cf-gears-toolkit-gts-macros = { path = "../../gears-rust-main/libs/toolkit-gts-macros" }
-cf-gears-toolkit-http = { path = "../../gears-rust-main/libs/toolkit-http" }
-cf-gears-toolkit-http-middleware = { path = "../../gears-rust-main/libs/toolkit-http-middleware" }
-cf-gears-toolkit-http-proxy = { path = "../../gears-rust-main/libs/toolkit-http-proxy" }
-cf-gears-toolkit-k8s-auth = { path = "../../gears-rust-main/libs/toolkit-k8s-auth" }
-cf-gears-toolkit-macros = { path = "../../gears-rust-main/libs/toolkit-macros" }
-cf-gears-toolkit-node-info = { path = "../../gears-rust-main/libs/toolkit-node-info" }
-cf-gears-toolkit-odata = { path = "../../gears-rust-main/libs/toolkit-odata" }
-cf-gears-toolkit-odata-macros = { path = "../../gears-rust-main/libs/toolkit-odata-macros" }
-cf-gears-toolkit-onnx-runtime = { path = "../../gears-rust-main/libs/ai/toolkit-onnx-runtime" }
-cf-gears-toolkit-sdk = { path = "../../gears-rust-main/libs/toolkit-sdk" }
-cf-gears-toolkit-sea-orm-pgq = { path = "../../gears-rust-main/libs/toolkit-sea-orm-pgq" }
-cf-gears-toolkit-security = { path = "../../gears-rust-main/libs/toolkit-security" }
-cf-gears-toolkit-stable-hash = { path = "../../gears-rust-main/libs/toolkit-stable-hash" }
-cf-gears-toolkit-taskward = { path = "../../gears-rust-main/libs/toolkit-taskward" }
-cf-gears-toolkit-trace-context = { path = "../../gears-rust-main/libs/toolkit-trace-context" }
-cf-gears-toolkit-transport-grpc = { path = "../../gears-rust-main/libs/toolkit-transport-grpc" }
-cf-gears-toolkit-utils = { path = "../../gears-rust-main/libs/toolkit-utils" }
-cf-gears-types-registry = { path = "../../gears-rust-main/gears/system/types-registry/types-registry" }
-cf-gears-types-registry-sdk = { path = "../../gears-rust-main/gears/system/types-registry/types-registry-sdk" }
-cf-gears-usage-collector = { path = "../../gears-rust-main/gears/system/usage-collector/usage-collector" }
-cf-gears-usage-collector-sdk = { path = "../../gears-rust-main/gears/system/usage-collector/usage-collector-sdk" }
