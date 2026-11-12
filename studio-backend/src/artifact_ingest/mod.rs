@@ -495,7 +495,11 @@ mod tests {
 
     #[test]
     fn mirror_base_url_refuses_other_schemes_and_garbage() {
-        for raw in ["ftp://127.0.0.1/cf", "file:///tmp/cf", "ws://127.0.0.1:8090/cf"] {
+        for raw in [
+            "ftp://127.0.0.1/cf",
+            "file:///tmp/cf",
+            "ws://127.0.0.1:8090/cf",
+        ] {
             let err = checked_mirror_base_url(raw).unwrap_err().to_string();
             assert!(err.contains("must be https://"), "{raw}: {err}");
         }

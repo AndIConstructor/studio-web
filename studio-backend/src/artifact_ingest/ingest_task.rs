@@ -196,9 +196,7 @@ impl TaskHandler for IngestTask {
         } else {
             None
         };
-        let base_url = platform_base_url
-            .as_deref()
-            .or(payload.base_url.as_deref());
+        let base_url = platform_base_url.as_deref().or(payload.base_url.as_deref());
 
         let (progress, drain) = ctx.progress_bridge();
         // Held until the sync returns. A closed semaphore cannot happen -- it is
