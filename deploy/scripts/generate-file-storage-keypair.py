@@ -34,5 +34,5 @@ public_key = key.public_key().public_bytes(
     serialization.PublicFormat.UncompressedPoint,
 )
 
-print(f"FILE_STORAGE_SIGNING_KEY={base64url(private_key)}")
+print(f"FILE_STORAGE_SIGNING_SEED={base64url(private_key)}")
 print(f"FILE_STORAGE_SIDECAR_PUBLIC_KEY={base64url(public_key)}")

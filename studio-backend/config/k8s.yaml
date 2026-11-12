@@ -1139,6 +1139,9 @@ gears:
         - ref: "studio-assistant-llm-key"
           value_env: "STUDIO_LLM_API_KEY"
           sharing: "shared"
+        - ref: "github-token"
+          value_env: "GITHUB_TOKEN"
+          sharing: "tenant"
 
   # This plugin is linked into the binary and therefore must be configured.
   # Keep it empty and deprioritized so OIDC is the only selected AuthN provider.

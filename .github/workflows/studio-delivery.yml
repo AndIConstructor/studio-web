@@ -1622,17 +1622,17 @@ jobs:
         env:
           S3_ACCESS_KEY_ID: ${{ secrets.FILE_STORAGE_S3_ACCESS_KEY_ID }}
           S3_SECRET_ACCESS_KEY: ${{ secrets.FILE_STORAGE_S3_SECRET_ACCESS_KEY }}
-          SIGNING_KEY: ${{ secrets.FILE_STORAGE_SIGNING_KEY }}
+          SIGNING_KEY: ${{ secrets.FILE_STORAGE_SIGNING_SEED }}
           SIDECAR_PUBLIC_KEY: ${{ secrets.FILE_STORAGE_SIDECAR_PUBLIC_KEY }}
         shell: bash
         run: |
           set -euo pipefail
           test -n "$S3_ACCESS_KEY_ID" || { echo "GitHub Environment secret FILE_STORAGE_S3_ACCESS_KEY_ID is empty" >&2; exit 1; }
           test -n "$S3_SECRET_ACCESS_KEY" || { echo "GitHub Environment secret FILE_STORAGE_S3_SECRET_ACCESS_KEY is empty" >&2; exit 1; }
-          test -n "$SIGNING_KEY" || { echo "GitHub Environment secret FILE_STORAGE_SIGNING_KEY is empty" >&2; exit 1; }
+          test -n "$SIGNING_KEY" || { echo "GitHub Environment secret FILE_STORAGE_SIGNING_SEED is empty" >&2; exit 1; }
           test -n "$SIDECAR_PUBLIC_KEY" || { echo "GitHub Environment secret FILE_STORAGE_SIDECAR_PUBLIC_KEY is empty" >&2; exit 1; }
           [[ "$SIGNING_KEY" =~ ^[A-Za-z0-9_-]+$ ]] || {
-            echo "FILE_STORAGE_SIGNING_KEY must be a P-256 PKCS#8 DER private key, base64url without padding" >&2
+            echo "FILE_STORAGE_SIGNING_SEED must be a P-256 PKCS#8 DER private key, base64url without padding" >&2
             exit 1
           }
           [[ "$SIDECAR_PUBLIC_KEY" =~ ^[A-Za-z0-9_-]{87}$ ]] || {

@@ -82,7 +82,7 @@ Create these four secrets independently in both GitHub Environments (`dev` and
 | --- | --- |
 | `FILE_STORAGE_S3_ACCESS_KEY_ID` | Access key restricted to this environment's bucket |
 | `FILE_STORAGE_S3_SECRET_ACCESS_KEY` | Matching S3 secret key |
-| `FILE_STORAGE_SIGNING_KEY` | P-256 private key, PKCS#8 DER, base64url without padding |
+| `FILE_STORAGE_SIGNING_SEED` | P-256 private key, PKCS#8 DER, base64url without padding |
 | `FILE_STORAGE_SIDECAR_PUBLIC_KEY` | Matching 65-byte uncompressed P-256 public point, base64url without padding |
 
 Generate a new signing pair for each environment:

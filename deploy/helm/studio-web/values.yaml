@@ -104,6 +104,7 @@ backend:
   # insight_api_key [optional; enables Constructor Insight analytics — without it the
   # Components page reports delivery activity as unavailable],
   # embed_api_key [required when embedding.provider=remote],
+  # github_token [optional; the GitHub Mirror's read-only GitHub token],
   # research_client_secret [optional; the `constructor-studio` client's secret at
   # the Constructor identity provider, see `research` below]).
   appSecrets:

@@ -17,7 +17,7 @@ promote the same release to test only after the dev upload/download smoke test.
   `py deploy/scripts/generate-file-storage-keypair.py`.
 - [ ] Set `FILE_STORAGE_S3_ACCESS_KEY_ID`.
 - [ ] Set `FILE_STORAGE_S3_SECRET_ACCESS_KEY`.
-- [ ] Set `FILE_STORAGE_SIGNING_KEY`.
+- [ ] Set `FILE_STORAGE_SIGNING_SEED`.
 - [ ] Set `FILE_STORAGE_SIDECAR_PUBLIC_KEY`.
 
 ## 3. Configure GitHub Environment `test`
